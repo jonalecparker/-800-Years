@@ -1,0 +1,33 @@
+# Unity (standard ignores — ready for when the Unity project is created)
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Mm]emoryCaptures/
+/[Rr]ecordings/
+
+# Unity crash/asset artifacts
+sysinfo.txt
+*.stackdump
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+crashlytics-build.properties
+
+# IDE
+.vs/
+.idea/
+.vscode/
+*.csproj
+*.sln
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
