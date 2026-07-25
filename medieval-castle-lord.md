@@ -236,8 +236,6 @@ Consequences, eyes open:
 4. Character Creator trial: one vassal in period clothing into the scene.
 5. Verdict: does the courtyard feel like 1220? (= the pipeline test defined above.)
 
-*(Historical note: a "no game-two code until game one ships" gate existed through 2026-07-22; **lifted 2026-07-23** to start the castle-building graybox prototype. ⚠️ The risk the gate guarded against — game two's shine eating game one's momentum — still stands; keep game one moving deliberately.)*
-
 ## Differences From Game One (worth tracking)
 
 - Game one: post-scarcity (no economy pressure). This game is *about* economy, land, and power — nearly the opposite. Expect the systems design to be much heavier.
