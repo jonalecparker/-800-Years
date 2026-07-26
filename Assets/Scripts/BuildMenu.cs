@@ -26,9 +26,16 @@ public class BuildMenu : MonoBehaviour
     public Color barColor = new Color(0.1f, 0.1f, 0.1f, 0.85f);
     public Color buttonColor = new Color(0.25f, 0.25f, 0.25f, 1f);
     public Color selectedColor = new Color(0.3f, 0.55f, 0.9f, 1f);
+    public Color deleteActiveColor = new Color(0.75f, 0.22f, 0.18f, 1f);
 
     private RectTransform itemRow;
     private string openCategory;
+    private Image deleteButtonImage;
+    private Image curveButtonImage;
+    private GameObject dragCountPanel;
+    private Text dragCountText;
+    private GameObject heightPanel;
+    private Text heightText;
 
     void Start()
     {
@@ -87,6 +94,109 @@ public class BuildMenu : MonoBehaviour
         {
             MenuCategory capturedCategory = category;
             CreateButton(categoryRow, capturedCategory.categoryName, () => ToggleCategory(capturedCategory));
+        }
+
+        // Curved toggles the build tool between straight runs and the
+        // three-click curve flow; it stays lit while the curve shape is
+        // armed. Delete sits beside it: one click arms the delete tool
+        // (button turns red), a second click — or picking any build item —
+        // returns to building.
+        curveButtonImage = CreateButton(categoryRow, "Curved", ToggleCurveShape).GetComponent<Image>();
+        deleteButtonImage = CreateButton(categoryRow, "Delete", ToggleDeleteMode).GetComponent<Image>();
+
+        // Small readouts tucked above the bar's right end: the wall height
+        // for the build tool (always visible while building), and the piece
+        // count (only while a drag is running).
+        dragCountPanel = CreateReadout(canvasObj.transform, "DragCountPanel",
+            new Vector2(-8f, 68f), new Vector2(120f, 40f), out dragCountText);
+        dragCountPanel.SetActive(false);
+        heightPanel = CreateReadout(canvasObj.transform, "HeightPanel",
+            new Vector2(-136f, 68f), new Vector2(190f, 40f), out heightText);
+        heightPanel.SetActive(false);
+    }
+
+    GameObject CreateReadout(Transform parent, string name, Vector2 anchoredPosition, Vector2 size, out Text text)
+    {
+        GameObject panel = new GameObject(name, typeof(RectTransform));
+        panel.transform.SetParent(parent, false);
+
+        RectTransform rt = panel.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(1f, 0f);
+        rt.anchorMax = new Vector2(1f, 0f);
+        rt.pivot = new Vector2(1f, 0f);
+        rt.anchoredPosition = anchoredPosition;
+        rt.sizeDelta = size;
+
+        Image bg = panel.AddComponent<Image>();
+        bg.color = barColor;
+
+        GameObject textObj = new GameObject("Label", typeof(RectTransform));
+        textObj.transform.SetParent(panel.transform, false);
+        RectTransform textRt = textObj.GetComponent<RectTransform>();
+        textRt.anchorMin = Vector2.zero;
+        textRt.anchorMax = Vector2.one;
+        textRt.offsetMin = Vector2.zero;
+        textRt.offsetMax = Vector2.zero;
+
+        text = textObj.AddComponent<Text>();
+        text.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        text.alignment = TextAnchor.MiddleCenter;
+        text.color = Color.white;
+        text.fontSize = 20;
+
+        return panel;
+    }
+
+    void Update()
+    {
+        if (placementSystem == null)
+            return;
+
+        int count = placementSystem.ActiveDragCount;
+        if (count > 0)
+            dragCountText.text = count == 1 ? "1 wall" : count + " walls";
+        dragCountPanel.SetActive(count > 0);
+
+        // Height only means anything while building, so the readout follows
+        // the tool.
+        bool building = placementSystem.Mode == GridPlacementSystem.ToolMode.Build;
+        heightPanel.SetActive(building);
+        if (building)
+            heightText.text = $"Height ×{placementSystem.HeightMultiplier:0.##}  ({placementSystem.CurrentWallHeight:0.##}m)";
+    }
+
+    void ToggleCurveShape()
+    {
+        if (placementSystem == null)
+            return;
+
+        // Arming a build shape always puts the build tool back in hand.
+        if (placementSystem.Mode != GridPlacementSystem.ToolMode.Build)
+        {
+            placementSystem.SetMode(GridPlacementSystem.ToolMode.Build);
+            deleteButtonImage.color = buttonColor;
+        }
+
+        bool entering = placementSystem.Shape == GridPlacementSystem.BuildShape.Straight;
+        placementSystem.SetShape(entering
+            ? GridPlacementSystem.BuildShape.Curved
+            : GridPlacementSystem.BuildShape.Straight);
+        curveButtonImage.color = entering ? selectedColor : buttonColor;
+    }
+
+    void ToggleDeleteMode()
+    {
+        if (placementSystem == null)
+            return;
+
+        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Delete;
+        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Delete : GridPlacementSystem.ToolMode.Build);
+        deleteButtonImage.color = entering ? deleteActiveColor : buttonColor;
+
+        if (entering)
+        {
+            itemRow.gameObject.SetActive(false);
+            openCategory = null;
         }
     }
 
@@ -173,8 +283,15 @@ public class BuildMenu : MonoBehaviour
 
     void SelectItem(MenuItem item)
     {
-        if (placementSystem != null && item.prefab != null)
-            placementSystem.piecePrefab = item.prefab;
+        if (placementSystem != null)
+        {
+            if (item.prefab != null)
+                placementSystem.piecePrefab = item.prefab;
+
+            // Picking something to build always disarms the delete tool.
+            placementSystem.SetMode(GridPlacementSystem.ToolMode.Build);
+            deleteButtonImage.color = buttonColor;
+        }
 
         itemRow.gameObject.SetActive(false);
         openCategory = null;

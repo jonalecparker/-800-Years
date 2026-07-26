@@ -149,12 +149,11 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::GridVisualizer
   gridSize: 1
-  extent: 110
+  patchCells: 12
   lineHeight: 0.03
   lineWidth: 0.05
+  segmentsPerCell: 2
   lineMaterial: {fileID: 2100000, guid: 121330d0a4d807f4d810f4033ebdbce9, type: 2}
-  fadeStartDistance: 40
-  fadeDistance: 20
 --- !u!4 &86173221
 Transform:
   m_ObjectHideFlags: 0
@@ -490,7 +489,11 @@ MonoBehaviour:
   piecePrefab: {fileID: 2562516638415339310, guid: 4af28b0ba82efee408e44c68c51df9ec, type: 3}
   gridSize: 1
   placementYOffset: 1.75
+  minHeightMultiplier: 0.25
+  maxHeightMultiplier: 3
+  heightMultiplierStep: 0.25
   previewColor: {r: 0.3, g: 0.9, b: 1, a: 1}
+  deletePreviewColor: {r: 1, g: 0.3, b: 0.25, a: 1}
 --- !u!4 &1064011757
 Transform:
   m_ObjectHideFlags: 0
@@ -501,6 +504,134 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
   m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &1184855072
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1184855076}
+  - component: {fileID: 1184855075}
+  - component: {fileID: 1184855074}
+  - component: {fileID: 1184855073}
+  m_Layer: 0
+  m_Name: Terrain
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &1184855073
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1184855072}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 5176e65a3c7181e44a029a95da60f6f4, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::TerrainGenerator
+  terrainSize: 800
+  terrainMaxHeight: 80
+  heightmapResolution: 1025
+  baseElevation: 14
+  rollingAmplitude: 12
+  rollingWavelength: 150
+  detailAmplitude: 0.5
+  detailWavelength: 16
+  seed: 800
+  hillHeight: 40
+  plateauRadius: 45
+  hillBaseRadius: 150
+  hillEdgeNoise: 0.2
+  plateauCalm: 0.85
+  grassAlbedo: {fileID: 2800000, guid: c84a8eb75b43d1e43b31cfec51217859, type: 3}
+  grassNormal: {fileID: 2800000, guid: 80bf88bbb567fe9438d3200d7af38f7e, type: 3}
+  dirtAlbedo: {fileID: 2800000, guid: 10ccafbf83ad7f34aa705f55748824aa, type: 3}
+  dirtNormal: {fileID: 2800000, guid: fe7eb5514775c514da71c4b78a186672, type: 3}
+  textureTileSize: 10
+  dirtSlopeStart: 24
+  dirtSlopeFull: 38
+  alphamapResolution: 512
+--- !u!154 &1184855074
+TerrainCollider:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1184855072}
+  m_Material: {fileID: 0}
+  m_IncludeLayers:
+    serializedVersion: 2
+    m_Bits: 0
+  m_ExcludeLayers:
+    serializedVersion: 2
+    m_Bits: 0
+  m_LayerOverridePriority: 0
+  m_ProvidesContacts: 0
+  m_Enabled: 1
+  serializedVersion: 2
+  m_TerrainData: {fileID: 15600000, guid: 49b2082c273765748bc465779fcbb932, type: 2}
+  m_EnableTreeColliders: 1
+--- !u!218 &1184855075
+Terrain:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1184855072}
+  m_Enabled: 1
+  serializedVersion: 6
+  m_TerrainData: {fileID: 15600000, guid: 49b2082c273765748bc465779fcbb932, type: 2}
+  m_TreeDistance: 5000
+  m_TreeBillboardDistance: 50
+  m_TreeCrossFadeLength: 5
+  m_TreeMaximumFullLODCount: 50
+  m_DetailObjectDistance: 80
+  m_DetailObjectDensity: 1
+  m_HeightmapPixelError: 5
+  m_SplatMapDistance: 1000
+  m_HeightmapMinimumLODSimplification: 0
+  m_HeightmapMaximumLOD: 0
+  m_ShadowCastingMode: 2
+  m_DrawHeightmap: 1
+  m_DrawInstanced: 0
+  m_DrawTreesAndFoliage: 1
+  m_StaticShadowCaster: 0
+  m_IgnoreQualitySettings: 0
+  m_ReflectionProbeUsage: 1
+  m_MaterialTemplate: {fileID: 2100000, guid: eee9e70fae613da47b29cd3ab82b9978, type: 2}
+  m_BakeLightProbesForTrees: 1
+  m_PreserveTreePrototypeLayers: 0
+  m_DeringLightProbesForTrees: 1
+  m_ReceiveGI: 1
+  m_ScaleInLightmap: 1
+  m_LightmapParameters: {fileID: 15203, guid: 0000000000000000f000000000000000, type: 0}
+  m_GroupingID: 0
+  m_RenderingLayerMask: 1
+  m_AllowAutoConnect: 0
+  m_EnableHeightmapRayTracing: 1
+  m_EnableTreesAndDetailsRayTracing: 0
+  m_TreeMotionVectorModeOverride: 3
+--- !u!4 &1184855076
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1184855072}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -400, y: 0, z: -400}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -540,6 +671,7 @@ MonoBehaviour:
   barColor: {r: 0.1, g: 0.1, b: 0.1, a: 0.85}
   buttonColor: {r: 0.25, g: 0.25, b: 0.25, a: 1}
   selectedColor: {r: 0.3, g: 0.55, b: 0.9, a: 1}
+  deleteActiveColor: {r: 0.75, g: 0.22, b: 0.18, a: 1}
 --- !u!4 &1211390081
 Transform:
   m_ObjectHideFlags: 0
@@ -573,7 +705,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!23 &1347441359
 MeshRenderer:
   m_ObjectHideFlags: 0
@@ -755,8 +887,8 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1823688464}
   serializedVersion: 2
-  m_LocalRotation: {x: 0.7071068, y: 0, z: 0, w: 0.7071068}
-  m_LocalPosition: {x: 0, y: 30, z: 0}
+  m_LocalRotation: {x: 0.1445266, y: -0.377972, z: 0.059864886, w: 0.91250503}
+  m_LocalPosition: {x: 180, y: 130, z: -180}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -913,9 +1045,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 2dddc79c6899e8d49b4582f7a2bd8b5c, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::FreeFlyCamera
-  moveSpeed: 6
+  moveSpeed: 20
   boostMultiplier: 3
-  unitsPerScrollStep: 1
+  unitsPerScrollStep: 3
   lookSensitivity: 0.15
   orbitSensitivity: 0.3
   defaultOrbitDistance: 10
@@ -981,3 +1113,4 @@ SceneRoots:
   - {fileID: 1064011757}
   - {fileID: 86173221}
   - {fileID: 1211390081}
+  - {fileID: 1184855076}

@@ -17,13 +17,8 @@ public class FreeFlyCamera : MonoBehaviour
     public float orbitDragThresholdPixels = 4f;
 
     // True once a right-click-drag has crossed the threshold and is actively
-    // orbiting. GridPlacementSystem reads this to tell an orbit drag apart
-    // from a plain right-click (which removes a placed piece).
+    // orbiting — middle-mouse free look stands down while an orbit is live.
     public static bool IsOrbiting { get; private set; }
-    // Set by GridPlacementSystem when a right-click starts on a placed
-    // piece, claiming the drag for deletion instead of letting it become an
-    // orbit — the two features share the same button and can't both have it.
-    public static bool SuppressOrbit { get; set; }
 
     private float yaw;
     private float pitch;
@@ -76,18 +71,13 @@ void HandleOrbit(Mouse mouse)
             if (!mouse.rightButton.isPressed)
             {
                 rightButtonCandidate = false;
-                SuppressOrbit = false;
+                IsOrbiting = false;
             }
             return;
         }
 
         if (!IsOrbiting)
         {
-            // GridPlacementSystem claims this drag for piece deletion when it
-            // started on a placed piece — don't hijack it into an orbit too.
-            if (SuppressOrbit)
-                return;
-
             Vector2 currentPos = mouse.position.ReadValue();
             if ((currentPos - rightPressScreenPos).sqrMagnitude < orbitDragThresholdPixels * orbitDragThresholdPixels)
                 return;
@@ -127,6 +117,13 @@ void HandleOrbit(Mouse mouse)
 
         float speed = moveSpeed * (keyboard.leftShiftKey.isPressed ? boostMultiplier : 1f);
         transform.position += move.normalized * speed * Time.deltaTime;
+
+        // The wheel should only ever mean one thing at a time: Ctrl+scroll
+        // belongs to wall height, and a curve mid-bend owns plain scroll
+        // for its curvature steps.
+        if (keyboard.leftCtrlKey.isPressed || keyboard.rightCtrlKey.isPressed
+            || GridPlacementSystem.ClaimingScrollWheel)
+            return;
 
         float scroll = mouse.scroll.ReadValue().y;
         if (Mathf.Abs(scroll) > 0.01f)
