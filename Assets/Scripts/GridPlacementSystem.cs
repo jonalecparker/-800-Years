@@ -3,19 +3,29 @@ using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
 
+// The wall-building tool. Every wall is a SplineWall — a straight wall is
+// just a bulge-0 spline — so junctions, terrain stepping, course stacking,
+// texturing, and deletion are each implemented exactly once. There is no
+// grid: placement is free, and alignment comes from assists — endpoint
+// chaining, drag stepping relative to the anchor, distance guides, and
+// the offset tool. (The class keeps its historical name so scene
+// references survive.)
 public class GridPlacementSystem : MonoBehaviour
 {
     [Header("Placement")]
+    // Source of the wall material, the box ghost mesh, and the preview
+    // pool instances — no pieces of it are placed anymore.
     public GameObject piecePrefab;
+    // Wall thickness and target masonry section length. (Historically
+    // also the grid cell size; the grid is gone and nothing snaps to
+    // world-space cells anymore.)
     public float gridSize = 1f;
-    // Half the prefab's natural (×1) height. The prefab pivot is centered,
-    // not base-anchored, so a piece's center sits half its height above its
-    // base; this is also the anchor the height multiplier scales from.
+    // Half the prefab's natural (×1) height — doubled to get the ×1 wall
+    // height the multiplier scales from.
     public float placementYOffset = 1.75f;
-    // Ground-course bases snap DOWN to this increment, so neighbouring
-    // pieces on gentle slopes share a base (long level top runs) and real
-    // drops read as clean, uniform foundation steps instead of a ragged
-    // edge shifting at every cell.
+    // Foundation bases snap DOWN to this increment, so neighbouring walls
+    // on gentle slopes share a base and real drops read as clean, uniform
+    // foundation steps instead of a ragged edge.
     public float baseStepSize = 0.5f;
 
     [Header("Height")]
@@ -30,15 +40,29 @@ public class GridPlacementSystem : MonoBehaviour
     // the same chord can be made genuinely identical.
     public float curveBulgeStep = 0.5f;
     // Existing wall endpoints within this range of the cursor grab a new
-    // wall's endpoint, so walls chain into networks; otherwise endpoints
-    // snap to the grid. Hold Alt to place freely.
+    // wall's endpoint, so walls chain into networks. Hold Alt to place
+    // freely.
     public float endpointSnapRadius = 0.75f;
 
     [Header("Preview")]
     public Color previewColor = new Color(0.3f, 0.9f, 1f, 1f);
     public Color deletePreviewColor = new Color(1f, 0.3f, 0.25f, 1f);
 
-    public enum ToolMode { Build, Delete }
+    [Header("Assists")]
+    // While placing, each free endpoint of the pending wall shows a line
+    // to the nearest wall within this range, labelled with the
+    // face-to-face distance — relationships, where the grid only shows
+    // rhythm.
+    public float guideRange = 5f;
+    public Color guideColor = new Color(1f, 0.85f, 0.2f, 1f);
+    // Free placement is assisted, not gridded: drag direction is fully
+    // freeform (hold Shift to snap it to angleStep degrees of bearing),
+    // while length steps in lengthStep increments RELATIVE to the anchor
+    // so strokes stay commensurable. Alt disables all stepping.
+    public float angleStep = 15f;
+    public float lengthStep = 0.5f;
+
+    public enum ToolMode { Build, Delete, Offset }
     public ToolMode Mode { get; private set; } = ToolMode.Build;
 
     public enum BuildShape { Straight, Curved }
@@ -53,27 +77,30 @@ public class GridPlacementSystem : MonoBehaviour
     public float BaseHeight => placementYOffset * 2f;
     public float CurrentWallHeight => BaseHeight * heightMultiplier;
 
-    // How many pieces the active placement preview will lay down — 0 when
-    // idle, so the HUD counter can show/hide off this alone.
+    // How many sections the active preview will actually lay down —
+    // blocked (red) specs don't count, and 0 when idle, so the HUD
+    // counter can show/hide off this alone.
     public int ActiveDragCount
     {
         get
         {
-            if (Mode != ToolMode.Build)
+            if (Mode == ToolMode.Delete)
                 return 0;
-            if (Shape == BuildShape.Curved)
-                return splineSpecs.Count;
-            return dragStartPosition.HasValue ? lastGhostCells.Count : 0;
+            int count = 0;
+            foreach (SplineWall.SectionSpec spec in splineSpecs)
+                if (!spec.blocked)
+                    count++;
+            return count;
         }
     }
 
-    // Slightly larger than the piece it covers so the overlay shell draws
-    // over the piece's own surface instead of z-fighting with it.
+    // Slightly larger than the section it covers so the overlay shell
+    // draws over the section's own surface instead of z-fighting with it.
     const float DeleteOverlayScale = 1.02f;
 
     private readonly List<GameObject> ghostPool = new List<GameObject>();
     private readonly List<GameObject> deletePool = new List<GameObject>();
-    private readonly List<Transform> doomedPieces = new List<Transform>();
+    private readonly List<Transform> doomedSections = new List<Transform>();
     private readonly List<SplineWall.SectionSpec> splineSpecs = new List<SplineWall.SectionSpec>();
     private readonly List<Mesh> previewMeshes = new List<Mesh>();
     private (Vector3 start, Vector3 end, float bulge, float apexT, float height)? lastPreviewKey;
@@ -81,27 +108,29 @@ public class GridPlacementSystem : MonoBehaviour
     private Mesh prefabMesh;
     private Material wallMaterial;
     private Transform splineParent;
-    private List<Vector3> lastGhostCells = new List<Vector3>();
-    private Transform placedParent;
     private float currentYRotation;
-    private float lastCourseYaw;
     private float heightMultiplier = 1f;
     private float curveBulge;
     private float curveApexT = 0.5f;
-    private Vector3? dragStartPosition;
     private Vector3? splineStart;
     private Vector3? splineEnd;
-    private Transform deleteAnchorPiece;
+    private SplineWallSection deleteAnchor;
+    private SplineWall offsetSource;
+    private float offsetDistance = 3f;
+    private float offsetSide = 1f;
+    private (Vector3 s, Vector3 c, Vector3 e, float height)? lastOffsetKey;
     private Camera cam;
-
-    // Each commit takes the next id, so every placed run — straight or
-    // curved — is identifiable as one wall afterwards.
-    private static int nextWallGroupId = 1;
+    private Vector3? guideCenter;
+    private float guideBearing;
+    private readonly List<(Vector3 from, Vector3 to, float distance)> activeGuides = new List<(Vector3, Vector3, float)>();
+    private readonly List<LineRenderer> guidePool = new List<LineRenderer>();
+    private readonly Dictionary<GameObject, Color> ghostTints = new Dictionary<GameObject, Color>();
+    private Material guideMaterial;
+    private GUIStyle guideLabelStyle;
 
     void Start()
     {
         cam = Camera.main;
-        placedParent = new GameObject("PlacedWalls").transform;
         splineParent = new GameObject("SplineWalls").transform;
 
         MeshFilter prefabFilter = piecePrefab != null ? piecePrefab.GetComponent<MeshFilter>() : null;
@@ -125,12 +154,22 @@ public class GridPlacementSystem : MonoBehaviour
         // world and start placing or deleting behind the bar.
         bool overUI = EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
 
-        ClaimingScrollWheel = Mode == ToolMode.Build && Shape == BuildShape.Curved && splineEnd.HasValue;
+        ClaimingScrollWheel = (Mode == ToolMode.Build && Shape == BuildShape.Curved && splineEnd.HasValue)
+            || (Mode == ToolMode.Offset && offsetSource != null);
+
+        // Placement branches re-set the pending wall's center and bearing
+        // each frame; anything else (delete mode, idle off-target) leaves
+        // it unset and the guides disappear with it.
+        guideCenter = null;
 
         if (Mode == ToolMode.Delete)
             UpdateDelete(mouse, ray, overUI);
+        else if (Mode == ToolMode.Offset)
+            UpdateOffset(mouse, keyboard, ray, overUI);
         else
             UpdateBuild(mouse, keyboard, ray, overUI);
+
+        UpdateDistanceGuides();
     }
 
     // Both tools share the left mouse button, so switching abandons any
@@ -141,11 +180,10 @@ public class GridPlacementSystem : MonoBehaviour
         if (Mode == mode)
             return;
         Mode = mode;
-        dragStartPosition = null;
-        deleteAnchorPiece = null;
-        doomedPieces.Clear();
+        deleteAnchor = null;
+        offsetSource = null;
+        doomedSections.Clear();
         CancelCurve();
-        HideGhosts();
         HideDeleteOverlays();
     }
 
@@ -154,9 +192,7 @@ public class GridPlacementSystem : MonoBehaviour
         if (Shape == shape)
             return;
         Shape = shape;
-        dragStartPosition = null;
         CancelCurve();
-        HideGhosts();
     }
 
     void UpdateBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
@@ -169,94 +205,112 @@ public class GridPlacementSystem : MonoBehaviour
             UpdateStraightBuild(mouse, keyboard, ray, overUI);
     }
 
+    // Straight walls: press, drag along an angle-stepped line, release to
+    // commit a bulge-0 SplineWall, identical in kind to a curved one.
+    // Hovering an existing wall's top face previews a full course along
+    // it instead, and one click lays it; R turns the single-click stub's
+    // orientation.
     void UpdateStraightBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
-        if (keyboard != null && keyboard.rKey.wasPressedThisFrame)
-            currentYRotation += 90f;
-
-        Vector3 rawSnapped = default;
-        bool hasTarget = !overUI && TryGetPlacementCell(ray, out rawSnapped);
-
-        if (hasTarget)
+        if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
         {
-            if (mouse.leftButton.wasPressedThisFrame)
-                dragStartPosition = rawSnapped;
+            CancelCurve();
+            return;
+        }
+        if (keyboard != null && keyboard.rKey.wasPressedThisFrame)
+            currentYRotation += 45f;
 
-            // Nothing is placed while dragging — only a ghost line from the
-            // anchor to the cursor's current 45°-locked cell. Wandering past a
-            // new 45° direction just re-previews the whole run from the same
-            // anchor instead of leaving stray pieces behind from the old one.
-            if (dragStartPosition.HasValue)
+        bool freePlace = keyboard != null && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
+        Vector3 point = default;
+        Vector3 rawSurface = default;
+        SplineWallSection courseTarget = null;
+        bool hasPoint = !overUI && TryGetCurveTarget(ray, freePlace, out point, out rawSurface, out courseTarget);
+
+        if (!splineStart.HasValue)
+        {
+            if (hasPoint && courseTarget != null)
             {
-                // One drag lays one course. A ground course (anchor on open
-                // ground) follows the terrain — each empty cell builds from
-                // its own ground, the way a real curtain wall steps along a
-                // slope. A stacking course (anchor on existing pieces)
-                // stays dead level instead: only cells whose column top
-                // lines up exactly may continue it. Anything else — cells
-                // occupied at the wrong elevation — drops out of the line.
-                Vector3 anchorCell = dragStartPosition.Value;
-                bool anchorOnGround = !TryGetHighestPieceTop(anchorCell.x, anchorCell.z, out float anchorStackTop);
-                float anchorBase = anchorOnGround
-                    ? SampleCellGroundY(anchorCell.x, anchorCell.z)
-                    : anchorStackTop;
-
-                // The run's own direction, for the junction angle test —
-                // a single-cell drag falls back to the piece's rotation.
-                Vector3 dragDelta = rawSnapped - anchorCell;
-                float courseYaw = dragDelta.sqrMagnitude > 0.01f
-                    ? Mathf.Atan2(-dragDelta.z, dragDelta.x) * Mathf.Rad2Deg
-                    : currentYRotation;
-                lastCourseYaw = courseYaw;
-
-                lastGhostCells = new List<Vector3>();
-                foreach (Vector3 lineCell in ComputeDragLineCells(anchorCell, rawSnapped))
-                {
-                    if (TryGetCourseBaseY(lineCell.x, lineCell.z, anchorOnGround, anchorBase, courseYaw, out float cellBase))
-                        lastGhostCells.Add(new Vector3(lineCell.x, cellBase + CurrentWallHeight / 2f, lineCell.z));
-                }
+                BuildCoursePreview(courseTarget.wall);
+                ShowSplineGhosts();
+                if (mouse.leftButton.wasPressedThisFrame)
+                    CommitCourse(courseTarget.wall);
+            }
+            else if (hasPoint)
+            {
+                BuildStubPreview(point);
+                ShowSplineGhosts();
+                guideCenter = point;
+                guideBearing = -currentYRotation;
+                if (mouse.leftButton.wasPressedThisFrame)
+                    splineStart = point;
             }
             else
             {
-                // Hover height reflects whatever's already stacked in the
-                // cell, so the ghost shows exactly where a click would land.
-                float baseY = GetColumnTopY(rawSnapped.x, rawSnapped.z);
-                lastGhostCells = new List<Vector3>
-                {
-                    new Vector3(rawSnapped.x, baseY + CurrentWallHeight / 2f, rawSnapped.z)
-                };
+                HideGhosts();
             }
-
-            ShowGhosts(lastGhostCells, currentYRotation);
         }
-        else if (!dragStartPosition.HasValue)
+        else
         {
-            // Only hide when idle. Mid-drag, an off-target cursor (HUD, sky)
-            // keeps the last ghost line visible — it's exactly what release
-            // will commit, so it shouldn't vanish while the button is held.
-            HideGhosts();
-        }
+            // Off-target frames (HUD, sky) keep the last stepped end — the
+            // preview stays visible and release commits exactly what it
+            // shows, instead of getting stuck dragging.
+            bool snapAngle = keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
+            if (hasPoint)
+                splineEnd = SteppedDragEnd(splineStart.Value, rawSurface, freePlace, snapAngle);
 
-        // Checked unconditionally (not just when hasTarget) so releasing the
-        // button while the cursor has wandered off target still commits the
-        // last line the ghost showed, instead of getting stuck dragging.
-        if (mouse.leftButton.wasReleasedThisFrame && dragStartPosition.HasValue)
-        {
-            int groupId = nextWallGroupId++;
-            for (int i = 0; i < lastGhostCells.Count; i++)
-            {
-                PlacedPiece piece = PlacePiece(lastGhostCells[i], currentYRotation);
-                piece.groupId = groupId;
-                piece.groupIndex = i;
-                piece.runYaw = lastCourseYaw;
-            }
-            dragStartPosition = null;
-            HideGhosts();
+            Vector3 anchor = splineStart.Value;
+            Vector3 end = splineEnd ?? anchor;
+            if (FlatDistance(anchor, end) >= 0.25f)
+                BuildSplinePreview(anchor, end, 0f, 0.5f);
+            else
+                BuildStubPreview(anchor);
+            ShowSplineGhosts();
+            guideCenter = (anchor + end) * 0.5f;
+            guideBearing = FlatDistance(anchor, end) > 0.01f
+                ? Mathf.Atan2(end.z - anchor.z, end.x - anchor.x) * Mathf.Rad2Deg
+                : -currentYRotation;
+
+            if (mouse.leftButton.wasReleasedThisFrame)
+                CommitSpline();
         }
     }
 
+    // A zero-length run still means a wall: a token 10cm chord through the
+    // clicked point, oriented by R, that the sweep's own half-section end
+    // extensions grow into a short stub — and bury into any wall standing
+    // beside it, same as a long wall's ends would.
+    void BuildStubPreview(Vector3 center)
+    {
+        float rad = currentYRotation * Mathf.Deg2Rad;
+        Vector3 halfChord = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad)) * 0.05f;
+        BuildSplinePreview(center - halfChord, center + halfChord, 0f, 0.5f);
+    }
+
+    // Drag assist: direction is freeform (Shift snaps it to angleStep
+    // bearings) while length steps in lengthStep increments — relative to
+    // the anchor, not to any world grid, so strokes stay commensurable
+    // without constraining where they start. Alt frees everything.
+    Vector3 SteppedDragEnd(Vector3 anchor, Vector3 target, bool free, bool snapAngle)
+    {
+        Vector3 delta = target - anchor;
+        delta.y = 0f;
+        float length = delta.magnitude;
+        if (length < 0.001f)
+            return anchor;
+
+        float angle = Mathf.Atan2(delta.z, delta.x) * Mathf.Rad2Deg;
+        if (!free)
+        {
+            if (snapAngle)
+                angle = Mathf.Round(angle / angleStep) * angleStep;
+            length = Mathf.Round(length / lengthStep) * lengthStep;
+        }
+        float rad = angle * Mathf.Deg2Rad;
+        return anchor + new Vector3(Mathf.Cos(rad) * length, 0f, Mathf.Sin(rad) * length);
+    }
+
     // Ctrl+scroll steps the wall height for subsequent placements and the
-    // live ghost line. FreeFlyCamera stands down from scroll-dollying while
+    // live preview. FreeFlyCamera stands down from scroll-dollying while
     // Ctrl is held, so the wheel only means one thing at a time.
     void HandleHeightScroll(Mouse mouse, Keyboard keyboard)
     {
@@ -272,13 +326,12 @@ public class GridPlacementSystem : MonoBehaviour
             minHeightMultiplier, maxHeightMultiplier);
     }
 
-    // Spline wall placement — walls are first-class objects, not grid
-    // cells. Three clicks: start point, end point (both snapping to
-    // existing wall endpoints first, then the grid; Alt places freely),
-    // then bend — plain scroll steps the bulge while the cursor drags the
-    // apex along the chord — and a final click commits. Hovering an
-    // existing wall instead previews a full course along it at the current
-    // height; one click lays it. Escape backs out at any stage.
+    // Curved wall placement. Three clicks: start point, end point (both
+    // snapping to existing wall endpoints first, then the grid; Alt places
+    // freely), then bend — plain scroll steps the bulge while the cursor
+    // drags the apex along the chord — and a final click commits. Hovering
+    // an existing wall instead previews a full course along it at the
+    // current height; one click lays it. Escape backs out at any stage.
     void UpdateCurvedBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
         if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
@@ -305,6 +358,8 @@ public class GridPlacementSystem : MonoBehaviour
             else if (hasPoint)
             {
                 ShowStartMarker(point);
+                guideCenter = point;
+                guideBearing = 0f;
                 if (mouse.leftButton.wasPressedThisFrame)
                     splineStart = point;
             }
@@ -322,6 +377,8 @@ public class GridPlacementSystem : MonoBehaviour
             {
                 BuildSplinePreview(splineStart.Value, point, 0f, 0.5f);
                 ShowSplineGhosts();
+                guideCenter = (splineStart.Value + point) * 0.5f;
+                guideBearing = Mathf.Atan2(point.z - splineStart.Value.z, point.x - splineStart.Value.x) * Mathf.Rad2Deg;
                 Vector3 flat = point - splineStart.Value;
                 flat.y = 0f;
                 if (flat.sqrMagnitude > 0.25f
@@ -356,19 +413,37 @@ public class GridPlacementSystem : MonoBehaviour
 
             BuildSplinePreview(splineStart.Value, splineEnd.Value, curveBulge, curveApexT);
             ShowSplineGhosts();
+            guideCenter = (splineStart.Value + splineEnd.Value) * 0.5f;
+            guideBearing = Mathf.Atan2(splineEnd.Value.z - splineStart.Value.z,
+                splineEnd.Value.x - splineStart.Value.x) * Mathf.Rad2Deg;
 
             if (mouse.leftButton.wasPressedThisFrame)
                 CommitSpline();
         }
     }
 
+    // A preview with only blocked (red) specs commits nothing.
+    bool HasPlaceableSpecs()
+    {
+        foreach (SplineWall.SectionSpec spec in splineSpecs)
+            if (!spec.blocked)
+                return true;
+        return false;
+    }
+
+    // Commits exactly what the ghost shows: the preview's own curve key
+    // and section specs — straight drags, curves, and stub walls all
+    // share this one commit path. Blocked specs ride along; Create skips
+    // and disposes them.
     void CommitSpline()
     {
-        if (splineSpecs.Count > 0 && splineStart.HasValue && splineEnd.HasValue)
+        if (HasPlaceableSpecs() && lastPreviewKey.HasValue)
         {
-            Vector3 control = ControlPointFor(splineStart.Value, splineEnd.Value, curveBulge, curveApexT);
-            SplineWall.Create(splineParent, splineStart.Value, control, splineEnd.Value,
-                CurrentWallHeight, gridSize, BaseHeight, wallMaterial, splineSpecs);
+            (Vector3 s, Vector3 e, float bulge, float apexT, float height) = lastPreviewKey.Value;
+            Vector3 control = ControlPointFor(s, e, bulge, apexT);
+            SplineWall.Create(splineParent, s, control, e,
+                height, gridSize, BaseHeight, wallMaterial, splineSpecs,
+                gridSize, baseStepSize, false);
             // Mesh ownership just moved to the wall's sections — clear the
             // preview list so CancelCurve doesn't destroy them.
             previewMeshes.Clear();
@@ -378,10 +453,11 @@ public class GridPlacementSystem : MonoBehaviour
 
     void CommitCourse(SplineWall below)
     {
-        if (splineSpecs.Count > 0)
+        if (HasPlaceableSpecs())
         {
             SplineWall.Create(splineParent, below.curveStart, below.curveControl, below.curveEnd,
-                CurrentWallHeight, below.thickness, BaseHeight, wallMaterial, splineSpecs);
+                CurrentWallHeight, below.thickness, BaseHeight, wallMaterial, splineSpecs,
+                gridSize, baseStepSize, true);
             previewMeshes.Clear();
         }
         CancelCurve();
@@ -393,6 +469,7 @@ public class GridPlacementSystem : MonoBehaviour
         splineSpecs.Clear();
         lastPreviewKey = null;
         lastCourseKey = null;
+        lastOffsetKey = null;
         splineStart = null;
         splineEnd = null;
         curveBulge = 0f;
@@ -400,12 +477,11 @@ public class GridPlacementSystem : MonoBehaviour
         HideGhosts();
     }
 
-    // Resolves the cursor for the curve tool. Pointing at a wall's flank
-    // OR at the cell beside it resolves to that neighbouring cell — the
-    // same assist helpers the grid tool uses, so "next to that wall" is
-    // one gesture and the wall's own end extension closes the joint. Wall
-    // top faces are course-stacking targets, existing spline endpoints
-    // chain, and Alt returns the raw surface point.
+    // Resolves the cursor for both build shapes. Wall top faces are
+    // course-stacking targets, existing wall endpoints chain, a wall's
+    // flank resolves to the cell beside the face being pointed at, terrain
+    // resolves to the cell under the hit point, and Alt returns the raw
+    // surface point.
     bool TryGetCurveTarget(Ray ray, bool freePlace, out Vector3 point, out Vector3 rawSurface, out SplineWallSection courseTarget)
     {
         point = default;
@@ -443,7 +519,7 @@ public class GridPlacementSystem : MonoBehaviour
             return true;
         }
 
-        // Chaining: existing spline endpoints outrank everything nearby.
+        // Chaining: existing wall endpoints outrank everything nearby.
         foreach (SplineWall wall in SplineWall.All)
         {
             if (FlatDistance(rawSurface, wall.curveStart) <= endpointSnapRadius)
@@ -460,21 +536,17 @@ public class GridPlacementSystem : MonoBehaviour
 
         if (section != null)
         {
-            // A spline wall's flank: the cell beside the face being
-            // pointed at, mirroring the grid pieces' assist boxes.
-            point = SnapToGrid(first.point + first.normal * (gridSize * 0.5f));
+            // A wall's flank: land the new wall's centerline flush
+            // against the face being pointed at, so "against that wall"
+            // is one gesture and the joint closes itself.
+            Vector3 flank = first.point + first.normal * (gridSize * 0.5f);
+            point = new Vector3(flank.x, 0f, flank.z);
             return true;
         }
 
-        // Terrain, grid pieces, and their assist boxes: the shared grid
-        // helper already resolves all of these to the intended cell.
-        if (TryGetPlacementCell(ray, out Vector3 cell))
-        {
-            point = cell;
-            return true;
-        }
-
-        point = SnapToGrid(rawSurface);
+        // Terrain (or anything else that isn't a wall): the exact point
+        // under the cursor — placement is free.
+        point = rawSurface;
         return true;
     }
 
@@ -506,7 +578,8 @@ public class GridPlacementSystem : MonoBehaviour
         splineSpecs.Clear();
         Vector3 control = ControlPointFor(start, end, bulge, apexT);
         splineSpecs.AddRange(SplineWall.BuildSpecs(start, control, end,
-            CurrentWallHeight, gridSize, gridSize, baseStepSize, BaseHeight));
+            CurrentWallHeight, gridSize, gridSize, baseStepSize, BaseHeight,
+            int.MaxValue, true));
         foreach (SplineWall.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
     }
@@ -521,7 +594,7 @@ public class GridPlacementSystem : MonoBehaviour
 
         ClearPreviewMeshes();
         splineSpecs.Clear();
-        splineSpecs.AddRange(wall.BuildCourseSpecs(CurrentWallHeight, BaseHeight));
+        splineSpecs.AddRange(wall.BuildCourseSpecs(CurrentWallHeight, BaseHeight, true));
         foreach (SplineWall.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
     }
@@ -533,6 +606,8 @@ public class GridPlacementSystem : MonoBehaviour
         previewMeshes.Clear();
     }
 
+    // Blocked pieces show red instead of vanishing — the refusal is
+    // visible in place, and release simply doesn't lay those pieces.
     void ShowSplineGhosts()
     {
         for (int i = 0; i < splineSpecs.Count; i++)
@@ -541,6 +616,7 @@ public class GridPlacementSystem : MonoBehaviour
             GameObject ghost = GetPooled(ghostPool, i, previewColor, "PlacementPreview");
             ghost.SetActive(true);
             SetGhostMesh(ghost, spec.mesh);
+            SetGhostTint(ghost, spec.blocked ? deletePreviewColor : previewColor);
             ghost.transform.SetPositionAndRotation(spec.position, Quaternion.Euler(0f, spec.yaw, 0f));
             ghost.transform.localScale = Vector3.one;
         }
@@ -548,8 +624,29 @@ public class GridPlacementSystem : MonoBehaviour
             ghostPool[i].SetActive(false);
     }
 
-    // A full box ghost marking the start cell — honest again now that the
-    // sweep's end extension makes the wall genuinely cover this cell.
+    // Pooled ghosts change tint per use (blocked pieces run red); the
+    // cache keeps material writes to actual changes.
+    void SetGhostTint(GameObject ghost, Color tint)
+    {
+        if (ghostTints.TryGetValue(ghost, out Color current) && current == tint)
+            return;
+        ghostTints[ghost] = tint;
+        foreach (var rend in ghost.GetComponentsInChildren<Renderer>())
+        {
+            foreach (var mat in rend.sharedMaterials)
+            {
+                if (mat == null)
+                    continue;
+                if (mat.HasProperty("_BaseColor"))
+                    mat.SetColor("_BaseColor", tint);
+                else if (mat.HasProperty("_Color"))
+                    mat.SetColor("_Color", tint);
+            }
+        }
+    }
+
+    // A full box ghost marking the curve tool's start cell — the sweep's
+    // end extension makes the committed wall genuinely cover this cell.
     void ShowStartMarker(Vector3 point)
     {
         ClearPreviewMeshes();
@@ -561,6 +658,7 @@ public class GridPlacementSystem : MonoBehaviour
         GameObject ghost = GetPooled(ghostPool, 0, previewColor, "PlacementPreview");
         ghost.SetActive(true);
         SetGhostMesh(ghost, null);
+        SetGhostTint(ghost, previewColor);
         Vector3 scale = piecePrefab.transform.localScale;
         scale.y *= heightMultiplier;
         ghost.transform.SetPositionAndRotation(
@@ -568,39 +666,6 @@ public class GridPlacementSystem : MonoBehaviour
         ghost.transform.localScale = scale;
         for (int i = 1; i < ghostPool.Count; i++)
             ghostPool[i].SetActive(false);
-    }
-
-    // Shared course rule for straight grid runs: a ground-anchored course
-    // follows the terrain through empty cells; anything else must line up
-    // exactly with the anchor's build elevation. Cells inside spline walls
-    // are blocked via physics, standing in for the occupancy those walls
-    // no longer register on the grid.
-    bool TryGetCourseBaseY(float x, float z, bool anchorOnGround, float anchorBase, float courseYaw, out float baseY)
-    {
-        bool cellOnGround = !TryGetHighestPieceTop(x, z, out float stackTop);
-        baseY = cellOnGround ? SampleCellGroundY(x, z) : stackTop;
-        bool aligned = (anchorOnGround && cellOnGround) || Mathf.Approximately(baseY, anchorBase);
-        return aligned && !SplineWallBlocksSpan(x, z, baseY, baseY + CurrentWallHeight, courseYaw);
-    }
-
-    bool SplineWallBlocksSpan(float x, float z, float bottom, float top, float courseYaw)
-    {
-        Vector3 center = new Vector3(x, (bottom + top) * 0.5f, z);
-        Vector3 halfExtents = new Vector3(gridSize * 0.45f, (top - bottom) * 0.45f, gridSize * 0.45f);
-        foreach (Collider c in Physics.OverlapBox(center, halfExtents))
-        {
-            if (c.isTrigger || c.GetComponent<SplineWallSection>() == null)
-                continue;
-
-            // Same junction rule spline walls use: a grid course crossing a
-            // spline wall at a real angle pushes through and connects; only
-            // a near-parallel run through the same space is blocked.
-            float delta = Mathf.Abs(Mathf.DeltaAngle(courseYaw, c.transform.eulerAngles.y));
-            delta = Mathf.Min(delta, 180f - delta);
-            if (delta < 25f)
-                return true;
-        }
-        return false;
     }
 
     // Pooled ghosts flip between the shared box mesh and per-slice curve
@@ -612,243 +677,244 @@ public class GridPlacementSystem : MonoBehaviour
             filter.sharedMesh = mesh != null ? mesh : prefabMesh;
     }
 
-    // Deletion mirrors the build flow: hovering shows a red overlay on the
-    // single piece the cursor is on, click-dragging extends that preview
-    // along the same 45°-locked line build uses, and nothing is destroyed
-    // until the button is released — exactly what's red when the button
-    // comes up is what's removed.
-    void UpdateDelete(Mouse mouse, Ray ray, bool overUI)
+    // The offset tool: click an existing wall and a parallel copy of its
+    // curve previews at a locked distance — plain scroll steps the
+    // distance (the wheel is claimed while a source is selected), the
+    // cursor's side of the source picks which side it lands on, click
+    // commits, Escape lets go of the source. The committed wall is a
+    // normal wall: it steps its own terrain and cuts its own junctions.
+    void UpdateOffset(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
-        if (deleteAnchorPiece != null)
+        HandleHeightScroll(mouse, keyboard);
+
+        if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
         {
-            // Re-resolved only while there's a real target under the cursor;
-            // off-target frames (HUD, sky) keep the last preview so release
-            // still commits what the overlay showed, matching build.
-            PlacedPiece anchor = deleteAnchorPiece.GetComponent<PlacedPiece>();
-            SplineWallSection anchorSection = deleteAnchorPiece.GetComponent<SplineWallSection>();
-            if (!overUI)
-            {
-                if (TryGetPlacedPieceUnderCursor(ray, out Transform under))
-                {
-                    SplineWallSection underSection = under.GetComponent<SplineWallSection>();
-                    if (anchorSection != null)
-                    {
-                        // Spline anchors extend only along their own wall —
-                        // wall membership, not grid lines, defines the run.
-                        if (underSection != null && underSection.wall == anchorSection.wall)
-                            MarkWallRangeDoomed(anchorSection, underSection);
-                    }
-                    else if (anchor != null && underSection == null)
-                    {
-                        PlacedPiece underPiece = under.GetComponent<PlacedPiece>();
-                        // Dragging within the anchor's own column flips the
-                        // run vertical: it climbs the stack instead of
-                        // walking the grid.
-                        if (SameColumn(under.position, deleteAnchorPiece.position))
-                            MarkColumnDoomed(anchor, underPiece);
-                        // Both ends on the same committed run: follow its
-                        // own piece order instead of a straight grid line.
-                        else if (underPiece != null && anchor.groupId != 0 && underPiece.groupId == anchor.groupId)
-                            MarkGroupRangeDoomed(anchor, underPiece);
-                        else
-                            MarkLineDoomed(anchor, under.position);
-                    }
-                    // Mixed grid/spline drags keep the last preview.
-                }
-                // The cell fallback (assist boxes / ground) can't express a
-                // height, so it only drives horizontal grid runs; a
-                // same-column cell hit keeps the previous preview instead.
-                else if (anchor != null && TryGetPlacementCell(ray, out Vector3 cellTarget)
-                    && !SameColumn(cellTarget, deleteAnchorPiece.position))
-                {
-                    MarkLineDoomed(anchor, cellTarget);
-                }
-            }
+            offsetSource = null;
+            CancelCurve();
+            return;
         }
-        else
+
+        if (offsetSource == null)
         {
-            doomedPieces.Clear();
-            if (!overUI && TryGetPlacedPieceUnderCursor(ray, out Transform hovered))
+            if (!overUI && TryGetSectionUnderCursor(ray, out SplineWallSection hovered))
             {
-                doomedPieces.Add(hovered);
+                ShowWallHighlight(hovered.wall);
                 if (mouse.leftButton.wasPressedThisFrame)
-                    deleteAnchorPiece = hovered;
+                    offsetSource = hovered.wall;
             }
+            else
+            {
+                HideGhosts();
+            }
+            return;
         }
 
-        ShowDeleteOverlays(doomedPieces);
+        bool ctrlHeld = keyboard != null && (keyboard.leftCtrlKey.isPressed || keyboard.rightCtrlKey.isPressed);
+        float scroll = mouse.scroll.ReadValue().y;
+        if (!ctrlHeld && Mathf.Abs(scroll) > 0.01f)
+            offsetDistance = Mathf.Clamp(offsetDistance + Mathf.Sign(scroll) * lengthStep, gridSize, 30f);
 
-        if (mouse.leftButton.wasReleasedThisFrame)
+        if (!overUI && TryGetSurfacePoint(ray, out Vector3 cursorPoint))
+            offsetSide = offsetSource.SideOf(cursorPoint);
+
+        SplineWall.OffsetCurve(offsetSource.curveStart, offsetSource.curveControl, offsetSource.curveEnd,
+            offsetSide * offsetDistance, out Vector3 s2, out Vector3 c2, out Vector3 e2);
+        BuildOffsetPreview(s2, c2, e2);
+        ShowSplineGhosts();
+        guideCenter = (s2 + e2) * 0.5f;
+        guideBearing = Mathf.Atan2(e2.z - s2.z, e2.x - s2.x) * Mathf.Rad2Deg;
+
+        if (mouse.leftButton.wasPressedThisFrame && HasPlaceableSpecs())
         {
-            if (deleteAnchorPiece != null)
-            {
-                // Spline walls losing every remaining section lose the
-                // wall object too.
-                var doomedPerWall = new Dictionary<SplineWall, int>();
-                foreach (Transform piece in doomedPieces)
-                {
-                    SplineWallSection section = piece.GetComponent<SplineWallSection>();
-                    if (section != null && section.wall != null)
-                        doomedPerWall[section.wall] = doomedPerWall.TryGetValue(section.wall, out int n) ? n + 1 : 1;
-                    Destroy(piece.gameObject);
-                }
-                foreach (KeyValuePair<SplineWall, int> pair in doomedPerWall)
-                {
-                    if (pair.Key.GetComponentsInChildren<SplineWallSection>().Length <= pair.Value)
-                        Destroy(pair.Key.gameObject);
-                }
-                doomedPieces.Clear();
-                HideDeleteOverlays();
-            }
-            deleteAnchorPiece = null;
+            SplineWall.Create(splineParent, s2, c2, e2, CurrentWallHeight, gridSize, BaseHeight,
+                wallMaterial, splineSpecs, gridSize, baseStepSize, false);
+            previewMeshes.Clear();
+            splineSpecs.Clear();
+            lastOffsetKey = null;
+            HideGhosts();
         }
     }
 
-    // Spline delete run: every section of the wall between the two drag
-    // ends, by the wall's own ordering — terrain height plays no part.
+    void BuildOffsetPreview(Vector3 s, Vector3 c, Vector3 e)
+    {
+        var key = (s, c, e, CurrentWallHeight);
+        if (lastOffsetKey.HasValue && lastOffsetKey.Value == key)
+            return;
+        lastOffsetKey = key;
+        lastPreviewKey = null;
+        lastCourseKey = null;
+
+        ClearPreviewMeshes();
+        splineSpecs.Clear();
+        splineSpecs.AddRange(SplineWall.BuildSpecs(s, c, e,
+            CurrentWallHeight, gridSize, gridSize, baseStepSize, BaseHeight,
+            int.MaxValue, true));
+        foreach (SplineWall.SectionSpec spec in splineSpecs)
+            previewMeshes.Add(spec.mesh);
+    }
+
+    // Shells the hovered wall in preview color so the offset tool shows
+    // what a click would take as its source.
+    void ShowWallHighlight(SplineWall wall)
+    {
+        ClearPreviewMeshes();
+        splineSpecs.Clear();
+        lastPreviewKey = null;
+        lastCourseKey = null;
+        lastOffsetKey = null;
+
+        int count = 0;
+        foreach (SplineWallSection section in wall.GetComponentsInChildren<SplineWallSection>())
+        {
+            GameObject ghost = GetPooled(ghostPool, count++, previewColor, "PlacementPreview");
+            ghost.SetActive(true);
+            MeshFilter filter = section.GetComponent<MeshFilter>();
+            SetGhostMesh(ghost, filter != null ? filter.sharedMesh : null);
+            SetGhostTint(ghost, previewColor);
+            ghost.transform.SetPositionAndRotation(section.transform.position, section.transform.rotation);
+            ghost.transform.localScale = Vector3.one * DeleteOverlayScale;
+        }
+        for (int i = count; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    // Nearest non-trigger surface point under the cursor, flattened —
+    // used by the offset tool to read which side of the source wall the
+    // cursor is on.
+    bool TryGetSurfacePoint(Ray ray, out Vector3 point)
+    {
+        RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (RaycastHit hit in hits)
+        {
+            if (hit.collider.isTrigger)
+                continue;
+            point = new Vector3(hit.point.x, 0f, hit.point.z);
+            return true;
+        }
+        point = default;
+        return false;
+    }
+
+    // Deletion mirrors the build flow: hovering shows a red overlay on the
+    // single section the cursor is on, click-dragging extends that preview
+    // along the section's own wall — wall membership, not grid lines,
+    // defines the run — and nothing is destroyed until the button is
+    // released: exactly what's red when the button comes up is removed.
+    void UpdateDelete(Mouse mouse, Ray ray, bool overUI)
+    {
+        if (deleteAnchor != null)
+        {
+            // Re-resolved only while the cursor is on the anchor's own
+            // wall; off-target frames (HUD, sky, other walls) keep the
+            // last preview so release still commits what the overlay
+            // showed, matching build.
+            if (!overUI && TryGetSectionUnderCursor(ray, out SplineWallSection under)
+                && under.wall == deleteAnchor.wall)
+                MarkWallRangeDoomed(deleteAnchor, under);
+        }
+        else
+        {
+            doomedSections.Clear();
+            if (!overUI && TryGetSectionUnderCursor(ray, out SplineWallSection hovered))
+            {
+                doomedSections.Add(hovered.transform);
+                if (mouse.leftButton.wasPressedThisFrame)
+                    deleteAnchor = hovered;
+            }
+        }
+
+        ShowDeleteOverlays(doomedSections);
+
+        if (mouse.leftButton.wasReleasedThisFrame)
+        {
+            if (deleteAnchor != null)
+            {
+                // Connections are modeled: gather the affected walls and
+                // everything linked to them BEFORE destroying, then let
+                // the survivors re-resolve — a neighbour that buried its
+                // end into a deleted wall retracts instead of leaving a
+                // stub hanging in the air. Destruction is immediate so
+                // the survivors' probes see the cleared space.
+                var affected = new HashSet<SplineWall>();
+                foreach (Transform doomed in doomedSections)
+                {
+                    SplineWallSection section = doomed.GetComponent<SplineWallSection>();
+                    if (section != null && section.wall != null)
+                        affected.Add(section.wall);
+                }
+                var candidates = new HashSet<SplineWall>(affected);
+                foreach (SplineWall wall in affected)
+                    candidates.UnionWith(wall.Links);
+
+                foreach (Transform doomed in doomedSections)
+                    DestroyImmediate(doomed.gameObject);
+
+                // Walls losing every remaining section lose the wall
+                // object too; survivors that lost some are gapped and
+                // keep their remaining geometry as-is from here on.
+                foreach (SplineWall wall in affected)
+                {
+                    if (wall == null)
+                        continue;
+                    if (wall.GetComponentsInChildren<SplineWallSection>().Length == 0)
+                        DestroyImmediate(wall.gameObject);
+                    else
+                        wall.hasGaps = true;
+                }
+                Physics.SyncTransforms();
+
+                foreach (SplineWall wall in candidates)
+                {
+                    if (wall == null)
+                        continue;
+                    wall.RebuildSections();
+                    wall.ResolveLinks();
+                }
+                doomedSections.Clear();
+                HideDeleteOverlays();
+            }
+            deleteAnchor = null;
+        }
+    }
+
+    // Delete run: every section of the wall between the two drag ends, by
+    // the wall's own ordering — terrain height plays no part.
     void MarkWallRangeDoomed(SplineWallSection a, SplineWallSection b)
     {
-        doomedPieces.Clear();
+        doomedSections.Clear();
         int min = Mathf.Min(a.index, b.index);
         int max = Mathf.Max(a.index, b.index);
         foreach (SplineWallSection section in a.wall.GetComponentsInChildren<SplineWallSection>())
         {
             if (section.index >= min && section.index <= max)
-                doomedPieces.Add(section.transform);
+                doomedSections.Add(section.transform);
         }
     }
 
-    // Resolves the cell the cursor is targeting. Each placed piece carries
-    // invisible trigger boxes over its four side cells and the cell above
-    // it (see AddPlacementAssist), so a ray through that empty space — not
-    // just one that hits a piece dead-on — resolves to the neighbouring
-    // cell. Each assist box covers exactly one cell, so the box's own
-    // center names the target cell directly; snapping the raw hit point
-    // instead would let a hit on the box's outer face round into the next
-    // cell over. Direct piece hits are nudged along the surface normal so a
-    // side face resolves to the cell beside it and the top face to the
-    // piece's own column (stacking picks the Y). Only when nothing is hit
-    // at all does this fall back to the raw ground plane.
-    bool TryGetPlacementCell(Ray ray, out Vector3 cell)
+    // Deliberately precise (unlike build targeting) — deletion should only
+    // ever affect the exact wall section under the cursor, never something
+    // merely nearby.
+    bool TryGetSectionUnderCursor(Ray ray, out SplineWallSection section)
     {
         RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
         System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
 
         foreach (RaycastHit hit in hits)
         {
-            // A real surface that isn't ours — the terrain — in front of
-            // any remaining pieces: the ray lands there, so the cell under
-            // that landing point is the target.
-            if (!hit.transform.IsChildOf(placedParent))
-            {
-                cell = SnapToGrid(hit.point);
-                return true;
-            }
-
-            if (hit.transform.name == "PlacementAssist")
-            {
-                // Entering an assist box through its top face means the ray
-                // is dropping past this cell from above, headed for
-                // something the player can actually see beyond it — the
-                // floor of a slot between two walls, say. Without this,
-                // walls flanking a slot cap it with an invisible ceiling at
-                // wall height, and a tilted ray gets caught there and snaps
-                // to a nearer cell than the one under the cursor. Side
-                // entries are the assist's real job — a ray brushing past a
-                // wall at wall height snaps to the cell it flew through —
-                // and they keep claiming the target as before.
-                if (hit.normal.y > 0.5f)
-                    continue;
-                cell = SnapToGrid(hit.collider.bounds.center);
-                return true;
-            }
-
-            cell = SnapToGrid(hit.point + hit.normal * (gridSize * 0.5f));
-            return true;
+            if (hit.collider.isTrigger)
+                continue;
+            section = hit.collider.GetComponent<SplineWallSection>();
+            return section != null;
         }
 
-        Plane groundPlane = new Plane(Vector3.up, Vector3.zero);
-        if (groundPlane.Raycast(ray, out float enter) && enter > 0f && enter <= 500f)
-        {
-            cell = SnapToGrid(ray.GetPoint(enter));
-            return true;
-        }
-
-        cell = Vector3.zero;
+        section = null;
         return false;
     }
 
-    // Snaps to the center of whichever grid cell the point falls in, so a
-    // placed piece's footprint lines up flush with the surrounding grid
-    // lines instead of straddling a corner where four cells meet. XZ only —
-    // vertical placement is span math, not grid math, so cells carry y = 0
-    // until a caller resolves a real elevation.
-    Vector3 SnapToGrid(Vector3 worldPoint)
-    {
-        float x = (Mathf.Floor(worldPoint.x / gridSize) + 0.5f) * gridSize;
-        float z = (Mathf.Floor(worldPoint.z / gridSize) + 0.5f) * gridSize;
-        return new Vector3(x, 0f, z);
-    }
-
-    // Walks the drag from start to target along the nearest 45° increment
-    // (N/S/E/W + diagonals), returning every grid cell along that line —
-    // matches how most wall-drawing tools keep a drag straight instead of
-    // following raw input.
-    List<Vector3> ComputeDragLineCells(Vector3 start, Vector3 target)
-    {
-        float gx = (target.x - start.x) / gridSize;
-        float gz = (target.z - start.z) / gridSize;
-
-        float angle = Mathf.Atan2(gz, gx) * Mathf.Rad2Deg;
-        float snappedAngle = Mathf.Round(angle / 45f) * 45f;
-        int dirX = Mathf.RoundToInt(Mathf.Cos(snappedAngle * Mathf.Deg2Rad));
-        int dirZ = Mathf.RoundToInt(Mathf.Sin(snappedAngle * Mathf.Deg2Rad));
-
-        int steps = 0;
-        if (dirX != 0 || dirZ != 0)
-            steps = Mathf.RoundToInt((gx * dirX + gz * dirZ) / (dirX * dirX + dirZ * dirZ));
-
-        var cells = new List<Vector3>();
-        for (int i = 0; i <= steps; i++)
-        {
-            Vector3 cell = start;
-            cell.x += i * dirX * gridSize;
-            cell.z += i * dirZ * gridSize;
-            cells.Add(cell);
-        }
-        return cells;
-    }
-
-    // The elevation the next piece in this column builds up from: the
-    // highest span top among pieces already there, or the ground itself
-    // when the column is empty.
-    float GetColumnTopY(float x, float z)
-    {
-        return TryGetHighestPieceTop(x, z, out float top) ? top : SampleCellGroundY(x, z);
-    }
-
-    bool TryGetHighestPieceTop(float x, float z, out float top)
-    {
-        top = float.MinValue;
-        bool found = false;
-        Vector3 column = new Vector3(x, 0f, z);
-        foreach (Transform child in placedParent)
-        {
-            if (!SameColumn(child.position, column))
-                continue;
-            PlacedPiece piece = child.GetComponent<PlacedPiece>();
-            if (piece == null)
-                continue;
-            found = true;
-            if (piece.topY > top)
-                top = piece.topY;
-        }
-        return found;
-    }
-
-    // Ground elevation for a cell: the lowest of its four corners, so a
-    // wall on a slope embeds into the hillside like a foundation instead
-    // of leaving a floating corner. Falls back to y = 0 with no terrain.
+    // Ground elevation under a marker footprint: the lowest of its four
+    // corners, so a marker on a slope embeds into the hillside instead of
+    // leaving a floating corner. Falls back to y = 0 with no terrain.
     float SampleCellGroundY(float x, float z)
     {
         Terrain terrain = Terrain.activeTerrain;
@@ -862,205 +928,157 @@ public class GridPlacementSystem : MonoBehaviour
         float h3 = terrain.SampleHeight(new Vector3(x + half, 0f, z + half));
         float ground = terrain.transform.position.y + Mathf.Min(Mathf.Min(h0, h1), Mathf.Min(h2, h3));
 
-        // Snapping down keeps the piece embedded (never floating) while
-        // giving nearby cells identical bases wherever the slope is gentle.
         if (baseStepSize > 0f)
             ground = Mathf.Floor(ground / baseStepSize) * baseStepSize;
         return ground;
     }
 
-    static bool SameColumn(Vector3 a, Vector3 b)
+    // Distance guides: the square around the ghost (guideRange to each
+    // side) splits into four sectors from its corners — ahead, behind,
+    // left, and right of the pending wall's run — and each sector shows
+    // one line to its closest wall. Spacing context in every direction,
+    // never more than four lines. Walls being touched (flush joints,
+    // snapped endpoints) are noise and get skipped.
+    void UpdateDistanceGuides()
     {
-        return Mathf.Approximately(a.x, b.x) && Mathf.Approximately(a.z, b.z);
-    }
-
-    // Horizontal delete run: walks the same 45°-locked line build uses and,
-    // in each cell, marks every piece whose vertical span overlaps the
-    // anchor's span. With mixed heights there is no shared "layer" to match
-    // — a tall anchor sweeps away the several short pieces beside it, and a
-    // short anchor takes just the one tall piece its slice passes through.
-    void MarkLineDoomed(PlacedPiece anchor, Vector3 target)
-    {
-        doomedPieces.Clear();
-        foreach (Vector3 cell in ComputeDragLineCells(anchor.transform.position, target))
-            AddOverlappingPiecesAt(cell.x, cell.z, anchor.bottomY, anchor.topY);
-    }
-
-    // Group delete run: both ends sit on the same committed wall, so mark
-    // every piece between them along that wall's own order. Height plays
-    // no part — group membership already proves they're one wall.
-    void MarkGroupRangeDoomed(PlacedPiece anchor, PlacedPiece target)
-    {
-        doomedPieces.Clear();
-        int min = Mathf.Min(anchor.groupIndex, target.groupIndex);
-        int max = Mathf.Max(anchor.groupIndex, target.groupIndex);
-        foreach (Transform child in placedParent)
+        activeGuides.Clear();
+        if (guideCenter.HasValue)
         {
-            PlacedPiece piece = child.GetComponent<PlacedPiece>();
-            if (piece != null && piece.groupId == anchor.groupId
-                && piece.groupIndex >= min && piece.groupIndex <= max)
-                doomedPieces.Add(child);
+            Vector3 center = guideCenter.Value;
+            var bestFace = new Vector3[4];
+            var bestDist = new float[] { float.MaxValue, float.MaxValue, float.MaxValue, float.MaxValue };
+            var found = new bool[4];
+            foreach (SplineWall wall in SplineWall.All)
+            {
+                Vector3 face = wall.ClosestFacePoint(center, out float dist);
+                if (dist > guideRange || dist < 0.05f)
+                    continue;
+                float bearing = Mathf.Atan2(face.z - center.z, face.x - center.x) * Mathf.Rad2Deg;
+                float delta = Mathf.DeltaAngle(guideBearing, bearing);
+                int sector = Mathf.Abs(delta) <= 45f ? 0
+                    : Mathf.Abs(delta) >= 135f ? 1
+                    : delta > 0f ? 2 : 3;
+                if (dist < bestDist[sector])
+                {
+                    bestDist[sector] = dist;
+                    bestFace[sector] = face;
+                    found[sector] = true;
+                }
+            }
+            for (int i = 0; i < 4; i++)
+            {
+                if (!found[i])
+                    continue;
+                Vector3 from = new Vector3(center.x, GuideY(center), center.z);
+                Vector3 to = new Vector3(bestFace[i].x, GuideY(bestFace[i]), bestFace[i].z);
+                activeGuides.Add((from, to, bestDist[i]));
+            }
+        }
+
+        while (guidePool.Count < activeGuides.Count)
+            guidePool.Add(CreateGuideLine());
+        for (int i = 0; i < guidePool.Count; i++)
+        {
+            bool active = i < activeGuides.Count;
+            guidePool[i].gameObject.SetActive(active);
+            if (active)
+            {
+                guidePool[i].SetPosition(0, activeGuides[i].from);
+                guidePool[i].SetPosition(1, activeGuides[i].to);
+            }
         }
     }
 
-    // Vertical delete run: every piece in the anchor's column whose span
-    // overlaps the range from the anchor to the targeted piece, inclusive.
-    void MarkColumnDoomed(PlacedPiece anchor, PlacedPiece target)
+    // Guides hover just above the terrain so they read against it.
+    float GuideY(Vector3 point)
     {
-        doomedPieces.Clear();
-        float bottom = target != null ? Mathf.Min(anchor.bottomY, target.bottomY) : anchor.bottomY;
-        float top = target != null ? Mathf.Max(anchor.topY, target.topY) : anchor.topY;
-        AddOverlappingPiecesAt(anchor.transform.position.x, anchor.transform.position.z, bottom, top);
+        Terrain terrain = Terrain.activeTerrain;
+        if (terrain == null)
+            return point.y + 0.3f;
+        return terrain.transform.position.y + terrain.SampleHeight(point) + 0.3f;
     }
 
-    void AddOverlappingPiecesAt(float x, float z, float bottom, float top)
+    LineRenderer CreateGuideLine()
     {
-        Vector3 column = new Vector3(x, 0f, z);
-        foreach (Transform child in placedParent)
+        GameObject lineObj = new GameObject("DistanceGuide");
+        lineObj.transform.SetParent(transform, false);
+        LineRenderer line = lineObj.AddComponent<LineRenderer>();
+        line.positionCount = 2;
+        line.widthMultiplier = 0.05f;
+        line.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+
+        if (guideMaterial == null)
         {
-            PlacedPiece piece = child.GetComponent<PlacedPiece>();
-            if (piece != null && SameColumn(child.position, column)
-                && piece.SpanOverlaps(bottom, top) && !doomedPieces.Contains(child))
-                doomedPieces.Add(child);
+            Shader shader = Shader.Find("HDRP/Unlit");
+            guideMaterial = new Material(shader != null ? shader : Shader.Find("Sprites/Default"));
+            if (guideMaterial.HasProperty("_UnlitColor"))
+                guideMaterial.SetColor("_UnlitColor", guideColor);
+            else
+                guideMaterial.color = guideColor;
         }
+        line.sharedMaterial = guideMaterial;
+        return line;
     }
 
-    PlacedPiece PlacePiece(Vector3 cell, float yRotation, float lengthScale = 1f, Mesh customMesh = null)
+    // Distance labels ride the guide midpoints. IMGUI because it renders
+    // identically under any pipeline — this is a measurement readout, not
+    // scene art.
+    void OnGUI()
     {
-        // Base elevation is recomputed here too (not just for the ghost
-        // preview) so placement is correct regardless of the Y passed in.
-        float bottom = GetColumnTopY(cell.x, cell.z);
-        float height = CurrentWallHeight;
-        Vector3 position = new Vector3(cell.x, bottom + height / 2f, cell.z);
+        if (cam == null || activeGuides.Count == 0)
+            return;
 
-        GameObject placed = Instantiate(piecePrefab, position, Quaternion.Euler(0f, yRotation, 0f), placedParent);
-        placed.name = piecePrefab.name;
-        Vector3 scale = piecePrefab.transform.localScale;
-        scale.x *= lengthScale;
-        scale.y *= heightMultiplier;
-        placed.transform.localScale = scale;
-
-        if (customMesh != null)
+        if (guideLabelStyle == null)
         {
-            MeshFilter filter = placed.GetComponent<MeshFilter>();
-            if (filter != null)
-                filter.sharedMesh = customMesh;
+            guideLabelStyle = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleCenter,
+                fontSize = 14,
+                fontStyle = FontStyle.Bold,
+            };
         }
 
-        PlacedPiece data = placed.AddComponent<PlacedPiece>();
-        data.bottomY = bottom;
-        data.topY = bottom + height;
-        data.size = new Vector3(gridSize * lengthScale, height, gridSize);
-        data.ownedMesh = customMesh;
-
-        AddPlacementAssist(placed, height);
-        return data;
-    }
-
-    // Adds invisible trigger boxes around a placed piece — one per cell it
-    // should help target: the four cardinal sides plus the cell directly
-    // above, deliberately not the diagonals, so rays through the corner
-    // cells fall through to the ground plane instead of snapping sideways.
-    // Each box covers exactly one cell so TryGetPlacementCell can read the
-    // target cell straight off the box's center. Local scale cancels out
-    // the piece's own visual scale so the box dimensions below are exact
-    // grid units regardless of how the piece itself is stretched.
-    void AddPlacementAssist(GameObject piece, float pieceHeight)
-    {
-        GameObject assist = new GameObject("PlacementAssist");
-        assist.transform.SetParent(piece.transform, false);
-
-        Vector3 pieceScale = piece.transform.localScale;
-        assist.transform.localScale = new Vector3(1f / pieceScale.x, 1f / pieceScale.y, 1f / pieceScale.z);
-
-        Vector3[] cellOffsets =
+        foreach ((Vector3 from, Vector3 to, float distance) guide in activeGuides)
         {
-            new Vector3(gridSize, 0f, 0f),
-            new Vector3(-gridSize, 0f, 0f),
-            new Vector3(0f, 0f, gridSize),
-            new Vector3(0f, 0f, -gridSize),
-            new Vector3(0f, pieceHeight, 0f),
-        };
-
-        foreach (Vector3 offset in cellOffsets)
-        {
-            BoxCollider box = assist.AddComponent<BoxCollider>();
-            box.isTrigger = true;
-            box.center = offset;
-            box.size = new Vector3(gridSize, pieceHeight, gridSize);
-        }
-    }
-
-    // Deliberately precise (unlike TryGetPlacementCell) — deletion should
-    // only ever affect the exact piece or wall section under the cursor,
-    // never something merely nearby, so hits on the oversized trigger
-    // assist boxes are skipped in favor of the nearest real collider.
-    bool TryGetPlacedPieceUnderCursor(Ray ray, out Transform piece)
-    {
-        RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
-        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
-
-        foreach (RaycastHit hit in hits)
-        {
-            if (hit.collider.isTrigger)
+            Vector3 screen = cam.WorldToScreenPoint((guide.from + guide.to) * 0.5f);
+            if (screen.z <= 0f)
                 continue;
-
-            bool ours = hit.transform.IsChildOf(placedParent)
-                || hit.collider.GetComponent<SplineWallSection>() != null;
-            piece = ours ? hit.transform : null;
-            return piece != null;
+            string text = guide.distance.ToString("0.0") + "m";
+            Rect rect = new Rect(screen.x - 45f, Screen.height - screen.y - 12f, 90f, 24f);
+            GUI.color = Color.black;
+            GUI.Label(new Rect(rect.x + 1f, rect.y + 1f, rect.width, rect.height), text, guideLabelStyle);
+            GUI.color = guideColor;
+            GUI.Label(rect, text, guideLabelStyle);
         }
-
-        piece = null;
-        return false;
+        GUI.color = Color.white;
     }
 
-    // Reuses pooled ghost instances so a long line doesn't instantiate/destroy
-    // objects every frame; extras left over from a shorter previous line are
-    // deactivated rather than destroyed. Scale is re-copied from the live
-    // prefab every call, not just at creation — otherwise a pooled ghost
-    // keeps showing whatever shape the prefab was when it was first spawned,
-    // silently drifting out of sync if the prefab is edited mid-session.
-    void ShowGhosts(List<Vector3> cells, float yRotation)
-    {
-        Quaternion rotation = Quaternion.Euler(0f, yRotation, 0f);
-        Vector3 scale = piecePrefab.transform.localScale;
-        scale.y *= heightMultiplier;
-        for (int i = 0; i < cells.Count; i++)
-        {
-            GameObject ghost = GetPooled(ghostPool, i, previewColor, "PlacementPreview");
-            ghost.SetActive(true);
-            SetGhostMesh(ghost, null);
-            ghost.transform.SetPositionAndRotation(cells[i], rotation);
-            ghost.transform.localScale = scale;
-        }
-        for (int i = cells.Count; i < ghostPool.Count; i++)
-            ghostPool[i].SetActive(false);
-    }
-
+    // Reuses pooled ghost instances so a long preview doesn't
+    // instantiate/destroy objects every frame; extras left over from a
+    // shorter previous preview are deactivated rather than destroyed.
     void HideGhosts()
     {
         foreach (GameObject ghost in ghostPool)
             ghost.SetActive(false);
     }
 
-    // Shells each doomed piece in a red pooled copy — position, rotation,
-    // and scale are taken from the piece itself, so the overlay reads as
-    // the piece turning red rather than a separate marker.
-    void ShowDeleteOverlays(List<Transform> pieces)
+    // Shells each doomed section in a red pooled copy — position, rotation,
+    // and scale are taken from the section itself, so the overlay reads as
+    // the section turning red rather than a separate marker.
+    void ShowDeleteOverlays(List<Transform> sections)
     {
-        for (int i = 0; i < pieces.Count; i++)
+        for (int i = 0; i < sections.Count; i++)
         {
             GameObject overlay = GetPooled(deletePool, i, deletePreviewColor, "DeletePreview");
             overlay.SetActive(true);
-            // Shell with the piece's actual mesh so curved slices highlight
-            // as curves, not as their bounding boxes.
-            MeshFilter pieceFilter = pieces[i].GetComponent<MeshFilter>();
-            SetGhostMesh(overlay, pieceFilter != null ? pieceFilter.sharedMesh : null);
-            overlay.transform.SetPositionAndRotation(pieces[i].position, pieces[i].rotation);
-            overlay.transform.localScale = pieces[i].localScale * DeleteOverlayScale;
+            // Shell with the section's actual mesh so curved slices
+            // highlight as curves, not as their bounding boxes.
+            MeshFilter sectionFilter = sections[i].GetComponent<MeshFilter>();
+            SetGhostMesh(overlay, sectionFilter != null ? sectionFilter.sharedMesh : null);
+            overlay.transform.SetPositionAndRotation(sections[i].position, sections[i].rotation);
+            overlay.transform.localScale = sections[i].localScale * DeleteOverlayScale;
         }
-        for (int i = pieces.Count; i < deletePool.Count; i++)
+        for (int i = sections.Count; i < deletePool.Count; i++)
             deletePool[i].SetActive(false);
     }
 

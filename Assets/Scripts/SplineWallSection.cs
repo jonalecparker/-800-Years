@@ -9,6 +9,14 @@ public class SplineWallSection : MonoBehaviour
     public int index;
     public float tStart;
     public float tEnd;
+    // Actual sweep range plus junction cut planes — differ from
+    // tStart/tEnd where this section was cut against older walls' faces.
+    // Courses stacked above copy these, so cuts carry upward. Cut lists
+    // are null when the section has no cuts.
+    public float tSweepStart;
+    public float tSweepEnd;
+    public System.Collections.Generic.List<Vector3> cutPoints;
+    public System.Collections.Generic.List<Vector3> cutNormals;
     public float bottomY;
     public float topY;
     [HideInInspector] public Mesh ownedMesh;

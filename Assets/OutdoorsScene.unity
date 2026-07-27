@@ -119,56 +119,6 @@ NavMeshSettings:
     debug:
       m_Flags: 0
   m_NavMeshData: {fileID: 0}
---- !u!1 &86173219
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 86173221}
-  - component: {fileID: 86173220}
-  m_Layer: 0
-  m_Name: GridVisualizer
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 1
---- !u!114 &86173220
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 86173219}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: bcaa6271314b4cf428aec364b48fd2fe, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::GridVisualizer
-  gridSize: 1
-  patchCells: 12
-  lineHeight: 0.03
-  lineWidth: 0.05
-  segmentsPerCell: 2
-  lineMaterial: {fileID: 2100000, guid: 121330d0a4d807f4d810f4033ebdbce9, type: 2}
---- !u!4 &86173221
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 86173219}
-  serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &157207112
 GameObject:
   m_ObjectHideFlags: 0
@@ -489,11 +439,18 @@ MonoBehaviour:
   piecePrefab: {fileID: 2562516638415339310, guid: 4af28b0ba82efee408e44c68c51df9ec, type: 3}
   gridSize: 1
   placementYOffset: 1.75
+  baseStepSize: 0.5
   minHeightMultiplier: 0.25
   maxHeightMultiplier: 3
   heightMultiplierStep: 0.25
+  curveBulgeStep: 0.5
+  endpointSnapRadius: 0.75
   previewColor: {r: 0.3, g: 0.9, b: 1, a: 1}
   deletePreviewColor: {r: 1, g: 0.3, b: 0.25, a: 1}
+  guideRange: 5
+  guideColor: {r: 1, g: 0.85, b: 0.2, a: 1}
+  angleStep: 15
+  lengthStep: 0.5
 --- !u!4 &1064011757
 Transform:
   m_ObjectHideFlags: 0
@@ -1111,6 +1068,5 @@ SceneRoots:
   - {fileID: 2013410475}
   - {fileID: 1347441362}
   - {fileID: 1064011757}
-  - {fileID: 86173221}
   - {fileID: 1211390081}
   - {fileID: 1184855076}

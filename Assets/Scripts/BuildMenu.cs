@@ -32,6 +32,7 @@ public class BuildMenu : MonoBehaviour
     private string openCategory;
     private Image deleteButtonImage;
     private Image curveButtonImage;
+    private Image offsetButtonImage;
     private GameObject dragCountPanel;
     private Text dragCountText;
     private GameObject heightPanel;
@@ -98,10 +99,13 @@ public class BuildMenu : MonoBehaviour
 
         // Curved toggles the build tool between straight runs and the
         // three-click curve flow; it stays lit while the curve shape is
-        // armed. Delete sits beside it: one click arms the delete tool
-        // (button turns red), a second click — or picking any build item —
-        // returns to building.
+        // armed. Offset arms the parallel-wall tool (click a wall, scroll
+        // the distance, click to lay a parallel copy). Delete sits
+        // beside them: one click arms the delete tool (button turns
+        // red), a second click — or picking any build item — returns to
+        // building.
         curveButtonImage = CreateButton(categoryRow, "Curved", ToggleCurveShape).GetComponent<Image>();
+        offsetButtonImage = CreateButton(categoryRow, "Offset", ToggleOffsetMode).GetComponent<Image>();
         deleteButtonImage = CreateButton(categoryRow, "Delete", ToggleDeleteMode).GetComponent<Image>();
 
         // Small readouts tucked above the bar's right end: the wall height
@@ -157,9 +161,9 @@ public class BuildMenu : MonoBehaviour
             dragCountText.text = count == 1 ? "1 wall" : count + " walls";
         dragCountPanel.SetActive(count > 0);
 
-        // Height only means anything while building, so the readout follows
-        // the tool.
-        bool building = placementSystem.Mode == GridPlacementSystem.ToolMode.Build;
+        // Height only means anything while placing walls (building or
+        // offsetting), so the readout follows the tool.
+        bool building = placementSystem.Mode != GridPlacementSystem.ToolMode.Delete;
         heightPanel.SetActive(building);
         if (building)
             heightText.text = $"Height ×{placementSystem.HeightMultiplier:0.##}  ({placementSystem.CurrentWallHeight:0.##}m)";
@@ -175,6 +179,7 @@ public class BuildMenu : MonoBehaviour
         {
             placementSystem.SetMode(GridPlacementSystem.ToolMode.Build);
             deleteButtonImage.color = buttonColor;
+            offsetButtonImage.color = buttonColor;
         }
 
         bool entering = placementSystem.Shape == GridPlacementSystem.BuildShape.Straight;
@@ -182,6 +187,23 @@ public class BuildMenu : MonoBehaviour
             ? GridPlacementSystem.BuildShape.Curved
             : GridPlacementSystem.BuildShape.Straight);
         curveButtonImage.color = entering ? selectedColor : buttonColor;
+    }
+
+    void ToggleOffsetMode()
+    {
+        if (placementSystem == null)
+            return;
+
+        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Offset;
+        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Offset : GridPlacementSystem.ToolMode.Build);
+        offsetButtonImage.color = entering ? selectedColor : buttonColor;
+        deleteButtonImage.color = buttonColor;
+
+        if (entering)
+        {
+            itemRow.gameObject.SetActive(false);
+            openCategory = null;
+        }
     }
 
     void ToggleDeleteMode()
@@ -192,6 +214,7 @@ public class BuildMenu : MonoBehaviour
         bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Delete;
         placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Delete : GridPlacementSystem.ToolMode.Build);
         deleteButtonImage.color = entering ? deleteActiveColor : buttonColor;
+        offsetButtonImage.color = buttonColor;
 
         if (entering)
         {
@@ -288,9 +311,10 @@ public class BuildMenu : MonoBehaviour
             if (item.prefab != null)
                 placementSystem.piecePrefab = item.prefab;
 
-            // Picking something to build always disarms the delete tool.
+            // Picking something to build always disarms the other tools.
             placementSystem.SetMode(GridPlacementSystem.ToolMode.Build);
             deleteButtonImage.color = buttonColor;
+            offsetButtonImage.color = buttonColor;
         }
 
         itemRow.gameObject.SetActive(false);

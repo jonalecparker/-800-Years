@@ -2,15 +2,20 @@
 
 Unity 6 / HDRP castle-builder graybox. Session workflow: `/start` to recap, `/wrap` to archive+commit — `Docs/NextSession.md` and `Docs/SessionLog/` are the project memory; read them, not this file, for current state.
 
-## Two wall systems coexist (deliberate)
+## One wall system, no grid (2026-07-27)
 
-- Straight walls = grid pieces (`GridPlacementSystem` + `PlacedPiece`); curved walls = `SplineWall` objects with uniform sections. Do not "unify" them casually — it's a known, discussed future step, not an oversight.
-- Cross-system occupancy is **physics overlap with a 25° angle rule** (crossing = junction, near-parallel = duplicate → blocked). Both `SplineWall.IsBlocked` and `GridPlacementSystem.SplineWallBlocksSpan` implement it; change one, change both.
-- Grid pieces have **square footprints — transform yaw does not encode run direction**. Any direction/angle test must use `PlacedPiece.runYaw` (recorded at placement). This has caused two real bugs already.
+- **Every wall is a `SplineWall`** — a straight wall is a bulge-0 spline committed by the drag tool; a plain click is a token 10cm chord the end extensions grow into a short stub. `PlacedPiece`, per-cell placement, `SnapToGrid`, and `GridVisualizer` are all gone — **placement is free**. Alignment comes from assists: endpoint chaining (0.75m), drag length stepping **relative to the anchor** (`lengthStep` 0.5m; direction is freeform, Shift snaps it to `angleStep` 15°, Alt frees everything), distance guides, and the **Offset tool** (BuildMenu button: click a wall → scroll steps a locked parallel distance, cursor side picks the side, click lays the copy — `SplineWall.OffsetCurve`). `gridSize` now just means wall thickness / target section length.
+- Occupancy is **physics overlap**, implemented once in `SplineWall.IsBlocked`, and it only refuses a wall whose **centerline** reaches another wall's body (slim thickness extent) — a wall merely leaning its face into a neighbour is legal and gets **fused flush** by graze clipping instead.
+- Junctions are **cut geometry, not interpenetration**: where a sweep's centerline passes inside an *older* wall's body at ≥10° (`FindJunctionBands`, one band **per host wall** — bands overlap at multi-wall junctions), interior sections are dropped and every kept piece carries the applicable hosts' **face planes** (`cutPoints`/`cutNormals`, inset 1.5cm into the host to avoid z-fighting). Mesh rows clip their cross-section against each plane (`ClipRow`), so cut edges follow host faces exactly — flush butt caps at 90°, clean diagonals at shallow angles. Cutting is asymmetric and stable via `buildOrder` — newer cuts against older, never the reverse.
+- **Graze lanes** (side-offset scans, angle-free) catch what the centerline misses: a face dipping into a host mid-run or a wall leaning alongside one — the face plane comes from a sideways raycast and clips the sliver flush (near-parallel walls **fuse** instead of interpenetrating). Corner clips at a host's *end* (two different faces) are a known, deliberate skip. Extension crumbs severed from the body by a band (chained-corner overshoot) are dropped in `EmitPiece`.
+- **Under-one-meter gap ⇒ connect**: a wall end whose face gap to another wall is under one section length overshoots into it (`EndExtension`, probe reach 1.25 + 0.2 radius ⇒ detects faces < 1.45 from the endpoint) and the cut planes trim it back flush — the T-join. A gap of exactly 1m (one `lengthStep` × 2) is deliberately preserved as a separator.
+- **Distance guides**: while placing, the square around the ghost (±`guideRange` 5m) splits into four sectors from its corners — ahead/behind/left/right of the run — and each sector draws one line + label (IMGUI) to its closest wall face (`UpdateDistanceGuides` / `SplineWall.ClosestFacePoint`). Max four lines, spacing context in every direction.
+- **Refused placement shows red, never vanishes**: previews build with `includeBlocked: true`, so duplicate-blocked pieces carry `SectionSpec.blocked` and tint red (`SetGhostTint`); `SplineWall.Create` skips and disposes blocked specs, and `ActiveDragCount`/commit guards ignore them.
+- Connections are **modeled**: `SplineWall.Links` (expanded-box overlap — flush contact, T-joints, and stacked courses all count) is resolved at commit, and the delete tool makes linked survivors `RebuildSections()` — buried stubs retract, junction gaps regrow solid when the host dies. Stacked courses (`isStackedCourse`) and walls with delete holes (`hasGaps`) never rebuild — a rebuild would drop a course to the terrain or resurrect the holes.
 
 ## Vertical math is spans, not layers
 
-- `PlacedPiece.bottomY/topY` and `SplineWallSection.bottomY/topY` are the source of truth. Never assume uniform piece height or ground at y=0 (terrain exists; cell ground = min of 4 corners, quantized down by `baseStepSize`).
+- `SplineWallSection.bottomY/topY` is the source of truth. Never assume uniform section height or ground at y=0 (terrain exists; cell ground = min of 4 corners, quantized down by `baseStepSize`).
 - Everything placement-related is deliberately **stepped** (height ×0.25, bulge 0.5m, bases 0.5m) so separately-built structures align. Don't make these continuous.
 
 ## Spline wall geometry
@@ -20,8 +25,8 @@ Unity 6 / HDRP castle-builder graybox. Session workflow: `/start` to recap, `/wr
 
 ## Input arbitration
 
-- The scroll wheel has three meanings: camera dolly (default), wall height (Ctrl), curve bulge (`GridPlacementSystem.ClaimingScrollWheel` during bend phase). `FreeFlyCamera` checks both before dollying — any new wheel use must join this arbitration.
-- Assist boxes are the only trigger colliders in the build scene; raycast/overlap code filters `isTrigger` to skip them. Adding unrelated triggers will confuse placement targeting.
+- The scroll wheel has four meanings: camera dolly (default), wall height (Ctrl), curve bulge (bend phase), offset distance (Offset tool with a source selected). The last two claim the wheel via `GridPlacementSystem.ClaimingScrollWheel`; `FreeFlyCamera` checks it and Ctrl before dollying — any new wheel use must join this arbitration.
+- No trigger colliders exist in the build scene anymore (the grid pieces' assist boxes died with them), but raycast/overlap code still filters `isTrigger` — keep those filters when adding new triggers, or placement targeting will misread them.
 
 ## Tooling gotchas
 
