@@ -117,6 +117,91 @@ public class BuildMenu : MonoBehaviour
         heightPanel = CreateReadout(canvasObj.transform, "HeightPanel",
             new Vector2(-136f, 68f), new Vector2(190f, 40f), out heightText);
         heightPanel.SetActive(false);
+
+        CreateOptionsPanel(canvasObj.transform);
+    }
+
+    // Session option toggles, stacked on the left edge above the bar.
+    // First one: lock the wall top level (bottom follows the terrain
+    // down) instead of the default fixed height above the ground.
+    void CreateOptionsPanel(Transform parent)
+    {
+        GameObject panel = new GameObject("OptionsPanel", typeof(RectTransform));
+        panel.transform.SetParent(parent, false);
+
+        RectTransform rt = panel.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0f, 0f);
+        rt.anchorMax = new Vector2(0f, 0f);
+        rt.pivot = new Vector2(0f, 0f);
+        rt.anchoredPosition = new Vector2(8f, 140f);
+        rt.sizeDelta = new Vector2(240f, 44f);
+
+        Image bg = panel.AddComponent<Image>();
+        bg.color = barColor;
+
+        VerticalLayoutGroup layout = panel.AddComponent<VerticalLayoutGroup>();
+        layout.padding = new RectOffset(10, 10, 8, 8);
+        layout.spacing = 6f;
+        layout.childAlignment = TextAnchor.UpperLeft;
+        layout.childForceExpandWidth = true;
+        layout.childForceExpandHeight = false;
+
+        ContentSizeFitter fitter = panel.AddComponent<ContentSizeFitter>();
+        fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+        CreateToggleRow(panel.transform, "Lock top height", false,
+            on => { if (placementSystem != null) placementSystem.lockTopHeight = on; });
+    }
+
+    // A checkbox row: box + checkmark + label, clickable anywhere on the
+    // row (the label Text is a raycast target too).
+    void CreateToggleRow(Transform parent, string label, bool initial, UnityEngine.Events.UnityAction<bool> onChanged)
+    {
+        GameObject row = new GameObject(label + "Toggle", typeof(RectTransform));
+        row.transform.SetParent(parent, false);
+        LayoutElement layoutElement = row.AddComponent<LayoutElement>();
+        layoutElement.minHeight = 26f;
+
+        GameObject box = new GameObject("Box", typeof(RectTransform));
+        box.transform.SetParent(row.transform, false);
+        RectTransform boxRt = box.GetComponent<RectTransform>();
+        boxRt.anchorMin = new Vector2(0f, 0.5f);
+        boxRt.anchorMax = new Vector2(0f, 0.5f);
+        boxRt.pivot = new Vector2(0f, 0.5f);
+        boxRt.anchoredPosition = Vector2.zero;
+        boxRt.sizeDelta = new Vector2(22f, 22f);
+        Image boxImage = box.AddComponent<Image>();
+        boxImage.color = buttonColor;
+
+        GameObject check = new GameObject("Check", typeof(RectTransform));
+        check.transform.SetParent(box.transform, false);
+        RectTransform checkRt = check.GetComponent<RectTransform>();
+        checkRt.anchorMin = Vector2.zero;
+        checkRt.anchorMax = Vector2.one;
+        checkRt.offsetMin = new Vector2(4f, 4f);
+        checkRt.offsetMax = new Vector2(-4f, -4f);
+        Image checkImage = check.AddComponent<Image>();
+        checkImage.color = selectedColor;
+
+        GameObject textObj = new GameObject("Label", typeof(RectTransform));
+        textObj.transform.SetParent(row.transform, false);
+        RectTransform textRt = textObj.GetComponent<RectTransform>();
+        textRt.anchorMin = Vector2.zero;
+        textRt.anchorMax = Vector2.one;
+        textRt.offsetMin = new Vector2(30f, 0f);
+        textRt.offsetMax = Vector2.zero;
+        Text text = textObj.AddComponent<Text>();
+        text.text = label;
+        text.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        text.alignment = TextAnchor.MiddleLeft;
+        text.color = Color.white;
+        text.fontSize = 16;
+
+        Toggle toggle = row.AddComponent<Toggle>();
+        toggle.targetGraphic = boxImage;
+        toggle.graphic = checkImage;
+        toggle.isOn = initial;
+        toggle.onValueChanged.AddListener(onChanged);
     }
 
     GameObject CreateReadout(Transform parent, string name, Vector2 anchoredPosition, Vector2 size, out Text text)
@@ -166,7 +251,13 @@ public class BuildMenu : MonoBehaviour
         bool building = placementSystem.Mode != GridPlacementSystem.ToolMode.Delete;
         heightPanel.SetActive(building);
         if (building)
-            heightText.text = $"Height ×{placementSystem.HeightMultiplier:0.##}  ({placementSystem.CurrentWallHeight:0.##}m)";
+        {
+            // EffectiveWallHeight, not CurrentWallHeight: while snapped to
+            // a wall the ghost adopts that wall's height, and the readout
+            // shows what would actually be built.
+            float height = placementSystem.EffectiveWallHeight;
+            heightText.text = $"Height ×{height / placementSystem.BaseHeight:0.##}  ({height:0.##}m)";
+        }
     }
 
     void ToggleCurveShape()

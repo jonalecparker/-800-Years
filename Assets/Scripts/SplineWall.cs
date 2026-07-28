@@ -36,6 +36,11 @@ public class SplineWall : MonoBehaviour
     // Set once a delete has punched sections out of this wall — a rebuild
     // would resurrect the holes, so a gapped wall keeps its geometry.
     public bool hasGaps;
+    // Locked-top walls: every section's top sits at this absolute height
+    // and only the bottom follows the terrain down — a level parapet on a
+    // slope. -Infinity (the default) means tops ride the ground instead
+    // (bottom + height per section).
+    public float fixedTopY = float.NegativeInfinity;
     // Commit order. Junction trimming is asymmetric and stable: the newer
     // wall always trims against the older wall's body, never the reverse,
     // so rebuilds can't eat a hole from both sides of a crossing.
@@ -104,6 +109,12 @@ public class SplineWall : MonoBehaviour
         public float aIn, aOut;
         public bool hasIn, hasOut;
         public Vector3 pIn, nIn, pOut, nOut;
+        // True once the host has appeared under the crossing-angle gate —
+        // only such bands may stay open through the body on the geometric
+        // hysteresis. A band that opened parallel in the gate-free end
+        // zone dies at the zone boundary instead, so a redraw entering
+        // through a cap refuses red rather than swallowing the wall.
+        public bool gateQualified;
     }
 
     void OnEnable() { All.Add(this); }
@@ -119,7 +130,7 @@ public class SplineWall : MonoBehaviour
 
     public static SplineWall Create(Transform parent, Vector3 s, Vector3 control, Vector3 e,
         float height, float thickness, float baseWallHeight, Material material, List<SectionSpec> specs,
-        float targetSectionLength, float baseStep, bool isStackedCourse)
+        float targetSectionLength, float baseStep, bool isStackedCourse, float fixedTopY = float.NegativeInfinity)
     {
         GameObject wallObj = new GameObject("SplineWall");
         wallObj.transform.SetParent(parent, false);
@@ -133,6 +144,7 @@ public class SplineWall : MonoBehaviour
         wall.targetSectionLength = targetSectionLength;
         wall.baseStep = baseStep;
         wall.isStackedCourse = isStackedCourse;
+        wall.fixedTopY = fixedTopY;
         wall.material = material;
         wall.buildOrder = nextBuildOrder++;
 
@@ -225,7 +237,7 @@ public class SplineWall : MonoBehaviour
         Physics.SyncTransforms();
 
         foreach (SectionSpec spec in BuildSpecs(curveStart, curveControl, curveEnd,
-            height, targetSectionLength, thickness, baseStep, baseWallHeight, buildOrder))
+            height, targetSectionLength, thickness, baseStep, baseWallHeight, buildOrder, false, fixedTopY))
             CreateSection(spec, material);
         Physics.SyncTransforms();
     }
@@ -241,7 +253,7 @@ public class SplineWall : MonoBehaviour
     // previews and new walls): only OLDER walls trim this sweep.
     public static List<SectionSpec> BuildSpecs(Vector3 s, Vector3 control, Vector3 e,
         float height, float targetSectionLength, float thickness, float baseStep, float baseWallHeight,
-        int buildOrder = int.MaxValue, bool includeBlocked = false)
+        int buildOrder = int.MaxValue, bool includeBlocked = false, float fixedTopY = float.NegativeInfinity)
     {
         var specs = new List<SectionSpec>();
         float[] arcTable = BuildArcTable(s, control, e);
@@ -293,14 +305,14 @@ public class SplineWall : MonoBehaviour
                     continue;
                 if (m.x > cursor + 0.001f)
                     EmitPiece(specs, s, control, e, i, cursor, m.x, bands, totalArc,
-                        height, thickness, baseStep, baseWallHeight, arcTable, includeBlocked);
+                        height, thickness, baseStep, baseWallHeight, arcTable, includeBlocked, fixedTopY);
                 cursor = Mathf.Max(cursor, m.y);
                 if (cursor >= a1)
                     break;
             }
             if (cursor < a1 - 0.01f)
                 EmitPiece(specs, s, control, e, i, cursor, a1, bands, totalArc,
-                    height, thickness, baseStep, baseWallHeight, arcTable, includeBlocked);
+                    height, thickness, baseStep, baseWallHeight, arcTable, includeBlocked, fixedTopY);
         }
         return specs;
     }
@@ -317,7 +329,7 @@ public class SplineWall : MonoBehaviour
     static void EmitPiece(List<SectionSpec> specs, Vector3 s, Vector3 control, Vector3 e, int index,
         float k0, float k1, List<Band> bands, float totalArc,
         float height, float thickness, float baseStep, float baseWallHeight, float[] arcTable,
-        bool includeBlocked)
+        bool includeBlocked, float fixedTopY)
     {
         if (k1 - k0 < 0.08f)
             return;
@@ -386,7 +398,15 @@ public class SplineWall : MonoBehaviour
         spec.tSweepStart = TFromExtendedArc(arcTable, s, control, e, sweepStartArc);
         spec.tSweepEnd = TFromExtendedArc(arcTable, s, control, e, sweepEndArc);
         spec.bottomY = SampleSliceGround(s, control, e, spec.tSweepStart, spec.tSweepEnd, thickness, baseStep);
-        AddSpecIfClear(specs, s, control, e, spec, height, thickness, baseWallHeight, arcTable, includeBlocked);
+        // A piece cut by an adjacent band deliberately penetrates its
+        // host at that end (inset + side-crossing overshoot) — pull the
+        // occupancy range back from the cut so the burial can't read as
+        // a near-parallel duplicate and drop the piece.
+        bool cutAdjacent = bandAtStart || bandAtEnd;
+        float blockArc0 = bandAtStart ? k0 + 0.3f : sweepStartArc;
+        float blockArc1 = bandAtEnd ? k1 - 0.3f : sweepEndArc;
+        AddSpecIfClear(specs, s, control, e, spec, height, fixedTopY, thickness, baseWallHeight, arcTable, includeBlocked,
+            cutAdjacent ? blockArc0 : float.NaN, cutAdjacent ? blockArc1 : float.NaN);
     }
 
     static void AddCut(ref SectionSpec spec, Vector3 point, Vector3 normal)
@@ -458,6 +478,7 @@ public class SplineWall : MonoBehaviour
     {
         Terrain terrain = Terrain.activeTerrain;
         const float step = 0.06f;
+        float totalArc = arcTable[arcTable.Length - 1];
 
         Vector3 ProbeAt(float arc, float sideOffset)
         {
@@ -487,6 +508,66 @@ public class SplineWall : MonoBehaviour
                 if (IsCrossingHost(c, tanDir, buildOrder, requireAngle))
                     hosts.Add(c.GetComponent<SplineWallSection>().wall);
             return hosts;
+        }
+
+        // A raycast face is only the host's tangent plane at one hit point.
+        // On a convex curve the real face bows away from that plane, so a
+        // cap clipped to it sits proud of the masonry by the sagitta —
+        // visible daylight at the joint. Measure the host's TRUE face
+        // analytically (its curve offset by half its thickness — the
+        // colliders are box approximations with cracks and interior caps,
+        // useless for this) across the lateral span the cut will occupy,
+        // and return the deepest recession behind the plane; the caller
+        // sinks the plane by it, burying the cap inside the curve —
+        // CutInset's trick, made curvature-aware. Flat faces and host end
+        // caps measure zero and stay put.
+        float FaceRecession(Vector3 point, Vector3 normal, float reach, SplineWall host)
+        {
+            const float MaxSink = 0.25f;
+            if (reach < 0.01f || host == null)
+                return 0f;
+            Vector3 hs = host.curveStart, hc = host.curveControl, he = host.curveEnd;
+
+            // Closest centerline parameter to the plane anchor, a little
+            // past the ends to cover end-extension geometry.
+            float bestT = 0f, bestSq = float.MaxValue;
+            for (float t = -0.2f; t <= 1.2001f; t += 0.01f)
+            {
+                Vector3 q = Evaluate(hs, hc, he, t);
+                float dx = point.x - q.x, dz = point.z - q.z;
+                float sq = dx * dx + dz * dz;
+                if (sq < bestSq) { bestSq = sq; bestT = t; }
+            }
+            Vector3 c0 = Evaluate(hs, hc, he, bestT);
+            Vector3 tan0 = Tangent(hs, hc, he, bestT).normalized;
+            float half = host.thickness * 0.5f;
+            // Only flank faces curve: anchor off the flank (an end cap) or
+            // a plane whose normal runs along the host are flat — no sink.
+            if (Mathf.Abs(Mathf.Sqrt(bestSq) - half) > 0.12f)
+                return 0f;
+            if (Mathf.Abs(normal.x * tan0.x + normal.z * tan0.z) > 0.5f)
+                return 0f;
+            float side = (point.x - c0.x) * -tan0.z + (point.z - c0.z) * tan0.x >= 0f ? 1f : -1f;
+
+            // Curve length estimate: (chord + control polygon) / 2. The
+            // reach is padded 1.5× — sampling past the cap's corners only
+            // sinks a few harmless millimeters deeper, while stopping
+            // short leaves the corners proud, which is the whole bug.
+            float len = ((he - hs).magnitude + (hc - hs).magnitude + (he - hc).magnitude) * 0.5f;
+            float dtReach = reach * 1.5f / Mathf.Max(1f, len);
+            float sink = 0f;
+            for (int i = -4; i <= 4; i++)
+            {
+                float t = bestT + dtReach * (i * 0.25f);
+                Vector3 q = Evaluate(hs, hc, he, t);
+                Vector3 tn = Tangent(hs, hc, he, t).normalized;
+                float fx = q.x + -tn.z * half * side;
+                float fz = q.z + tn.x * half * side;
+                float r = (point.x - fx) * normal.x + (point.z - fz) * normal.z;
+                if (r > sink)
+                    sink = r;
+            }
+            return Mathf.Min(sink, MaxSink);
         }
 
         bool TryFaceAt(float outsideArc, float insideArc, float sideOffset, bool requireAngle, SplineWall host, out Vector3 point, out Vector3 normal)
@@ -522,6 +603,12 @@ public class SplineWall : MonoBehaviour
                     n = new Vector3(-dir.x, 0f, -dir.z);
                 point = new Vector3(hit.point.x, 0f, hit.point.z);
                 normal = n.normalized;
+                // Lateral span of the cut face: half thickness, stretched
+                // by the crossing's obliquity (a skewed cut is wider than
+                // the wall), then sunk to the curve's deepest recession.
+                float obliquity = Mathf.Max(0.15f, Mathf.Abs(normal.x * tanDir.x + normal.z * tanDir.z));
+                float reach = Mathf.Min(2f, thickness * 0.5f / obliquity);
+                point -= normal * FaceRecession(point, normal, reach, host);
                 return true;
             }
             return false;
@@ -529,25 +616,49 @@ public class SplineWall : MonoBehaviour
 
         List<Band> ScanLane(float sideOffset, bool graze)
         {
-            bool requireAngle = !graze;
+            // The crossing-angle gate applies only where the wall's own
+            // BODY overlaps a host — a collinear host there is a duplicate
+            // to refuse, not a junction. Inside the end-extension
+            // overshoot the gate is off: end-on burials (collinear
+            // continuations, closing an in-line gap) band at any angle
+            // and clip flush at the host's cap, instead of dropping whole
+            // blocked sections and leaving a stepped gap.
+            bool RequireAngleAt(float arcPos) => !graze && arcPos > 0.02f && arcPos < totalArc - 0.02f;
+
             var laneBands = new List<Band>();
             var open = new Dictionary<SplineWall, Band>();
-            HashSet<SplineWall> prevHosts = HostsAt(aMin, sideOffset, requireAngle);
+            HashSet<SplineWall> prevHosts = HostsAt(aMin, sideOffset, RequireAngleAt(aMin));
             foreach (SplineWall host in prevHosts)
-                open[host] = new Band { wall = host, graze = graze, aIn = aMin, hasIn = false };
+                open[host] = new Band { wall = host, graze = graze, aIn = aMin, hasIn = false, gateQualified = RequireAngleAt(aMin) };
             float prevArc = aMin;
 
             var left = new List<SplineWall>();
             for (float arc = aMin + step; ; arc += step)
             {
                 float a = Mathf.Min(arc, aMax);
-                HashSet<SplineWall> hosts = HostsAt(a, sideOffset, requireAngle);
+                HashSet<SplineWall> hosts = HostsAt(a, sideOffset, RequireAngleAt(a));
+                // Appearing under the gate qualifies an open band for the
+                // hysteresis below.
+                if (RequireAngleAt(a))
+                    foreach (SplineWall host in hosts)
+                        if (open.TryGetValue(host, out Band qb))
+                            qb.gateQualified = true;
+                // A gate-qualified open band closes at its geometric exit,
+                // never at the gate boundary. A band that never passed the
+                // gate (opened parallel in the gate-free end zone) gets no
+                // such grace — it must close here, or a redraw entering
+                // through a cap would read as one endless burial and drop
+                // the whole wall instead of refusing red.
+                if (open.Count > 0 && RequireAngleAt(a))
+                    foreach (SplineWall host in HostsAt(a, sideOffset, false))
+                        if (open.TryGetValue(host, out Band hb) && hb.gateQualified)
+                            hosts.Add(host);
                 foreach (SplineWall host in hosts)
                 {
                     if (open.ContainsKey(host))
                         continue;
-                    Band band = new Band { wall = host, graze = graze, aIn = prevArc };
-                    band.hasIn = TryFaceAt(prevArc, a, sideOffset, requireAngle, host, out band.pIn, out band.nIn);
+                    Band band = new Band { wall = host, graze = graze, aIn = prevArc, gateQualified = RequireAngleAt(a) };
+                    band.hasIn = TryFaceAt(prevArc, a, sideOffset, false, host, out band.pIn, out band.nIn);
                     open[host] = band;
                 }
                 left.Clear();
@@ -558,7 +669,7 @@ public class SplineWall : MonoBehaviour
                 {
                     Band band = open[host];
                     band.aOut = a;
-                    band.hasOut = TryFaceAt(a, prevArc, sideOffset, requireAngle, host, out band.pOut, out band.nOut);
+                    band.hasOut = TryFaceAt(a, prevArc, sideOffset, false, host, out band.pOut, out band.nOut);
                     if (band.aOut - band.aIn > 0.02f)
                         laneBands.Add(band);
                     open.Remove(host);
@@ -570,11 +681,18 @@ public class SplineWall : MonoBehaviour
             }
             // Sweep ends inside a host (a buried overshoot): everything
             // from the entry face onward is dropped — the flush T-joint.
+            // Except a parallel leftover with no entry face: that's a
+            // redraw lying inside the host, not a burial — discarded, so
+            // its pieces fall through to the duplicate refusal (red)
+            // instead of silently vanishing.
             foreach (KeyValuePair<SplineWall, Band> pair in open)
             {
-                pair.Value.aOut = aMax + 1f;
-                pair.Value.hasOut = false;
-                laneBands.Add(pair.Value);
+                Band band = pair.Value;
+                band.aOut = aMax + 1f;
+                band.hasOut = false;
+                if (!graze && !band.hasIn && !HostsAt(aMax, sideOffset, true).Contains(pair.Key))
+                    continue;
+                laneBands.Add(band);
             }
             return laneBands;
         }
@@ -585,7 +703,7 @@ public class SplineWall : MonoBehaviour
         // centerline (outside the host) toward the lane (inside it) — this
         // works even when the lane never transitions, e.g. a wall leaning
         // alongside a host for its entire length.
-        bool TrySideFace(float arc, float sideOffset, SplineWall host, out Vector3 point, out Vector3 normal)
+        bool TrySideFace(float arc, float sideOffset, SplineWall host, float reach, out Vector3 point, out Vector3 normal)
         {
             point = default;
             normal = default;
@@ -610,6 +728,11 @@ public class SplineWall : MonoBehaviour
                     return false;
                 point = new Vector3(hit.point.x, 0f, hit.point.z);
                 normal = n.normalized;
+                // For a graze the cut spans the band along the run —
+                // sink the plane to the curved flank's deepest point so
+                // a straight wall leaning on a curve fuses without
+                // hairline gaps at the band's ends.
+                point -= normal * FaceRecession(point, normal, reach, host);
                 return true;
             }
             return false;
@@ -640,9 +763,10 @@ public class SplineWall : MonoBehaviour
                     continue;
                 float aA = Mathf.Clamp(Mathf.Lerp(g.aIn, aEnd, 0.3f), aMin, aMax);
                 float aB = Mathf.Clamp(Mathf.Lerp(g.aIn, aEnd, 0.7f), aMin, aMax);
-                if (!TrySideFace(aA, side, g.wall, out Vector3 pA, out Vector3 nA))
+                float grazeReach = Mathf.Min(2f, (aEnd - g.aIn) * 0.5f + 0.3f);
+                if (!TrySideFace(aA, side, g.wall, grazeReach, out Vector3 pA, out Vector3 nA))
                     continue;
-                if (!TrySideFace(aB, side, g.wall, out Vector3 pB, out Vector3 nB))
+                if (!TrySideFace(aB, side, g.wall, 0f, out Vector3 pB, out Vector3 nB))
                     continue;
                 if (Vector3.Dot(nA, nB) < 0.7f)
                     continue;
@@ -658,11 +782,13 @@ public class SplineWall : MonoBehaviour
     }
 
     // requireAngle distinguishes the two junction mechanisms: centerline
-    // bands demand a real crossing angle (near-parallel same-strip
-    // overlap is a refusal, not a junction), while graze lanes take any
-    // angle — a same-face graze necessarily passes through a
-    // parallel-to-host moment at its deepest point, and grazes only
-    // clip, never drop.
+    // bands demand a real crossing angle where the wall's BODY overlaps a
+    // host (near-parallel same-strip overlap is a refusal, not a
+    // junction) — but not in the end-extension overshoot, where end-on
+    // collinear burials are deliberate fuses (see ScanLane's
+    // RequireAngleAt). Graze lanes take any angle everywhere — a
+    // same-face graze necessarily passes through a parallel-to-host
+    // moment at its deepest point, and grazes only clip, never drop.
     static bool IsCrossingHost(Collider c, Vector3 tanDir, int buildOrder, bool requireAngle)
     {
         if (c.isTrigger)
@@ -677,19 +803,37 @@ public class SplineWall : MonoBehaviour
         float myYaw = Mathf.Atan2(-tanDir.z, tanDir.x) * Mathf.Rad2Deg;
         float delta = Mathf.Abs(Mathf.DeltaAngle(myYaw, c.transform.eulerAngles.y));
         delta = Mathf.Min(delta, 180f - delta);
+        // The box yaw is only the section's AVERAGE heading — a tightly
+        // curved section turns 20°+ within itself, enough for a wall to
+        // read as crossing its own redraw. Near the gate, re-judge
+        // against the host's local tangents across the section; the
+        // minimum decides, so following the same curve stays parallel.
+        if (delta >= JunctionAngle && delta < JunctionAngle + 25f)
+        {
+            SplineWall host = section.wall;
+            for (int i = 0; i <= 2; i++)
+            {
+                float t = Mathf.Lerp(section.tStart, section.tEnd, i * 0.5f);
+                Vector3 ht = Tangent(host.curveStart, host.curveControl, host.curveEnd, t).normalized;
+                float hy = Mathf.Atan2(-ht.z, ht.x) * Mathf.Rad2Deg;
+                float d = Mathf.Abs(Mathf.DeltaAngle(myYaw, hy));
+                d = Mathf.Min(d, 180f - d);
+                delta = Mathf.Min(delta, d);
+            }
+        }
         return delta >= JunctionAngle;
     }
 
     // How far past an endpoint the sweep continues: at least half a
     // section, so the endpoint's cell is fully covered — and further when
-    // an existing wall stands STRICTLY LESS than one cell past the end's
-    // natural coverage. The sweep then overshoots INTO that wall on
-    // purpose: the junction band trims it back flush to the wall's face,
-    // which is what makes "end a wall near another wall" read as a built
-    // joint. A gap of exactly one cell is deliberately respected — that's
-    // how you keep a separator between walls. (Probe reach 1.25 + probe
-    // radius 0.2 detects faces up to 1.45 from the endpoint; a one-cell
-    // gap puts the face at 1.5.)
+    // an existing wall stands AT (or within a whisker of) that natural
+    // cap. The sweep then overshoots INTO that wall on purpose: the
+    // junction band trims it back flush to the wall's face, which is what
+    // makes a snapped or touching end read as a built joint. Contact
+    // only — probes reach 0.4 + 0.2 radius = 0.6 from the endpoint, just
+    // past the 0.5 default cap, so anything the cap would touch fuses and
+    // a visible gap is never bridged. Connecting across a distance is the
+    // end snap's job, not a reach-back's.
     static float EndExtension(Vector3 s, Vector3 control, Vector3 e, float[] arcTable,
         bool atStart, float sectionLength)
     {
@@ -697,7 +841,7 @@ public class SplineWall : MonoBehaviour
         float totalArc = arcTable[arcTable.Length - 1];
         Terrain terrain = Terrain.activeTerrain;
 
-        for (float arc = 0.1f; arc <= sectionLength * 1.25f; arc += 0.1f)
+        for (float arc = 0.1f; arc <= sectionLength * 0.4f + 0.001f; arc += 0.1f)
         {
             float trueArc = atStart ? -arc : totalArc + arc;
             float t = TFromExtendedArc(arcTable, s, control, e, trueArc);
@@ -740,7 +884,7 @@ public class SplineWall : MonoBehaviour
                 bottomY = below.topY,
             };
             AddSpecIfClear(specs, curveStart, curveControl, curveEnd, spec,
-                courseHeight, thickness, courseBaseWallHeight, arcTable, includeBlocked);
+                courseHeight, float.NegativeInfinity, thickness, courseBaseWallHeight, arcTable, includeBlocked);
         }
         return specs;
     }
@@ -750,14 +894,20 @@ public class SplineWall : MonoBehaviour
     // when includeBlocked is set (previews), added with blocked = true so
     // the ghost can show the refusal in red instead of vanishing.
     static void AddSpecIfClear(List<SectionSpec> specs, Vector3 s, Vector3 control, Vector3 e,
-        SectionSpec spec, float height, float thickness, float baseWallHeight, float[] arcTable,
-        bool includeBlocked)
+        SectionSpec spec, float height, float fixedTopY, float thickness, float baseWallHeight, float[] arcTable,
+        bool includeBlocked, float clearArc0 = float.NaN, float clearArc1 = float.NaN)
     {
         float tMid = (spec.tSweepStart + spec.tSweepEnd) * 0.5f;
         Vector3 mid = Evaluate(s, control, e, tMid);
         Vector3 direction = Tangent(s, control, e, tMid).normalized;
         float yaw = Mathf.Atan2(-direction.z, direction.x) * Mathf.Rad2Deg;
-        spec.topY = spec.bottomY + height;
+        // A locked top is one absolute height for the whole wall; where
+        // the ground climbs to within a sliver of it the wall is fully
+        // buried and the piece simply doesn't exist.
+        spec.topY = float.IsNegativeInfinity(fixedTopY) ? spec.bottomY + height : fixedTopY;
+        float span = spec.topY - spec.bottomY;
+        if (span < 0.1f)
+            return;
         Vector3 center = new Vector3(mid.x, (spec.bottomY + spec.topY) * 0.5f, mid.z);
 
         spec.arcLength = ExtendedArcAt(arcTable, s, control, e, spec.tSweepEnd)
@@ -765,7 +915,28 @@ public class SplineWall : MonoBehaviour
         if (spec.arcLength < 0.03f)
             return;
 
-        spec.blocked = IsBlocked(center, spec.arcLength, height, thickness, yaw);
+        // Occupancy box: the sweep, unless a clearArc range says a
+        // junction cut owns part of it — then only the range clear of the
+        // burial is tested. A piece that is nearly all burial is a
+        // junction sliver, not a redraw, and is never blocked.
+        float blockLen = spec.arcLength;
+        Vector3 blockCenter = center;
+        float blockYaw = yaw;
+        bool checkable = true;
+        if (!float.IsNaN(clearArc0))
+        {
+            blockLen = clearArc1 - clearArc0;
+            checkable = blockLen >= 0.1f;
+            if (checkable)
+            {
+                float bt = TFromExtendedArc(arcTable, s, control, e, (clearArc0 + clearArc1) * 0.5f);
+                Vector3 bp = Evaluate(s, control, e, bt);
+                Vector3 bd = Tangent(s, control, e, bt).normalized;
+                blockCenter = new Vector3(bp.x, center.y, bp.z);
+                blockYaw = Mathf.Atan2(-bd.z, bd.x) * Mathf.Rad2Deg;
+            }
+        }
+        spec.blocked = checkable && IsBlocked(blockCenter, blockLen, span, thickness, blockYaw);
         if (spec.blocked && !includeBlocked)
             return;
 
@@ -826,6 +997,22 @@ public class SplineWall : MonoBehaviour
         if (baseStep > 0f)
             ground = Mathf.Floor(ground / baseStep) * baseStep;
         return ground;
+    }
+
+    // A wall end for the placement tool's end snapping: the endpoint
+    // itself, and the direction pointing out past it, flattened. The end
+    // piece's physical faces sit around these — the end cap half a
+    // section out along the outward direction, the flanks half a
+    // thickness to each side.
+    public Vector3 EndPosition(bool atStart) => atStart ? curveStart : curveEnd;
+
+    public Vector3 EndOutwardDir(bool atStart)
+    {
+        Vector3 d = Tangent(curveStart, curveControl, curveEnd, atStart ? 0f : 1f);
+        if (atStart)
+            d = -d;
+        d.y = 0f;
+        return d.normalized;
     }
 
     // Which side of this wall's centerline a point lies on (+1 toward the

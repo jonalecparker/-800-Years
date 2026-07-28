@@ -29,11 +29,13 @@ public class GridPlacementSystem : MonoBehaviour
     public float baseStepSize = 0.5f;
 
     [Header("Height")]
-    // Wall height is stepped, not continuous — snapped heights are what let
-    // separately-built structures actually line up.
+    // Wall height scrolls smoothly — lining up with a neighbour doesn't
+    // come from shared increments anymore but from snapping, which adopts
+    // the snapped wall's exact height.
     public float minHeightMultiplier = 0.25f;
     public float maxHeightMultiplier = 3f;
-    public float heightMultiplierStep = 0.25f;
+    // Meters of wall height per wheel notch.
+    public float heightScrollRate = 0.25f;
 
     [Header("Curve")]
     // Curvature moves in fixed steps so two separately-built curves over
@@ -47,6 +49,10 @@ public class GridPlacementSystem : MonoBehaviour
     [Header("Preview")]
     public Color previewColor = new Color(0.3f, 0.9f, 1f, 1f);
     public Color deletePreviewColor = new Color(1f, 0.3f, 0.25f, 1f);
+    // The ghost runs gold while an end snap is deciding its position —
+    // hovering a snapped start point, or a drag end landing on a wall end
+    // — and blue the rest of the time.
+    public Color snapColor = new Color(1f, 0.78f, 0.12f, 1f);
 
     [Header("Assists")]
     // While placing, each free endpoint of the pending wall shows a line
@@ -61,6 +67,10 @@ public class GridPlacementSystem : MonoBehaviour
     // so strokes stay commensurable. Alt disables all stepping.
     public float angleStep = 15f;
     public float lengthStep = 0.5f;
+    // The options panel's "Lock top height": the wall's top sits level at
+    // anchor ground + height and the bottom follows the terrain down,
+    // instead of the top riding the ground section by section.
+    public bool lockTopHeight;
 
     public enum ToolMode { Build, Delete, Offset }
     public ToolMode Mode { get; private set; } = ToolMode.Build;
@@ -76,6 +86,40 @@ public class GridPlacementSystem : MonoBehaviour
     public float HeightMultiplier => heightMultiplier;
     public float BaseHeight => placementYOffset * 2f;
     public float CurrentWallHeight => BaseHeight * heightMultiplier;
+
+    // The height the active ghost actually builds at: a snapped ghost
+    // adopts the snapped wall's exact height (a scrolled height would
+    // never land on it), anchor snap outranking a far-end snap outranking
+    // hover. Ctrl+scroll overrides the match for the current context, and
+    // Alt suppresses snapping and with it the height match.
+    public float EffectiveWallHeight
+    {
+        get
+        {
+            if (heightOverride)
+                return CurrentWallHeight;
+            if (anchorSnapHeight.HasValue)
+                return anchorSnapHeight.Value;
+            if (dragEndSnap.HasValue && dragEndSnap.Value.wall != null)
+                return SnapHeightOf(dragEndSnap.Value.wall, dragEndSnap.Value.point);
+            if (hoverSnapHeight.HasValue)
+                return hoverSnapHeight.Value;
+            return CurrentWallHeight;
+        }
+    }
+
+    // What "match the snapped wall's height" means: its stored height —
+    // except for a locked-top wall, whose stored height says nothing
+    // about its profile on a slope. There the ghost takes the span that
+    // puts its own top at the host's locked top at the snap point, so
+    // the joint lines up (and with the lock toggle on, the new wall
+    // continues that exact level top).
+    float SnapHeightOf(SplineWall wall, Vector3 at)
+    {
+        if (float.IsNegativeInfinity(wall.fixedTopY))
+            return wall.height;
+        return Mathf.Max(0.25f, wall.fixedTopY - SampleCellGroundY(at.x, at.z));
+    }
 
     // How many sections the active preview will actually lay down —
     // blocked (red) specs don't count, and 0 when idle, so the HUD
@@ -98,13 +142,55 @@ public class GridPlacementSystem : MonoBehaviour
     // draws over the section's own surface instead of z-fighting with it.
     const float DeleteOverlayScale = 1.02f;
 
+    // One exact end-snap result: where the point locked, the bearing
+    // pointing from that end back along its wall (the angle guide's
+    // zero), and the yaw a pre-click stub takes there — perpendicular to
+    // the host's run, so corner and T previews trim clean instead of
+    // burying collinearly.
+    struct EndSnap
+    {
+        public SplineWall wall;
+        public Vector3 point;
+        public float backBearing;
+        public float stubYaw;
+        // The direction a wall LEAVING this snap point should run to meet
+        // the host cleanly: outward along the run for endpoint and cap
+        // snaps, sideways off the face for flank snaps. Feeds the
+        // tangent-matched connector when both ends of a drag are snapped.
+        public Vector3 outDir;
+        // The endpoint candidate sits on the host's centerline, where a
+        // carved stub preview trims away to nothing — the hover ghost
+        // shows a solid marker there instead.
+        public bool isEndpoint;
+    }
+
     private readonly List<GameObject> ghostPool = new List<GameObject>();
     private readonly List<GameObject> deletePool = new List<GameObject>();
     private readonly List<Transform> doomedSections = new List<Transform>();
     private readonly List<SplineWall.SectionSpec> splineSpecs = new List<SplineWall.SectionSpec>();
     private readonly List<Mesh> previewMeshes = new List<Mesh>();
-    private (Vector3 start, Vector3 end, float bulge, float apexT, float height)? lastPreviewKey;
+    private (Vector3 start, Vector3 end, float bulge, float apexT, float height, float topY)? lastPreviewKey;
     private (SplineWall wall, float height)? lastCourseKey;
+    private EndSnap? hoverSnap;
+    private EndSnap? anchorSnap;
+    private EndSnap? dragEndSnap;
+    private bool snapTint;
+    // The host-derived yaw of the current hover snap (end OR flank) —
+    // snapped stubs sit flush with the wall they snapped to instead of
+    // keeping their own R rotation. Captured at click for the drag stub.
+    private float? hoverSnapYaw;
+    private float? anchorSnapYaw;
+    // The snapped wall's height (end OR flank snap) — the ghost matches
+    // it exactly instead of using the scrolled height. Captured at click
+    // for the drag, same as the yaw.
+    private float? hoverSnapHeight;
+    private float? anchorSnapHeight;
+    // Set when Ctrl+scroll fires — the scrolled height beats the snap
+    // match until the drag ends or the hover leaves the snap, then
+    // matching re-arms.
+    private bool heightOverride;
+    private (Vector3 center, float fromBearing, float toBearing)? activeAngle;
+    private LineRenderer angleLine;
     private Mesh prefabMesh;
     private Material wallMaterial;
     private Transform splineParent;
@@ -118,7 +204,7 @@ public class GridPlacementSystem : MonoBehaviour
     private SplineWall offsetSource;
     private float offsetDistance = 3f;
     private float offsetSide = 1f;
-    private (Vector3 s, Vector3 c, Vector3 e, float height)? lastOffsetKey;
+    private (Vector3 s, Vector3 c, Vector3 e, float height, float topY)? lastOffsetKey;
     private Camera cam;
     private Vector3? guideCenter;
     private float guideBearing;
@@ -159,8 +245,14 @@ public class GridPlacementSystem : MonoBehaviour
 
         // Placement branches re-set the pending wall's center and bearing
         // each frame; anything else (delete mode, idle off-target) leaves
-        // it unset and the guides disappear with it.
+        // it unset and the guides disappear with it. Same for the snap
+        // state and the corner-angle readout.
         guideCenter = null;
+        activeAngle = null;
+        snapTint = false;
+        hoverSnap = null;
+        hoverSnapYaw = null;
+        hoverSnapHeight = null;
 
         if (Mode == ToolMode.Delete)
             UpdateDelete(mouse, ray, overUI);
@@ -169,7 +261,14 @@ public class GridPlacementSystem : MonoBehaviour
         else
             UpdateBuild(mouse, keyboard, ray, overUI);
 
+        // A scrolled height override lives as long as its context — the
+        // active drag, or the hovered snap it was scrolled against.
+        // Leaving both re-arms the snap height match.
+        if (!splineStart.HasValue && !hoverSnapHeight.HasValue)
+            heightOverride = false;
+
         UpdateDistanceGuides();
+        UpdateAngleGuide();
     }
 
     // Both tools share the left mouse button, so switching abandons any
@@ -207,9 +306,11 @@ public class GridPlacementSystem : MonoBehaviour
 
     // Straight walls: press, drag along an angle-stepped line, release to
     // commit a bulge-0 SplineWall, identical in kind to a curved one.
-    // Hovering an existing wall's top face previews a full course along
-    // it instead, and one click lays it; R turns the single-click stub's
-    // orientation.
+    // When BOTH ends of the drag snap to wall ends, the wall auto-curves
+    // to tangent-match the two hosts (TryTangentControl) so it ties in
+    // flush at both — Shift keeps it straight. Hovering an existing
+    // wall's top face previews a full course along it instead, and one
+    // click lays it; R turns the single-click stub's orientation.
     void UpdateStraightBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
         if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
@@ -231,18 +332,35 @@ public class GridPlacementSystem : MonoBehaviour
             if (hasPoint && courseTarget != null)
             {
                 BuildCoursePreview(courseTarget.wall);
+                snapTint = true;
                 ShowSplineGhosts();
                 if (mouse.leftButton.wasPressedThisFrame)
                     CommitCourse(courseTarget.wall);
             }
             else if (hasPoint)
             {
-                BuildStubPreview(point);
-                ShowSplineGhosts();
+                float stubYaw = hoverSnapYaw ?? currentYRotation;
+                snapTint = hoverSnapYaw.HasValue;
+                // On the host's centerline (endpoint snap) the carved stub
+                // trims away to nothing — show the solid marker instead.
+                if (hoverSnap.HasValue && hoverSnap.Value.isEndpoint)
+                {
+                    ShowStartMarker(point);
+                }
+                else
+                {
+                    BuildStubPreview(point, stubYaw);
+                    ShowSplineGhosts();
+                }
                 guideCenter = point;
-                guideBearing = -currentYRotation;
+                guideBearing = -stubYaw;
                 if (mouse.leftButton.wasPressedThisFrame)
+                {
                     splineStart = point;
+                    anchorSnap = hoverSnap;
+                    anchorSnapYaw = hoverSnapYaw;
+                    anchorSnapHeight = hoverSnapHeight;
+                }
             }
             else
             {
@@ -256,19 +374,50 @@ public class GridPlacementSystem : MonoBehaviour
             // shows, instead of getting stuck dragging.
             bool snapAngle = keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
             if (hasPoint)
-                splineEnd = SteppedDragEnd(splineStart.Value, rawSurface, freePlace, snapAngle);
+            {
+                // The far end snaps to wall ends too, so closing a loop
+                // lands exactly on the corner it started from — the snap
+                // outranks length stepping while it holds.
+                if (!freePlace && TryEndSnap(rawSurface, splineStart, out EndSnap endSnap))
+                {
+                    splineEnd = endSnap.point;
+                    dragEndSnap = endSnap;
+                }
+                else
+                {
+                    splineEnd = SteppedDragEnd(splineStart.Value, rawSurface, freePlace, snapAngle);
+                    dragEndSnap = null;
+                }
+            }
 
             Vector3 anchor = splineStart.Value;
             Vector3 end = splineEnd ?? anchor;
+            // Both ends snapped to wall ends: the connector auto-curves to
+            // leave one host and arrive at the other straight-on, turning
+            // both joints into flush end-on fuses instead of kinked
+            // corners. Shift keeps it straight for a deliberate corner.
+            float dragBulge = 0f, dragApexT = 0.5f;
+            bool tangentTied = anchorSnap.HasValue && dragEndSnap.HasValue && !snapAngle
+                && TryTangentControl(anchor, end, out dragBulge, out dragApexT);
+            if (!tangentTied)
+            {
+                dragBulge = 0f;
+                dragApexT = 0.5f;
+            }
             if (FlatDistance(anchor, end) >= 0.25f)
-                BuildSplinePreview(anchor, end, 0f, 0.5f);
+                BuildSplinePreview(anchor, end, dragBulge, dragApexT);
             else
-                BuildStubPreview(anchor);
+                BuildStubPreview(anchor, anchorSnapYaw ?? currentYRotation);
+            snapTint = dragEndSnap.HasValue;
             ShowSplineGhosts();
             guideCenter = (anchor + end) * 0.5f;
             guideBearing = FlatDistance(anchor, end) > 0.01f
                 ? Mathf.Atan2(end.z - anchor.z, end.x - anchor.x) * Mathf.Rad2Deg
-                : -currentYRotation;
+                : -(anchorSnapYaw ?? currentYRotation);
+            // The corner-angle readout only means something for a kinked
+            // joint — a tangent-tied connector has no corner by design.
+            if (anchorSnap.HasValue && !tangentTied && FlatDistance(anchor, end) >= 0.25f)
+                activeAngle = (anchor, anchorSnap.Value.backBearing, guideBearing);
 
             if (mouse.leftButton.wasReleasedThisFrame)
                 CommitSpline();
@@ -276,14 +425,52 @@ public class GridPlacementSystem : MonoBehaviour
     }
 
     // A zero-length run still means a wall: a token 10cm chord through the
-    // clicked point, oriented by R, that the sweep's own half-section end
-    // extensions grow into a short stub — and bury into any wall standing
-    // beside it, same as a long wall's ends would.
-    void BuildStubPreview(Vector3 center)
+    // clicked point, oriented by R — or by the snapped host wall — that
+    // the sweep's own half-section end extensions grow into a short stub,
+    // and bury into any wall standing beside it, same as a long wall's
+    // ends would.
+    void BuildStubPreview(Vector3 center, float yawDegrees)
     {
-        float rad = currentYRotation * Mathf.Deg2Rad;
+        float rad = yawDegrees * Mathf.Deg2Rad;
         Vector3 halfChord = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad)) * 0.05f;
         BuildSplinePreview(center - halfChord, center + halfChord, 0f, 0.5f);
+    }
+
+    // Both drag ends snapped to wall ends: solve the quadratic control
+    // point that makes the connector LEAVE the anchor's host straight-on
+    // and ARRIVE at the far host straight-on — the intersection of the
+    // two snaps' departure rays. Each joint then meets its host collinear
+    // (the flush end-on fuse) instead of kinking into a corner cut.
+    // False — stay straight — when the tangents are parallel (an S no
+    // single quadratic can make), diverge, or demand an extreme curve.
+    bool TryTangentControl(Vector3 anchor, Vector3 end, out float bulge, out float apexT)
+    {
+        bulge = 0f;
+        apexT = 0.5f;
+        Vector3 d0 = anchorSnap.Value.outDir;
+        Vector3 d1 = dragEndSnap.Value.outDir;
+        Vector3 delta = end - anchor;
+        delta.y = 0f;
+        float chordLen = delta.magnitude;
+        if (chordLen < 0.25f)
+            return false;
+
+        // anchor + u*d0 = end + v*d1, both u and v ahead of their ends.
+        float det = d0.x * d1.z - d0.z * d1.x;
+        if (Mathf.Abs(det) < 0.02f)
+            return false;
+        float u = (delta.x * d1.z - delta.z * d1.x) / det;
+        float v = (delta.x * d0.z - delta.z * d0.x) / det;
+        if (u < 0.1f || v < 0.1f || u > 3f * chordLen || v > 3f * chordLen)
+            return false;
+
+        // Decompose the control point (anchor + u*d0) into the
+        // (apexT, bulge) coordinates the preview/commit pipeline speaks.
+        Vector3 w = d0 * u;
+        Vector3 normal = new Vector3(-delta.z, 0f, delta.x) / chordLen;
+        apexT = (w.x * delta.x + w.z * delta.z) / (chordLen * chordLen);
+        bulge = (w.x * normal.x + w.z * normal.z) * 0.5f;
+        return Mathf.Abs(bulge) <= 0.75f * chordLen;
     }
 
     // Drag assist: direction is freeform (Shift snaps it to angleStep
@@ -309,9 +496,9 @@ public class GridPlacementSystem : MonoBehaviour
         return anchor + new Vector3(Mathf.Cos(rad) * length, 0f, Mathf.Sin(rad) * length);
     }
 
-    // Ctrl+scroll steps the wall height for subsequent placements and the
-    // live preview. FreeFlyCamera stands down from scroll-dollying while
-    // Ctrl is held, so the wheel only means one thing at a time.
+    // Ctrl+scroll slides the wall height smoothly for subsequent placements
+    // and the live preview. FreeFlyCamera stands down from scroll-dollying
+    // while Ctrl is held, so the wheel only means one thing at a time.
     void HandleHeightScroll(Mouse mouse, Keyboard keyboard)
     {
         if (keyboard == null || (!keyboard.leftCtrlKey.isPressed && !keyboard.rightCtrlKey.isPressed))
@@ -321,9 +508,17 @@ public class GridPlacementSystem : MonoBehaviour
         if (Mathf.Abs(scroll) < 0.01f)
             return;
 
+        // Windows reports raw ±120 per wheel notch; smaller magnitudes
+        // (normalized notches, trackpad glides) already mean notches.
+        if (Mathf.Abs(scroll) >= 100f)
+            scroll /= 120f;
+        float notches = Mathf.Clamp(scroll, -4f, 4f);
         heightMultiplier = Mathf.Clamp(
-            heightMultiplier + Mathf.Sign(scroll) * heightMultiplierStep,
+            heightMultiplier + notches * (heightScrollRate / BaseHeight),
             minHeightMultiplier, maxHeightMultiplier);
+        // Scrolling is an explicit height choice — it beats any active
+        // snap height match until that context ends.
+        heightOverride = true;
     }
 
     // Curved wall placement. Three clicks: start point, end point (both
@@ -351,17 +546,24 @@ public class GridPlacementSystem : MonoBehaviour
             if (hasPoint && courseTarget != null)
             {
                 BuildCoursePreview(courseTarget.wall);
+                snapTint = true;
                 ShowSplineGhosts();
                 if (mouse.leftButton.wasPressedThisFrame)
                     CommitCourse(courseTarget.wall);
             }
             else if (hasPoint)
             {
+                snapTint = hoverSnapYaw.HasValue;
                 ShowStartMarker(point);
                 guideCenter = point;
-                guideBearing = 0f;
+                guideBearing = -(hoverSnapYaw ?? 0f);
                 if (mouse.leftButton.wasPressedThisFrame)
+                {
                     splineStart = point;
+                    anchorSnap = hoverSnap;
+                    anchorSnapYaw = hoverSnapYaw;
+                    anchorSnapHeight = hoverSnapHeight;
+                }
             }
             else
             {
@@ -376,9 +578,12 @@ public class GridPlacementSystem : MonoBehaviour
             if (hasPoint)
             {
                 BuildSplinePreview(splineStart.Value, point, 0f, 0.5f);
+                snapTint = hoverSnapYaw.HasValue;
                 ShowSplineGhosts();
                 guideCenter = (splineStart.Value + point) * 0.5f;
                 guideBearing = Mathf.Atan2(point.z - splineStart.Value.z, point.x - splineStart.Value.x) * Mathf.Rad2Deg;
+                if (anchorSnap.HasValue && FlatDistance(splineStart.Value, point) >= 0.25f)
+                    activeAngle = (splineStart.Value, anchorSnap.Value.backBearing, guideBearing);
                 Vector3 flat = point - splineStart.Value;
                 flat.y = 0f;
                 if (flat.sqrMagnitude > 0.25f
@@ -416,6 +621,8 @@ public class GridPlacementSystem : MonoBehaviour
             guideCenter = (splineStart.Value + splineEnd.Value) * 0.5f;
             guideBearing = Mathf.Atan2(splineEnd.Value.z - splineStart.Value.z,
                 splineEnd.Value.x - splineStart.Value.x) * Mathf.Rad2Deg;
+            if (anchorSnap.HasValue)
+                activeAngle = (splineStart.Value, anchorSnap.Value.backBearing, guideBearing);
 
             if (mouse.leftButton.wasPressedThisFrame)
                 CommitSpline();
@@ -439,11 +646,11 @@ public class GridPlacementSystem : MonoBehaviour
     {
         if (HasPlaceableSpecs() && lastPreviewKey.HasValue)
         {
-            (Vector3 s, Vector3 e, float bulge, float apexT, float height) = lastPreviewKey.Value;
+            (Vector3 s, Vector3 e, float bulge, float apexT, float height, float topY) = lastPreviewKey.Value;
             Vector3 control = ControlPointFor(s, e, bulge, apexT);
             SplineWall.Create(splineParent, s, control, e,
                 height, gridSize, BaseHeight, wallMaterial, splineSpecs,
-                gridSize, baseStepSize, false);
+                gridSize, baseStepSize, false, topY);
             // Mesh ownership just moved to the wall's sections — clear the
             // preview list so CancelCurve doesn't destroy them.
             previewMeshes.Clear();
@@ -474,6 +681,11 @@ public class GridPlacementSystem : MonoBehaviour
         splineEnd = null;
         curveBulge = 0f;
         curveApexT = 0.5f;
+        anchorSnap = null;
+        anchorSnapYaw = null;
+        anchorSnapHeight = null;
+        heightOverride = false;
+        dragEndSnap = null;
         HideGhosts();
     }
 
@@ -519,28 +731,32 @@ public class GridPlacementSystem : MonoBehaviour
             return true;
         }
 
-        // Chaining: existing wall endpoints outrank everything nearby.
-        foreach (SplineWall wall in SplineWall.All)
+        // End snapping: wall ends outrank everything nearby, and the point
+        // locks EXACTLY to one of four spots per end — the endpoint itself
+        // or one of the end piece's three faces (end cap and both flanks)
+        // — the joints a rectangular layout is made of.
+        if (TryEndSnap(rawSurface, null, out EndSnap endSnap))
         {
-            if (FlatDistance(rawSurface, wall.curveStart) <= endpointSnapRadius)
-            {
-                point = new Vector3(wall.curveStart.x, 0f, wall.curveStart.z);
-                return true;
-            }
-            if (FlatDistance(rawSurface, wall.curveEnd) <= endpointSnapRadius)
-            {
-                point = new Vector3(wall.curveEnd.x, 0f, wall.curveEnd.z);
-                return true;
-            }
+            hoverSnap = endSnap;
+            hoverSnapYaw = endSnap.stubYaw;
+            if (endSnap.wall != null)
+                hoverSnapHeight = SnapHeightOf(endSnap.wall, endSnap.point);
+            point = endSnap.point;
+            return true;
         }
 
         if (section != null)
         {
             // A wall's flank: land the new wall's centerline flush
             // against the face being pointed at, so "against that wall"
-            // is one gesture and the joint closes itself.
+            // is one gesture and the joint closes itself. The snap also
+            // hands over the wall's own yaw — the stub lies along the
+            // host, flush, instead of keeping its R rotation.
             Vector3 flank = first.point + first.normal * (gridSize * 0.5f);
+            hoverSnapYaw = first.collider.transform.eulerAngles.y;
             point = new Vector3(flank.x, 0f, flank.z);
+            if (section.wall != null)
+                hoverSnapHeight = SnapHeightOf(section.wall, point);
             return true;
         }
 
@@ -548,6 +764,67 @@ public class GridPlacementSystem : MonoBehaviour
         // under the cursor — placement is free.
         point = rawSurface;
         return true;
+    }
+
+    // The nearest exact end-snap candidate within endpointSnapRadius of
+    // the raw point, across every wall end: the endpoint itself, the
+    // center of the end cap, and the two flank points beside the endpoint
+    // (each exactly on a face plane, so snapped walls trim flush).
+    // Candidates near `exclude` (the drag anchor) are skipped so a drag
+    // can't snap its far end back onto its own start.
+    bool TryEndSnap(Vector3 raw, Vector3? exclude, out EndSnap snap)
+    {
+        snap = default;
+        float bestSq = endpointSnapRadius * endpointSnapRadius;
+        bool found = false;
+        foreach (SplineWall wall in SplineWall.All)
+        {
+            for (int endIndex = 0; endIndex < 2; endIndex++)
+            {
+                bool atStart = endIndex == 0;
+                Vector3 endPos = wall.EndPosition(atStart);
+                endPos.y = 0f;
+                Vector3 outDir = wall.EndOutwardDir(atStart);
+                Vector3 side = new Vector3(-outDir.z, 0f, outDir.x);
+                float capReach = wall.targetSectionLength * 0.5f;
+                float halfThick = wall.thickness * 0.5f;
+                // The cap candidate sits half a thickness PAST the end
+                // face, so a snapped stub stands beside the cap and gets
+                // graze-fused flush against it — centered on the face it
+                // would straddle the host and carve itself in two.
+                Vector3[] candidates =
+                {
+                    endPos,
+                    endPos + outDir * (capReach + halfThick),
+                    endPos + side * halfThick,
+                    endPos - side * halfThick,
+                };
+                Vector3[] candidateDirs = { outDir, outDir, side, -side };
+                for (int ci = 0; ci < candidates.Length; ci++)
+                {
+                    Vector3 candidate = candidates[ci];
+                    if (exclude.HasValue && FlatDistance(candidate, exclude.Value) < lengthStep)
+                        continue;
+                    float dx = candidate.x - raw.x;
+                    float dz = candidate.z - raw.z;
+                    float sq = dx * dx + dz * dz;
+                    if (sq >= bestSq)
+                        continue;
+                    bestSq = sq;
+                    found = true;
+                    snap = new EndSnap
+                    {
+                        wall = wall,
+                        point = candidate,
+                        backBearing = Mathf.Atan2(-outDir.z, -outDir.x) * Mathf.Rad2Deg,
+                        stubYaw = Mathf.Atan2(-outDir.z, outDir.x) * Mathf.Rad2Deg + 90f,
+                        outDir = candidateDirs[ci],
+                        isEndpoint = ci == 0,
+                    };
+                }
+            }
+        }
+        return found;
     }
 
     static float FlatDistance(Vector3 a, Vector3 b)
@@ -566,9 +843,21 @@ public class GridPlacementSystem : MonoBehaviour
         return s + chord * apexT + normal * (bulge * 2f);
     }
 
+    // The absolute top a locked-top wall anchored at this point gets: the
+    // anchor cell's stepped ground plus the current wall height.
+    // -Infinity (lock off) leaves tops riding the terrain per section.
+    float LockedTopFor(Vector3 anchor)
+    {
+        return lockTopHeight
+            ? SampleCellGroundY(anchor.x, anchor.z) + EffectiveWallHeight
+            : float.NegativeInfinity;
+    }
+
     void BuildSplinePreview(Vector3 start, Vector3 end, float bulge, float apexT)
     {
-        var key = (start, end, bulge, apexT, CurrentWallHeight);
+        float height = EffectiveWallHeight;
+        float topY = LockedTopFor(start);
+        var key = (start, end, bulge, apexT, height, topY);
         if (lastPreviewKey.HasValue && lastPreviewKey.Value == key)
             return;
         lastPreviewKey = key;
@@ -578,8 +867,8 @@ public class GridPlacementSystem : MonoBehaviour
         splineSpecs.Clear();
         Vector3 control = ControlPointFor(start, end, bulge, apexT);
         splineSpecs.AddRange(SplineWall.BuildSpecs(start, control, end,
-            CurrentWallHeight, gridSize, gridSize, baseStepSize, BaseHeight,
-            int.MaxValue, true));
+            height, gridSize, gridSize, baseStepSize, BaseHeight,
+            int.MaxValue, true, topY));
         foreach (SplineWall.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
     }
@@ -616,7 +905,7 @@ public class GridPlacementSystem : MonoBehaviour
             GameObject ghost = GetPooled(ghostPool, i, previewColor, "PlacementPreview");
             ghost.SetActive(true);
             SetGhostMesh(ghost, spec.mesh);
-            SetGhostTint(ghost, spec.blocked ? deletePreviewColor : previewColor);
+            SetGhostTint(ghost, spec.blocked ? deletePreviewColor : (snapTint ? snapColor : previewColor));
             ghost.transform.SetPositionAndRotation(spec.position, Quaternion.Euler(0f, spec.yaw, 0f));
             ghost.transform.localScale = Vector3.one;
         }
@@ -655,14 +944,18 @@ public class GridPlacementSystem : MonoBehaviour
         lastCourseKey = null;
 
         float ground = SampleCellGroundY(point.x, point.z);
+        float height = EffectiveWallHeight;
         GameObject ghost = GetPooled(ghostPool, 0, previewColor, "PlacementPreview");
         ghost.SetActive(true);
         SetGhostMesh(ghost, null);
-        SetGhostTint(ghost, previewColor);
+        SetGhostTint(ghost, snapTint ? snapColor : previewColor);
         Vector3 scale = piecePrefab.transform.localScale;
-        scale.y *= heightMultiplier;
+        scale.y *= height / BaseHeight;
+        // A snapped marker sits flush with the wall it snapped to instead
+        // of staying world-aligned.
         ghost.transform.SetPositionAndRotation(
-            new Vector3(point.x, ground + CurrentWallHeight / 2f, point.z), Quaternion.identity);
+            new Vector3(point.x, ground + height / 2f, point.z),
+            Quaternion.Euler(0f, hoverSnapYaw ?? 0f, 0f));
         ghost.transform.localScale = scale;
         for (int i = 1; i < ghostPool.Count; i++)
             ghostPool[i].SetActive(false);
@@ -727,7 +1020,7 @@ public class GridPlacementSystem : MonoBehaviour
         if (mouse.leftButton.wasPressedThisFrame && HasPlaceableSpecs())
         {
             SplineWall.Create(splineParent, s2, c2, e2, CurrentWallHeight, gridSize, BaseHeight,
-                wallMaterial, splineSpecs, gridSize, baseStepSize, false);
+                wallMaterial, splineSpecs, gridSize, baseStepSize, false, LockedTopFor(s2));
             previewMeshes.Clear();
             splineSpecs.Clear();
             lastOffsetKey = null;
@@ -737,7 +1030,8 @@ public class GridPlacementSystem : MonoBehaviour
 
     void BuildOffsetPreview(Vector3 s, Vector3 c, Vector3 e)
     {
-        var key = (s, c, e, CurrentWallHeight);
+        float topY = LockedTopFor(s);
+        var key = (s, c, e, CurrentWallHeight, topY);
         if (lastOffsetKey.HasValue && lastOffsetKey.Value == key)
             return;
         lastOffsetKey = key;
@@ -748,7 +1042,7 @@ public class GridPlacementSystem : MonoBehaviour
         splineSpecs.Clear();
         splineSpecs.AddRange(SplineWall.BuildSpecs(s, c, e,
             CurrentWallHeight, gridSize, gridSize, baseStepSize, BaseHeight,
-            int.MaxValue, true));
+            int.MaxValue, true, topY));
         foreach (SplineWall.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
     }
@@ -989,6 +1283,40 @@ public class GridPlacementSystem : MonoBehaviour
         }
     }
 
+    // Arc radius of the corner-angle readout, and where its label sits.
+    const float AngleArcRadius = 1.5f;
+
+    // The corner readout: while the pending wall hangs off a snapped wall
+    // end, an arc sweeps along the ground from the host wall's run to the
+    // ghost's, and OnGUI labels it with the degrees between them — 90 is
+    // a square corner, 180 a straight continuation.
+    void UpdateAngleGuide()
+    {
+        if (!activeAngle.HasValue)
+        {
+            if (angleLine != null)
+                angleLine.gameObject.SetActive(false);
+            return;
+        }
+        if (angleLine == null)
+        {
+            angleLine = CreateGuideLine();
+            angleLine.gameObject.name = "AngleGuide";
+        }
+        angleLine.gameObject.SetActive(true);
+
+        (Vector3 center, float fromBearing, float toBearing) = activeAngle.Value;
+        float delta = Mathf.DeltaAngle(fromBearing, toBearing);
+        const int ArcSteps = 24;
+        angleLine.positionCount = ArcSteps + 1;
+        for (int i = 0; i <= ArcSteps; i++)
+        {
+            float rad = (fromBearing + delta * i / ArcSteps) * Mathf.Deg2Rad;
+            Vector3 p = center + new Vector3(Mathf.Cos(rad), 0f, Mathf.Sin(rad)) * AngleArcRadius;
+            angleLine.SetPosition(i, new Vector3(p.x, GuideY(p), p.z));
+        }
+    }
+
     // Guides hover just above the terrain so they read against it.
     float GuideY(Vector3 point)
     {
@@ -1025,7 +1353,7 @@ public class GridPlacementSystem : MonoBehaviour
     // scene art.
     void OnGUI()
     {
-        if (cam == null || activeGuides.Count == 0)
+        if (cam == null || (activeGuides.Count == 0 && !activeAngle.HasValue))
             return;
 
         if (guideLabelStyle == null)
@@ -1043,14 +1371,31 @@ public class GridPlacementSystem : MonoBehaviour
             Vector3 screen = cam.WorldToScreenPoint((guide.from + guide.to) * 0.5f);
             if (screen.z <= 0f)
                 continue;
-            string text = guide.distance.ToString("0.0") + "m";
-            Rect rect = new Rect(screen.x - 45f, Screen.height - screen.y - 12f, 90f, 24f);
-            GUI.color = Color.black;
-            GUI.Label(new Rect(rect.x + 1f, rect.y + 1f, rect.width, rect.height), text, guideLabelStyle);
-            GUI.color = guideColor;
-            GUI.Label(rect, text, guideLabelStyle);
+            DrawGuideLabel(screen, guide.distance.ToString("0.0") + "m");
+        }
+
+        // The corner angle rides just outside its arc's midpoint.
+        if (activeAngle.HasValue)
+        {
+            (Vector3 center, float fromBearing, float toBearing) = activeAngle.Value;
+            float delta = Mathf.DeltaAngle(fromBearing, toBearing);
+            float midRad = (fromBearing + delta * 0.5f) * Mathf.Deg2Rad;
+            Vector3 world = center + new Vector3(Mathf.Cos(midRad), 0f, Mathf.Sin(midRad)) * (AngleArcRadius + 0.55f);
+            world.y = GuideY(world);
+            Vector3 screen = cam.WorldToScreenPoint(world);
+            if (screen.z > 0f)
+                DrawGuideLabel(screen, Mathf.Abs(delta).ToString("0") + "°");
         }
         GUI.color = Color.white;
+    }
+
+    void DrawGuideLabel(Vector3 screen, string text)
+    {
+        Rect rect = new Rect(screen.x - 45f, Screen.height - screen.y - 12f, 90f, 24f);
+        GUI.color = Color.black;
+        GUI.Label(new Rect(rect.x + 1f, rect.y + 1f, rect.width, rect.height), text, guideLabelStyle);
+        GUI.color = guideColor;
+        GUI.Label(rect, text, guideLabelStyle);
     }
 
     // Reuses pooled ghost instances so a long preview doesn't
