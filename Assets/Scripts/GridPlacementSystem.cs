@@ -154,14 +154,18 @@ public class GridPlacementSystem : MonoBehaviour
         public float backBearing;
         public float stubYaw;
         // The direction a wall LEAVING this snap point should run to meet
-        // the host cleanly: outward along the run for endpoint and cap
-        // snaps, sideways off the face for flank snaps. Feeds the
+        // the host cleanly: outward along the run for endpoint snaps,
+        // sideways off the face for flank snaps. Feeds the
         // tangent-matched connector when both ends of a drag are snapped.
         public Vector3 outDir;
         // The endpoint candidate sits on the host's centerline, where a
         // carved stub preview trims away to nothing — the hover ghost
         // shows a solid marker there instead.
         public bool isEndpoint;
+        // Mid-wall flank termination: the point sits ON the host's face
+        // and the commit makes a T-node there, the host joining as a
+        // flank member. Like isEndpoint, this end builds as a node end.
+        public bool isFlank;
     }
 
     private readonly List<GameObject> ghostPool = new List<GameObject>();
@@ -169,7 +173,7 @@ public class GridPlacementSystem : MonoBehaviour
     private readonly List<Transform> doomedSections = new List<Transform>();
     private readonly List<SplineWall.SectionSpec> splineSpecs = new List<SplineWall.SectionSpec>();
     private readonly List<Mesh> previewMeshes = new List<Mesh>();
-    private (Vector3 start, Vector3 end, float bulge, float apexT, float height, float topY)? lastPreviewKey;
+    private (Vector3 start, Vector3 end, float bulge, float apexT, float height, float topY, bool nodeStart, bool nodeEnd)? lastPreviewKey;
     private (SplineWall wall, float height)? lastCourseKey;
     private EndSnap? hoverSnap;
     private EndSnap? anchorSnap;
@@ -213,6 +217,12 @@ public class GridPlacementSystem : MonoBehaviour
     private readonly Dictionary<GameObject, Color> ghostTints = new Dictionary<GameObject, Color>();
     private Material guideMaterial;
     private GUIStyle guideLabelStyle;
+    // Corner-post ghosts: gold posts at endpoint-snapped ends while
+    // placing — the corner masonry the commit will actually create.
+    private readonly List<(Vector3 pos, float ground, float height)> pendingNodeGhosts = new List<(Vector3, float, float)>();
+    private readonly List<GameObject> nodeGhostPool = new List<GameObject>();
+    private readonly List<Mesh> nodeGhostMeshes = new List<Mesh>();
+    private readonly List<float> nodeGhostHeights = new List<float>();
 
     void Start()
     {
@@ -253,6 +263,7 @@ public class GridPlacementSystem : MonoBehaviour
         hoverSnap = null;
         hoverSnapYaw = null;
         hoverSnapHeight = null;
+        pendingNodeGhosts.Clear();
 
         if (Mode == ToolMode.Delete)
             UpdateDelete(mouse, ray, overUI);
@@ -269,6 +280,7 @@ public class GridPlacementSystem : MonoBehaviour
 
         UpdateDistanceGuides();
         UpdateAngleGuide();
+        UpdateNodeGhostVisuals();
     }
 
     // Both tools share the left mouse button, so switching abandons any
@@ -306,11 +318,13 @@ public class GridPlacementSystem : MonoBehaviour
 
     // Straight walls: press, drag along an angle-stepped line, release to
     // commit a bulge-0 SplineWall, identical in kind to a curved one.
-    // When BOTH ends of the drag snap to wall ends, the wall auto-curves
-    // to tangent-match the two hosts (TryTangentControl) so it ties in
-    // flush at both — Shift keeps it straight. Hovering an existing
-    // wall's top face previews a full course along it instead, and one
-    // click lays it; R turns the single-click stub's orientation.
+    // Endpoint-snapped ends commit as CORNER NODES: the wall stays
+    // straight and the turning happens in the node's round post
+    // (WallNode), at any angle. Holding Shift with both ends snapped opts
+    // into the tangent-tied connector instead (TryTangentControl) — the
+    // wall auto-curves to tie in flush at both hosts. Hovering an
+    // existing wall's top face previews a full course along it instead,
+    // and one click lays it; R turns the single-click stub's orientation.
     void UpdateStraightBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
         if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
@@ -341,11 +355,13 @@ public class GridPlacementSystem : MonoBehaviour
             {
                 float stubYaw = hoverSnapYaw ?? currentYRotation;
                 snapTint = hoverSnapYaw.HasValue;
-                // On the host's centerline (endpoint snap) the carved stub
-                // trims away to nothing — show the solid marker instead.
-                if (hoverSnap.HasValue && hoverSnap.Value.isEndpoint)
+                // A node-forming snap previews as a rectangular stub
+                // leaving the point outward — flush outside the host,
+                // never a half-buried post marker.
+                if (hoverSnap.HasValue && (hoverSnap.Value.isEndpoint || hoverSnap.Value.isFlank))
                 {
-                    ShowStartMarker(point);
+                    BuildSnappedStubPreview(hoverSnap.Value, point);
+                    ShowSplineGhosts();
                 }
                 else
                 {
@@ -377,37 +393,81 @@ public class GridPlacementSystem : MonoBehaviour
             {
                 // The far end snaps to wall ends too, so closing a loop
                 // lands exactly on the corner it started from — the snap
-                // outranks length stepping while it holds.
+                // outranks length stepping while it holds. Failing an end
+                // snap, a wall FACE grabs the end instead: the wall
+                // terminates there as a T-joint node, at any angle.
                 if (!freePlace && TryEndSnap(rawSurface, splineStart, out EndSnap endSnap))
                 {
                     splineEnd = endSnap.point;
                     dragEndSnap = endSnap;
                 }
+                else if (!freePlace && TryFlankSnap(rawSurface, splineStart, out EndSnap flankSnap))
+                {
+                    splineEnd = flankSnap.point;
+                    dragEndSnap = flankSnap;
+                }
                 else
                 {
                     splineEnd = SteppedDragEnd(splineStart.Value, rawSurface, freePlace, snapAngle);
                     dragEndSnap = null;
+                    // A flank-anchored drag measures its direction FROM the
+                    // face normal, always stepped — a lazy short drag lands
+                    // exactly 90° flush, deliberate angles land on clean
+                    // 15° increments. Alt frees as everywhere.
+                    if (!freePlace && anchorSnap.HasValue && anchorSnap.Value.isFlank)
+                    {
+                        Vector3 d = splineEnd.Value - splineStart.Value;
+                        d.y = 0f;
+                        float len = d.magnitude;
+                        if (len > 0.001f)
+                        {
+                            float rel = Vector3.SignedAngle(anchorSnap.Value.outDir, d, Vector3.up);
+                            float snapped = Mathf.Round(rel / angleStep) * angleStep;
+                            Vector3 dir = Quaternion.AngleAxis(snapped, Vector3.up) * anchorSnap.Value.outDir;
+                            splineEnd = splineStart.Value + dir * len;
+                        }
+                    }
                 }
             }
 
             Vector3 anchor = splineStart.Value;
             Vector3 end = splineEnd ?? anchor;
-            // Both ends snapped to wall ends: the connector auto-curves to
-            // leave one host and arrive at the other straight-on, turning
-            // both joints into flush end-on fuses instead of kinked
-            // corners. Shift keeps it straight for a deliberate corner.
+            // Endpoint-snapped ends default to corner nodes on a straight
+            // wall — all the turning lives in the posts. Holding Shift
+            // with both ends snapped opts into the tangent-tied connector
+            // instead: the wall auto-curves to leave one host and arrive
+            // at the other straight-on, both joints flush end-on fuses.
             float dragBulge = 0f, dragApexT = 0.5f;
-            bool tangentTied = anchorSnap.HasValue && dragEndSnap.HasValue && !snapAngle
+            bool tangentTied = anchorSnap.HasValue && dragEndSnap.HasValue && snapAngle
                 && TryTangentControl(anchor, end, out dragBulge, out dragApexT);
             if (!tangentTied)
             {
                 dragBulge = 0f;
                 dragApexT = 0.5f;
             }
+            bool nodeStart = anchorSnap.HasValue
+                && (anchorSnap.Value.isEndpoint || anchorSnap.Value.isFlank);
+            bool nodeEnd = dragEndSnap.HasValue
+                && (dragEndSnap.Value.isEndpoint || dragEndSnap.Value.isFlank);
             if (FlatDistance(anchor, end) >= 0.25f)
-                BuildSplinePreview(anchor, end, dragBulge, dragApexT);
+            {
+                BuildSplinePreview(anchor, end, dragBulge, dragApexT, nodeStart, nodeEnd,
+                    PendingIgnores(anchorSnap, anchor, dragEndSnap, end));
+                // Post ghosts only where a real corner post will stand —
+                // flank ends cap flat ON the host's face, no cylinder.
+                if (nodeStart && anchorSnap.Value.isEndpoint)
+                    AddNodeGhost(anchor);
+                if (nodeEnd && dragEndSnap.Value.isEndpoint)
+                    AddNodeGhost(end);
+            }
+            else if (nodeStart)
+            {
+                BuildSnappedStubPreview(anchorSnap.Value, anchor);
+            }
             else
+            {
                 BuildStubPreview(anchor, anchorSnapYaw ?? currentYRotation);
+            }
             snapTint = dragEndSnap.HasValue;
             ShowSplineGhosts();
             guideCenter = (anchor + end) * 0.5f;
@@ -436,11 +496,23 @@ public class GridPlacementSystem : MonoBehaviour
         BuildSplinePreview(center - halfChord, center + halfChord, 0f, 0.5f);
     }
 
-    // Both drag ends snapped to wall ends: solve the quadratic control
-    // point that makes the connector LEAVE the anchor's host straight-on
-    // and ARRIVE at the far host straight-on — the intersection of the
-    // two snaps' departure rays. Each joint then meets its host collinear
-    // (the flush end-on fuse) instead of kinking into a corner cut.
+    // The ghost for a node-forming snap (endpoint or flank): a token
+    // chord LEAVING the snap point along its outward direction, node-
+    // capped flat ON the point — a rectangle sitting wholly outside the
+    // host, flush with its face or cap, never a half-buried marker.
+    void BuildSnappedStubPreview(EndSnap snap, Vector3 point)
+    {
+        Vector3 end = point + snap.outDir * 0.1f;
+        BuildSplinePreview(point, end, 0f, 0.5f, true, false,
+            PendingIgnores(snap, point, null, end));
+    }
+
+    // Shift held with both drag ends snapped to wall ends: solve the
+    // quadratic control point that makes the connector LEAVE the anchor's
+    // host straight-on and ARRIVE at the far host straight-on — the
+    // intersection of the two snaps' departure rays. Each joint then
+    // meets its host collinear (the flush end-on fuse) instead of turning
+    // at a corner node, for the deliberate sweeping run between towers.
     // False — stay straight — when the tangents are parallel (an S no
     // single quadratic can make), diverge, or demand an extreme curve.
     bool TryTangentControl(Vector3 anchor, Vector3 end, out float bulge, out float apexT)
@@ -554,7 +626,13 @@ public class GridPlacementSystem : MonoBehaviour
             else if (hasPoint)
             {
                 snapTint = hoverSnapYaw.HasValue;
-                ShowStartMarker(point);
+                if (hoverSnap.HasValue && (hoverSnap.Value.isEndpoint || hoverSnap.Value.isFlank))
+                {
+                    BuildSnappedStubPreview(hoverSnap.Value, point);
+                    ShowSplineGhosts();
+                }
+                else
+                    ShowStartMarker(point);
                 guideCenter = point;
                 guideBearing = -(hoverSnapYaw ?? 0f);
                 if (mouse.leftButton.wasPressedThisFrame)
@@ -577,8 +655,32 @@ public class GridPlacementSystem : MonoBehaviour
             // far end; off-target frames keep the last preview.
             if (hasPoint)
             {
-                BuildSplinePreview(splineStart.Value, point, 0f, 0.5f);
-                snapTint = hoverSnapYaw.HasValue;
+                // Failing an end snap, a wall face grabs the chord's far
+                // end for a T-node, same as the straight tool. The hover's
+                // flank pick is discarded first: it chose the face by
+                // cursor side (the anchor gesture) — a far end approaching
+                // a host must land on the face the ANCHOR is on, so it is
+                // re-derived here with the anchor picking the side.
+                EndSnap? chordSnap = hoverSnap;
+                if (chordSnap.HasValue && chordSnap.Value.isFlank)
+                    chordSnap = null;
+                if (!freePlace && !chordSnap.HasValue
+                    && TryFlankSnap(rawSurface, splineStart, out EndSnap chordFlank))
+                {
+                    chordSnap = chordFlank;
+                    point = chordFlank.point;
+                }
+                bool chordNodeStart = anchorSnap.HasValue
+                    && (anchorSnap.Value.isEndpoint || anchorSnap.Value.isFlank);
+                bool chordNodeEnd = chordSnap.HasValue
+                    && (chordSnap.Value.isEndpoint || chordSnap.Value.isFlank);
+                BuildSplinePreview(splineStart.Value, point, 0f, 0.5f, chordNodeStart, chordNodeEnd,
+                    PendingIgnores(anchorSnap, splineStart.Value, chordSnap, point));
+                if (chordNodeStart && anchorSnap.Value.isEndpoint)
+                    AddNodeGhost(splineStart.Value);
+                if (chordNodeEnd && chordSnap.Value.isEndpoint)
+                    AddNodeGhost(point);
+                snapTint = hoverSnapYaw.HasValue || (chordSnap.HasValue && chordSnap.Value.isFlank);
                 ShowSplineGhosts();
                 guideCenter = (splineStart.Value + point) * 0.5f;
                 guideBearing = Mathf.Atan2(point.z - splineStart.Value.z, point.x - splineStart.Value.x) * Mathf.Rad2Deg;
@@ -588,7 +690,12 @@ public class GridPlacementSystem : MonoBehaviour
                 flat.y = 0f;
                 if (flat.sqrMagnitude > 0.25f
                     && (mouse.leftButton.wasPressedThisFrame || mouse.leftButton.wasReleasedThisFrame))
+                {
                     splineEnd = point;
+                    // Remember the snap here — the commit turns it into a
+                    // corner or T node.
+                    dragEndSnap = chordSnap;
+                }
             }
         }
         else
@@ -616,7 +723,16 @@ public class GridPlacementSystem : MonoBehaviour
                 curveApexT = Mathf.Clamp(t, 0.15f, 0.85f);
             }
 
-            BuildSplinePreview(splineStart.Value, splineEnd.Value, curveBulge, curveApexT);
+            bool bendNodeStart = anchorSnap.HasValue
+                && (anchorSnap.Value.isEndpoint || anchorSnap.Value.isFlank);
+            bool bendNodeEnd = dragEndSnap.HasValue
+                && (dragEndSnap.Value.isEndpoint || dragEndSnap.Value.isFlank);
+            BuildSplinePreview(splineStart.Value, splineEnd.Value, curveBulge, curveApexT, bendNodeStart, bendNodeEnd,
+                PendingIgnores(anchorSnap, splineStart.Value, dragEndSnap, splineEnd.Value));
+            if (bendNodeStart && anchorSnap.Value.isEndpoint)
+                AddNodeGhost(splineStart.Value);
+            if (bendNodeEnd && dragEndSnap.Value.isEndpoint)
+                AddNodeGhost(splineEnd.Value);
             ShowSplineGhosts();
             guideCenter = (splineStart.Value + splineEnd.Value) * 0.5f;
             guideBearing = Mathf.Atan2(splineEnd.Value.z - splineStart.Value.z,
@@ -646,14 +762,24 @@ public class GridPlacementSystem : MonoBehaviour
     {
         if (HasPlaceableSpecs() && lastPreviewKey.HasValue)
         {
-            (Vector3 s, Vector3 e, float bulge, float apexT, float height, float topY) = lastPreviewKey.Value;
+            (Vector3 s, Vector3 e, float bulge, float apexT, float height, float topY, bool nodeStart, bool nodeEnd) = lastPreviewKey.Value;
             Vector3 control = ControlPointFor(s, e, bulge, apexT);
             SplineWall.Create(splineParent, s, control, e,
                 height, gridSize, BaseHeight, wallMaterial, splineSpecs,
-                gridSize, baseStepSize, false, topY);
+                gridSize, baseStepSize, false, topY, nodeStart, nodeEnd);
             // Mesh ownership just moved to the wall's sections — clear the
             // preview list so CancelCurve doesn't destroy them.
             previewMeshes.Clear();
+            // Snapped ends become nodes: every wall ending on the point
+            // joins, hosts retract their caps to it, and the node's post
+            // carves the corner. A flank-snapped end passes its host in
+            // as a flank member (the T-joint — host geometry untouched).
+            if (nodeStart)
+                WallNode.Connect(splineParent, s, gridSize * 0.5f, wallMaterial,
+                    anchorSnap.HasValue && anchorSnap.Value.isFlank ? anchorSnap.Value.wall : null);
+            if (nodeEnd)
+                WallNode.Connect(splineParent, e, gridSize * 0.5f, wallMaterial,
+                    dragEndSnap.HasValue && dragEndSnap.Value.isFlank ? dragEndSnap.Value.wall : null);
         }
         CancelCurve();
     }
@@ -666,6 +792,13 @@ public class GridPlacementSystem : MonoBehaviour
                 CurrentWallHeight, below.thickness, BaseHeight, wallMaterial, splineSpecs,
                 gridSize, baseStepSize, true);
             previewMeshes.Clear();
+            // A course over a node-ended wall joins the node, so the post
+            // rises with the corner (the copied sections already cap at
+            // the point).
+            if (below.nodeAtStart)
+                WallNode.Connect(splineParent, below.curveStart, gridSize * 0.5f, wallMaterial);
+            if (below.nodeAtEnd)
+                WallNode.Connect(splineParent, below.curveEnd, gridSize * 0.5f, wallMaterial);
         }
         CancelCurve();
     }
@@ -686,6 +819,7 @@ public class GridPlacementSystem : MonoBehaviour
         anchorSnapHeight = null;
         heightOverride = false;
         dragEndSnap = null;
+        pendingNodeGhosts.Clear();
         HideGhosts();
     }
 
@@ -732,9 +866,9 @@ public class GridPlacementSystem : MonoBehaviour
         }
 
         // End snapping: wall ends outrank everything nearby, and the point
-        // locks EXACTLY to one of four spots per end — the endpoint itself
-        // or one of the end piece's three faces (end cap and both flanks)
-        // — the joints a rectangular layout is made of.
+        // locks EXACTLY to one of three spots per end — the endpoint
+        // itself (a corner-node joint) or one of the two flank points
+        // beside it — the joints a wall layout is made of.
         if (TryEndSnap(rawSurface, null, out EndSnap endSnap))
         {
             hoverSnap = endSnap;
@@ -745,18 +879,19 @@ public class GridPlacementSystem : MonoBehaviour
             return true;
         }
 
-        if (section != null)
+        // A wall's face: the anchor lands ON the face point, on whichever
+        // side of the wall the cursor is — clicking plants a T-node there
+        // and the wall draws away from that face at any angle (the commit
+        // makes the host a flank member; the wedge rule fills the
+        // shoulder). This replaces the old lay-alongside gesture — a
+        // parallel run against a face is the Offset tool's job.
+        if (TryFlankSnap(rawSurface, null, out EndSnap flankSnap))
         {
-            // A wall's flank: land the new wall's centerline flush
-            // against the face being pointed at, so "against that wall"
-            // is one gesture and the joint closes itself. The snap also
-            // hands over the wall's own yaw — the stub lies along the
-            // host, flush, instead of keeping its R rotation.
-            Vector3 flank = first.point + first.normal * (gridSize * 0.5f);
-            hoverSnapYaw = first.collider.transform.eulerAngles.y;
-            point = new Vector3(flank.x, 0f, flank.z);
-            if (section.wall != null)
-                hoverSnapHeight = SnapHeightOf(section.wall, point);
+            hoverSnap = flankSnap;
+            hoverSnapYaw = flankSnap.stubYaw;
+            if (flankSnap.wall != null)
+                hoverSnapHeight = SnapHeightOf(flankSnap.wall, flankSnap.point);
+            point = flankSnap.point;
             return true;
         }
 
@@ -767,11 +902,13 @@ public class GridPlacementSystem : MonoBehaviour
     }
 
     // The nearest exact end-snap candidate within endpointSnapRadius of
-    // the raw point, across every wall end: the endpoint itself, the
-    // center of the end cap, and the two flank points beside the endpoint
-    // (each exactly on a face plane, so snapped walls trim flush).
-    // Candidates near `exclude` (the drag anchor) are skipped so a drag
-    // can't snap its far end back onto its own start.
+    // the raw point, across every wall end: the endpoint itself (a
+    // corner-node joint) and the two flank points beside it (each exactly
+    // on a face plane, so snapped stubs fuse flush). The old cap
+    // candidate is gone — with corner nodes, continuing past an end is
+    // just an endpoint snap drawn onward. Candidates near `exclude` (the
+    // drag anchor) are skipped so a drag can't snap its far end back
+    // onto its own start.
     bool TryEndSnap(Vector3 raw, Vector3? exclude, out EndSnap snap)
     {
         snap = default;
@@ -786,20 +923,14 @@ public class GridPlacementSystem : MonoBehaviour
                 endPos.y = 0f;
                 Vector3 outDir = wall.EndOutwardDir(atStart);
                 Vector3 side = new Vector3(-outDir.z, 0f, outDir.x);
-                float capReach = wall.targetSectionLength * 0.5f;
                 float halfThick = wall.thickness * 0.5f;
-                // The cap candidate sits half a thickness PAST the end
-                // face, so a snapped stub stands beside the cap and gets
-                // graze-fused flush against it — centered on the face it
-                // would straddle the host and carve itself in two.
                 Vector3[] candidates =
                 {
                     endPos,
-                    endPos + outDir * (capReach + halfThick),
                     endPos + side * halfThick,
                     endPos - side * halfThick,
                 };
-                Vector3[] candidateDirs = { outDir, outDir, side, -side };
+                Vector3[] candidateDirs = { outDir, side, -side };
                 for (int ci = 0; ci < candidates.Length; ci++)
                 {
                     Vector3 candidate = candidates[ci];
@@ -825,6 +956,75 @@ public class GridPlacementSystem : MonoBehaviour
             }
         }
         return found;
+    }
+
+    // Mid-wall flank termination snap: the drag's far end lands ON a
+    // host's face, ending the wall there as a T-joint node at ANY angle —
+    // the host joins the node as a flank member and the wedge rule fills
+    // the shoulder (nothing at 90°, an arc at shallow angles). `from` is
+    // the drag anchor: it picks which face of the host to land on, and
+    // candidates near it are skipped like TryEndSnap's. The host's end
+    // zones are left to end snapping.
+    bool TryFlankSnap(Vector3 raw, Vector3? from, out EndSnap snap)
+    {
+        snap = default;
+        float bestSq = endpointSnapRadius * endpointSnapRadius;
+        bool found = false;
+        foreach (SplineWall wall in SplineWall.All)
+        {
+            float bestT = 0f, bestCSq = float.MaxValue;
+            for (int i = 0; i <= 64; i++)
+            {
+                float t = i / 64f;
+                Vector3 q = SplineWall.Evaluate(wall.curveStart, wall.curveControl, wall.curveEnd, t);
+                float dx = q.x - raw.x, dz = q.z - raw.z;
+                float sq = dx * dx + dz * dz;
+                if (sq < bestCSq) { bestCSq = sq; bestT = t; }
+            }
+            float halfThick = wall.thickness * 0.5f;
+            if (bestCSq > (halfThick + endpointSnapRadius) * (halfThick + endpointSnapRadius))
+                continue;
+
+            Vector3 c = SplineWall.Evaluate(wall.curveStart, wall.curveControl, wall.curveEnd, bestT);
+            Vector3 side = wall.SideOf(from ?? raw) * FlankNormalAt(wall, bestT);
+            Vector3 facePoint = new Vector3(c.x + side.x * halfThick, 0f, c.z + side.z * halfThick);
+            if (FlatDistance(facePoint, wall.EndPosition(true)) < 0.9f
+                || FlatDistance(facePoint, wall.EndPosition(false)) < 0.9f)
+                continue;
+            if (from.HasValue && FlatDistance(facePoint, from.Value) < lengthStep)
+                continue;
+            float dxf = facePoint.x - raw.x, dzf = facePoint.z - raw.z;
+            float sqf = dxf * dxf + dzf * dzf;
+            if (sqf >= bestSq)
+                continue;
+            bestSq = sqf;
+            found = true;
+            snap = new EndSnap
+            {
+                wall = wall,
+                point = facePoint,
+                backBearing = Mathf.Atan2(side.z, side.x) * Mathf.Rad2Deg + 180f,
+                // Maps to a stub chord running ALONG side — perpendicular
+                // out of the face, the direction a wall leaves a T flush.
+                stubYaw = Mathf.Atan2(-side.z, side.x) * Mathf.Rad2Deg,
+                outDir = side,
+                isEndpoint = false,
+                isFlank = true,
+            };
+        }
+        return found;
+    }
+
+    // The host's left-hand flank normal at t, flattened — SideOf's sign
+    // convention picks which face by multiplying this by ±1.
+    static Vector3 FlankNormalAt(SplineWall wall, float t)
+    {
+        Vector3 a = SplineWall.Evaluate(wall.curveStart, wall.curveControl, wall.curveEnd, Mathf.Clamp01(t - 0.01f));
+        Vector3 b = SplineWall.Evaluate(wall.curveStart, wall.curveControl, wall.curveEnd, Mathf.Clamp01(t + 0.01f));
+        Vector3 dir = b - a;
+        dir.y = 0f;
+        dir = dir.sqrMagnitude < 0.000001f ? Vector3.right : dir.normalized;
+        return new Vector3(-dir.z, 0f, dir.x);
     }
 
     static float FlatDistance(Vector3 a, Vector3 b)
@@ -853,11 +1053,12 @@ public class GridPlacementSystem : MonoBehaviour
             : float.NegativeInfinity;
     }
 
-    void BuildSplinePreview(Vector3 start, Vector3 end, float bulge, float apexT)
+    void BuildSplinePreview(Vector3 start, Vector3 end, float bulge, float apexT,
+        bool nodeStart = false, bool nodeEnd = false, List<SplineWall> ignoreWalls = null)
     {
         float height = EffectiveWallHeight;
         float topY = LockedTopFor(start);
-        var key = (start, end, bulge, apexT, height, topY);
+        var key = (start, end, bulge, apexT, height, topY, nodeStart, nodeEnd);
         if (lastPreviewKey.HasValue && lastPreviewKey.Value == key)
             return;
         lastPreviewKey = key;
@@ -868,9 +1069,48 @@ public class GridPlacementSystem : MonoBehaviour
         Vector3 control = ControlPointFor(start, end, bulge, apexT);
         splineSpecs.AddRange(SplineWall.BuildSpecs(start, control, end,
             height, gridSize, gridSize, baseStepSize, BaseHeight,
-            int.MaxValue, true, topY));
+            int.MaxValue, true, topY, nodeStart, nodeEnd, ignoreWalls));
         foreach (SplineWall.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
+    }
+
+    // The walls the pending drag is joining at its snapped ends — the set
+    // spec building stands the junction machinery down for: the snap
+    // hosts themselves plus every existing member of nodes at the points.
+    List<SplineWall> PendingIgnores(EndSnap? startSnap, Vector3 start, EndSnap? endSnap, Vector3 end)
+    {
+        List<SplineWall> ignore = null;
+        void Add(SplineWall w)
+        {
+            if (w == null || (ignore != null && ignore.Contains(w)))
+                return;
+            (ignore ??= new List<SplineWall>()).Add(w);
+        }
+        void AddEnd(EndSnap? snap, Vector3 p, Vector3 other)
+        {
+            if (!snap.HasValue || !(snap.Value.isEndpoint || snap.Value.isFlank))
+                return;
+            // A flank host only stands down for a wall that leaves on its
+            // snapped face's side. A drag crossing to the far side is an
+            // intersection — no stand-down, so the machinery refuses it
+            // red instead of letting the wall run through its own host.
+            if (snap.Value.isFlank)
+            {
+                Vector3 leave = other - p;
+                leave.y = 0f;
+                if (leave.sqrMagnitude > 0.0001f
+                    && Vector3.Dot(leave, snap.Value.outDir) < -0.001f)
+                    return;
+            }
+            Add(snap.Value.wall);
+            WallNode node = WallNode.FindAt(p);
+            if (node != null)
+                foreach (SplineWall w in node.MemberWalls)
+                    Add(w);
+        }
+        AddEnd(startSnap, start, end);
+        AddEnd(endSnap, end, start);
+        return ignore;
     }
 
     void BuildCoursePreview(SplineWall wall)
@@ -959,6 +1199,42 @@ public class GridPlacementSystem : MonoBehaviour
         ghost.transform.localScale = scale;
         for (int i = 1; i < ghostPool.Count; i++)
             ghostPool[i].SetActive(false);
+    }
+
+    // Queues a gold corner-post ghost at an endpoint-snapped end for this
+    // frame; UpdateNodeGhostVisuals renders the queue at the end of
+    // Update.
+    void AddNodeGhost(Vector3 p)
+    {
+        pendingNodeGhosts.Add((p, SampleCellGroundY(p.x, p.z), EffectiveWallHeight));
+    }
+
+    void UpdateNodeGhostVisuals()
+    {
+        for (int i = 0; i < pendingNodeGhosts.Count; i++)
+        {
+            (Vector3 pos, float ground, float height) = pendingNodeGhosts[i];
+            while (nodeGhostMeshes.Count <= i)
+            {
+                nodeGhostMeshes.Add(null);
+                nodeGhostHeights.Add(-1f);
+            }
+            if (nodeGhostMeshes[i] == null || !Mathf.Approximately(nodeGhostHeights[i], height))
+            {
+                if (nodeGhostMeshes[i] != null)
+                    Destroy(nodeGhostMeshes[i]);
+                nodeGhostMeshes[i] = WallNode.BuildGhostMesh(gridSize * 0.5f, height);
+                nodeGhostHeights[i] = height;
+            }
+            GameObject ghost = GetPooled(nodeGhostPool, i, snapColor, "NodeGhost");
+            ghost.SetActive(true);
+            SetGhostMesh(ghost, nodeGhostMeshes[i]);
+            SetGhostTint(ghost, snapColor);
+            ghost.transform.SetPositionAndRotation(new Vector3(pos.x, ground, pos.z), Quaternion.identity);
+            ghost.transform.localScale = Vector3.one;
+        }
+        for (int i = pendingNodeGhosts.Count; i < nodeGhostPool.Count; i++)
+            nodeGhostPool[i].SetActive(false);
     }
 
     // Pooled ghosts flip between the shared box mesh and per-slice curve
@@ -1404,6 +1680,8 @@ public class GridPlacementSystem : MonoBehaviour
     void HideGhosts()
     {
         foreach (GameObject ghost in ghostPool)
+            ghost.SetActive(false);
+        foreach (GameObject ghost in nodeGhostPool)
             ghost.SetActive(false);
     }
 

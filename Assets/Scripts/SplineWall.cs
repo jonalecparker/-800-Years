@@ -45,6 +45,12 @@ public class SplineWall : MonoBehaviour
     // wall always trims against the older wall's body, never the reverse,
     // so rebuilds can't eat a hole from both sides of a crossing.
     public int buildOrder;
+    // Ends that terminate at a corner node (WallNode) end in a flat cap
+    // exactly ON the endpoint: no end extension, no overshoot into
+    // neighbours — the node's post supplies the corner masonry, and the
+    // caps and flanks are tangent to it by construction.
+    public bool nodeAtStart;
+    public bool nodeAtEnd;
 
     // The walls this wall physically meets — burials, crossings, flush
     // T-joints, chained endpoints, and stacked courses all land here.
@@ -96,6 +102,11 @@ public class SplineWall : MonoBehaviour
         // show red instead of vanishing) — Create skips and disposes
         // them, they never become sections.
         public bool blocked;
+        // True when the piece overlaps a fellow node member: legal buried
+        // masonry near the shared joint, not a duplicate. Only if EVERY
+        // piece is buried does the wall read as a redraw along a member —
+        // BuildSpecs then blocks the lot.
+        public bool buriedInMember;
     }
 
     // One junction band: the arc interval of a sweep that lies inside an
@@ -115,6 +126,11 @@ public class SplineWall : MonoBehaviour
         // zone dies at the zone boundary instead, so a redraw entering
         // through a cap refuses red rather than swallowing the wall.
         public bool gateQualified;
+        // A through-crossing: the sweep enters AND exits the host's body
+        // mid-run. Walls never intersect — these bands refuse their span
+        // (blocked red) instead of cutting; only terminal burials (an end
+        // riding its overshoot into a host) still cut-fuse flush.
+        public bool through;
     }
 
     void OnEnable() { All.Add(this); }
@@ -126,11 +142,17 @@ public class SplineWall : MonoBehaviour
             if (other != null)
                 other.Links.Remove(this);
         Links.Clear();
+        // Corner nodes drop this wall; a node left with one member
+        // dissolves and un-nodes the survivor (see WallNode.Unregister).
+        if (nodeAtStart || nodeAtEnd)
+            foreach (WallNode node in new List<WallNode>(WallNode.All))
+                node.Unregister(this);
     }
 
     public static SplineWall Create(Transform parent, Vector3 s, Vector3 control, Vector3 e,
         float height, float thickness, float baseWallHeight, Material material, List<SectionSpec> specs,
-        float targetSectionLength, float baseStep, bool isStackedCourse, float fixedTopY = float.NegativeInfinity)
+        float targetSectionLength, float baseStep, bool isStackedCourse, float fixedTopY = float.NegativeInfinity,
+        bool nodeAtStart = false, bool nodeAtEnd = false)
     {
         GameObject wallObj = new GameObject("SplineWall");
         wallObj.transform.SetParent(parent, false);
@@ -138,6 +160,8 @@ public class SplineWall : MonoBehaviour
         wall.curveStart = s;
         wall.curveControl = control;
         wall.curveEnd = e;
+        wall.nodeAtStart = nodeAtStart;
+        wall.nodeAtEnd = nodeAtEnd;
         wall.height = height;
         wall.thickness = thickness;
         wall.baseWallHeight = baseWallHeight;
@@ -237,9 +261,31 @@ public class SplineWall : MonoBehaviour
         Physics.SyncTransforms();
 
         foreach (SectionSpec spec in BuildSpecs(curveStart, curveControl, curveEnd,
-            height, targetSectionLength, thickness, baseStep, baseWallHeight, buildOrder, false, fixedTopY))
+            height, targetSectionLength, thickness, baseStep, baseWallHeight, buildOrder, false, fixedTopY,
+            nodeAtStart, nodeAtEnd, NodeMemberIgnores()))
             CreateSection(spec, material);
         Physics.SyncTransforms();
+    }
+
+    // The fellow members of the nodes this wall's ends are joined at —
+    // the walls the junction machinery stands down for on a rebuild.
+    List<SplineWall> NodeMemberIgnores()
+    {
+        List<SplineWall> ignore = null;
+        void Collect(Vector3 p)
+        {
+            WallNode node = WallNode.FindAt(p);
+            if (node == null)
+                return;
+            foreach (SplineWall wall in node.MemberWalls)
+                if (wall != this && (ignore == null || !ignore.Contains(wall)))
+                    (ignore ??= new List<SplineWall>()).Add(wall);
+        }
+        if (nodeAtStart)
+            Collect(curveStart);
+        if (nodeAtEnd)
+            Collect(curveEnd);
+        return ignore;
     }
 
     // Sections for a fresh wall on the ground. The cut count is chosen so
@@ -251,9 +297,16 @@ public class SplineWall : MonoBehaviour
     // and the junction band trims it back flush to that wall's face.
     // buildOrder is the committing wall's place in line (int.MaxValue for
     // previews and new walls): only OLDER walls trim this sweep.
+    // ignoreWalls: fellow members of the corner/T nodes this wall is
+    // joining — the node owns the joint, so the junction machinery stands
+    // down for them: no bands, no graze clips, no duplicate refusal.
+    // Overlap with a member is legal buried masonry (a shallow tee's
+    // sliver hides inside the host) — unless EVERY piece is buried, which
+    // means a redraw along the member and blocks the lot.
     public static List<SectionSpec> BuildSpecs(Vector3 s, Vector3 control, Vector3 e,
         float height, float targetSectionLength, float thickness, float baseStep, float baseWallHeight,
-        int buildOrder = int.MaxValue, bool includeBlocked = false, float fixedTopY = float.NegativeInfinity)
+        int buildOrder = int.MaxValue, bool includeBlocked = false, float fixedTopY = float.NegativeInfinity,
+        bool nodeAtStart = false, bool nodeAtEnd = false, List<SplineWall> ignoreWalls = null)
     {
         var specs = new List<SectionSpec>();
         float[] arcTable = BuildArcTable(s, control, e);
@@ -261,33 +314,59 @@ public class SplineWall : MonoBehaviour
         if (totalArc < 0.05f)
             return specs;
 
-        float startExt = EndExtension(s, control, e, arcTable, true, targetSectionLength);
-        float endExt = EndExtension(s, control, e, arcTable, false, targetSectionLength);
+        // A node end caps flat exactly ON the endpoint: the corner node's
+        // post owns the space past it, so there is nothing to grow into.
+        float startExt = nodeAtStart ? 0f : EndExtension(s, control, e, arcTable, true, targetSectionLength);
+        float endExt = nodeAtEnd ? 0f : EndExtension(s, control, e, arcTable, false, targetSectionLength);
 
         float fullLength = startExt + totalArc + endExt;
         int count = Mathf.Max(1, Mathf.RoundToInt(fullLength / Mathf.Max(0.1f, targetSectionLength)));
         float sectionArc = fullLength / count;
 
-        List<Band> bands = FindJunctionBands(s, control, e, arcTable, -startExt, totalArc + endExt, thickness, buildOrder);
+        float scanMin = -startExt;
+        float scanMax = totalArc + endExt;
+        List<Band> bands = FindJunctionBands(s, control, e, arcTable, scanMin, scanMax, thickness, buildOrder,
+            nodeAtStart, nodeAtEnd, ignoreWalls);
 
-        // Bands are per-host and can overlap where several hosts meet at
-        // one junction; sections are carved against their arc UNION, while
-        // every piece keeps each individual band's face planes to clip by.
-        // Graze bands only clip — they never remove sections.
-        var merged = new List<Vector2>();
+        // Walls never intersect: a band the sweep passes THROUGH (enters
+        // and exits a host's body mid-run) refuses its span instead of
+        // cutting — drawing across a wall means drawing two walls, one on
+        // each side. A band is a legal terminal burial only when it began
+        // before the wall's body did or outlives the body's end — i.e. an
+        // END lies inside it (any overshoot poking out the host's far
+        // side is extension crumb, already dropped). Real body resuming
+        // on the far side is what makes a crossing. Node ends have no
+        // overshoot and their clamped scan starts inside the body, so a
+        // band opening there classifies as the crossing it is.
         foreach (Band band in bands)
         {
             if (band.graze)
                 continue;
-            if (merged.Count > 0 && band.aIn <= merged[merged.Count - 1].y + 0.001f)
+            band.through = band.aIn > 0.02f && band.aOut < totalArc - 0.02f;
+        }
+
+        // Bands are per-host and can overlap where several hosts meet at
+        // one junction; sections are carved against their arc UNION, while
+        // every piece keeps each individual band's face planes to clip by.
+        // Graze bands only clip — they never remove sections. Through
+        // bands neither clip nor remove: their union is collected apart,
+        // and every piece overlapping it emits force-blocked (red).
+        var merged = new List<Vector2>();
+        var refused = new List<Vector2>();
+        foreach (Band band in bands)
+        {
+            if (band.graze)
+                continue;
+            List<Vector2> list = band.through ? refused : merged;
+            if (list.Count > 0 && band.aIn <= list[list.Count - 1].y + 0.001f)
             {
-                Vector2 last = merged[merged.Count - 1];
+                Vector2 last = list[list.Count - 1];
                 last.y = Mathf.Max(last.y, band.aOut);
-                merged[merged.Count - 1] = last;
+                list[list.Count - 1] = last;
             }
             else
             {
-                merged.Add(new Vector2(band.aIn, band.aOut));
+                list.Add(new Vector2(band.aIn, band.aOut));
             }
         }
 
@@ -304,15 +383,36 @@ public class SplineWall : MonoBehaviour
                 if (m.y <= cursor + 0.001f || m.x >= a1 - 0.001f)
                     continue;
                 if (m.x > cursor + 0.001f)
-                    EmitPiece(specs, s, control, e, i, cursor, m.x, bands, totalArc,
-                        height, thickness, baseStep, baseWallHeight, arcTable, includeBlocked, fixedTopY);
+                    EmitPiece(specs, s, control, e, i, cursor, m.x, bands, refused, totalArc,
+                        height, thickness, baseStep, baseWallHeight, arcTable, includeBlocked, fixedTopY, ignoreWalls);
                 cursor = Mathf.Max(cursor, m.y);
                 if (cursor >= a1)
                     break;
             }
             if (cursor < a1 - 0.01f)
-                EmitPiece(specs, s, control, e, i, cursor, a1, bands, totalArc,
-                    height, thickness, baseStep, baseWallHeight, arcTable, includeBlocked, fixedTopY);
+                EmitPiece(specs, s, control, e, i, cursor, a1, bands, refused, totalArc,
+                    height, thickness, baseStep, baseWallHeight, arcTable, includeBlocked, fixedTopY, ignoreWalls);
+        }
+
+        // A wall whose EVERY piece lies buried inside its node partners is
+        // a redraw along a member, not a joint — refuse the lot, exactly
+        // as the duplicate check would for an un-noded wall.
+        if (ignoreWalls != null && specs.Count > 0)
+        {
+            bool anyClear = false;
+            foreach (SectionSpec sp in specs)
+                if (!sp.blocked && !sp.buriedInMember)
+                {
+                    anyClear = true;
+                    break;
+                }
+            if (!anyClear)
+                for (int i = 0; i < specs.Count; i++)
+                {
+                    SectionSpec sp = specs[i];
+                    sp.blocked = true;
+                    specs[i] = sp;
+                }
         }
         return specs;
     }
@@ -327,9 +427,9 @@ public class SplineWall : MonoBehaviour
     // shallow angles — so the clip has geometry to carve the diagonal
     // from.
     static void EmitPiece(List<SectionSpec> specs, Vector3 s, Vector3 control, Vector3 e, int index,
-        float k0, float k1, List<Band> bands, float totalArc,
+        float k0, float k1, List<Band> bands, List<Vector2> refused, float totalArc,
         float height, float thickness, float baseStep, float baseWallHeight, float[] arcTable,
-        bool includeBlocked, float fixedTopY)
+        bool includeBlocked, float fixedTopY, List<SplineWall> ignoreWalls)
     {
         if (k1 - k0 < 0.08f)
             return;
@@ -338,6 +438,16 @@ public class SplineWall : MonoBehaviour
         // inside its body instead of z-fighting its surface.
         const float CutInset = 0.015f;
         float half = thickness * 0.5f;
+
+        // A piece touching a through-crossing refuses wholesale — no cut
+        // planes, no occupancy question, just red.
+        bool forceBlocked = false;
+        foreach (Vector2 r in refused)
+            if (r.x < k1 - 0.001f && r.y > k0 + 0.001f)
+            {
+                forceBlocked = true;
+                break;
+            }
 
         var spec = new SectionSpec
         {
@@ -352,6 +462,8 @@ public class SplineWall : MonoBehaviour
         bool bandAtStart = false;
         foreach (Band band in bands)
         {
+            if (band.through)
+                continue;
             if (band.graze)
             {
                 // Grazes only clip: the sliver of cross-section that dips
@@ -360,7 +472,13 @@ public class SplineWall : MonoBehaviour
                     AddCut(ref spec, band.pIn - band.nIn * CutInset, band.nIn);
                 continue;
             }
-            if (band.hasIn && band.aIn >= k1 - 0.02f)
+            // Ride-along reach is bounded: a legitimate shallow-angle face
+            // cuts at most halfWidth/tan(10°) ≈ 2.8m from its band. Beyond
+            // that a plane is never a no-op safeguard but a hazard — a
+            // band whose face runs PARALLEL to this wall (touching a host
+            // cap end-on at a corner node) would otherwise shave the flank
+            // off every piece downstream.
+            if (band.hasIn && band.aIn >= k1 - 0.02f && band.aIn <= k1 + 3f)
             {
                 Vector3 planeP = band.pIn - band.nIn * CutInset;
                 AddCut(ref spec, planeP, band.nIn);
@@ -372,7 +490,7 @@ public class SplineWall : MonoBehaviour
                         SideCrossing(s, control, e, arcTable, -half, k1, planeP, band.nIn)));
                 }
             }
-            if (band.hasOut && band.aOut <= k0 + 0.02f)
+            if (band.hasOut && band.aOut <= k0 + 0.02f && band.aOut >= k0 - 3f)
             {
                 Vector3 planeP = band.pOut - band.nOut * CutInset;
                 AddCut(ref spec, planeP, band.nOut);
@@ -406,7 +524,7 @@ public class SplineWall : MonoBehaviour
         float blockArc0 = bandAtStart ? k0 + 0.3f : sweepStartArc;
         float blockArc1 = bandAtEnd ? k1 - 0.3f : sweepEndArc;
         AddSpecIfClear(specs, s, control, e, spec, height, fixedTopY, thickness, baseWallHeight, arcTable, includeBlocked,
-            cutAdjacent ? blockArc0 : float.NaN, cutAdjacent ? blockArc1 : float.NaN);
+            cutAdjacent ? blockArc0 : float.NaN, cutAdjacent ? blockArc1 : float.NaN, ignoreWalls, forceBlocked);
     }
 
     static void AddCut(ref SectionSpec spec, Vector3 point, Vector3 normal)
@@ -474,11 +592,27 @@ public class SplineWall : MonoBehaviour
     // older wall's own colliders with short raycasts across each
     // transition, so curved hosts and box approximations both just work.
     static List<Band> FindJunctionBands(Vector3 s, Vector3 control, Vector3 e, float[] arcTable,
-        float aMin, float aMax, float thickness, int buildOrder)
+        float aMin, float aMax, float thickness, int buildOrder,
+        bool nodeAtStart = false, bool nodeAtEnd = false, List<SplineWall> ignoreWalls = null)
     {
         Terrain terrain = Terrain.activeTerrain;
         const float step = 0.06f;
         float totalArc = arcTable[arcTable.Length - 1];
+
+        // A node end touches its corner partners at the node by
+        // construction — at 90° the centerline runs exactly in the host's
+        // cap plane, and at the post-radius mark it grazes the partner's
+        // box corner — and the scanner would read either touch as a
+        // burial to trim. Everything within the post's radius of a node
+        // end is the node's own masonry, so the scan starts a sample step
+        // PAST that radius, strictly clear of surface contact. (A wall
+        // genuinely buried deeper — a hairpin — still bands from there.)
+        if (nodeAtStart)
+            aMin = Mathf.Max(aMin, thickness * 0.5f + step + 0.02f);
+        if (nodeAtEnd)
+            aMax = Mathf.Min(aMax, totalArc - thickness * 0.5f - step - 0.02f);
+        if (aMax <= aMin + 0.01f)
+            return new List<Band>();
 
         Vector3 ProbeAt(float arc, float sideOffset)
         {
@@ -505,7 +639,7 @@ public class SplineWall : MonoBehaviour
             Vector3 tanDir = Tangent(s, control, e, t).normalized;
             var hosts = new HashSet<SplineWall>();
             foreach (Collider c in Physics.OverlapSphere(ProbeAt(arc, sideOffset), 0.01f))
-                if (IsCrossingHost(c, tanDir, buildOrder, requireAngle))
+                if (IsCrossingHost(c, tanDir, buildOrder, requireAngle, ignoreWalls))
                     hosts.Add(c.GetComponent<SplineWallSection>().wall);
             return hosts;
         }
@@ -591,7 +725,7 @@ public class SplineWall : MonoBehaviour
             System.Array.Sort(hits, (x, y) => x.distance.CompareTo(y.distance));
             foreach (RaycastHit hit in hits)
             {
-                if (!IsCrossingHost(hit.collider, tanDir, buildOrder, requireAngle))
+                if (!IsCrossingHost(hit.collider, tanDir, buildOrder, requireAngle, ignoreWalls))
                     continue;
                 SplineWallSection hitSection = hit.collider.GetComponent<SplineWallSection>();
                 if (hitSection.wall != host)
@@ -719,7 +853,7 @@ public class SplineWall : MonoBehaviour
             System.Array.Sort(hits, (x, y) => x.distance.CompareTo(y.distance));
             foreach (RaycastHit hit in hits)
             {
-                if (!IsCrossingHost(hit.collider, tanDir, buildOrder, false))
+                if (!IsCrossingHost(hit.collider, tanDir, buildOrder, false, ignoreWalls))
                     continue;
                 if (hit.collider.GetComponent<SplineWallSection>().wall != host)
                     continue;
@@ -789,7 +923,8 @@ public class SplineWall : MonoBehaviour
     // RequireAngleAt). Graze lanes take any angle everywhere — a
     // same-face graze necessarily passes through a parallel-to-host
     // moment at its deepest point, and grazes only clip, never drop.
-    static bool IsCrossingHost(Collider c, Vector3 tanDir, int buildOrder, bool requireAngle)
+    static bool IsCrossingHost(Collider c, Vector3 tanDir, int buildOrder, bool requireAngle,
+        List<SplineWall> ignoreWalls = null)
     {
         if (c.isTrigger)
             return false;
@@ -797,6 +932,10 @@ public class SplineWall : MonoBehaviour
         if (section == null || section.wall == null)
             return false;
         if (section.wall.buildOrder >= buildOrder)
+            return false;
+        // Node partners are never junction hosts for each other — the
+        // node owns the joint, burial near it is deliberate masonry.
+        if (ignoreWalls != null && ignoreWalls.Contains(section.wall))
             return false;
         if (!requireAngle)
             return true;
@@ -895,7 +1034,8 @@ public class SplineWall : MonoBehaviour
     // the ghost can show the refusal in red instead of vanishing.
     static void AddSpecIfClear(List<SectionSpec> specs, Vector3 s, Vector3 control, Vector3 e,
         SectionSpec spec, float height, float fixedTopY, float thickness, float baseWallHeight, float[] arcTable,
-        bool includeBlocked, float clearArc0 = float.NaN, float clearArc1 = float.NaN)
+        bool includeBlocked, float clearArc0 = float.NaN, float clearArc1 = float.NaN,
+        List<SplineWall> ignoreWalls = null, bool forceBlocked = false)
     {
         float tMid = (spec.tSweepStart + spec.tSweepEnd) * 0.5f;
         Vector3 mid = Evaluate(s, control, e, tMid);
@@ -936,7 +1076,10 @@ public class SplineWall : MonoBehaviour
                 blockYaw = Mathf.Atan2(-bd.z, bd.x) * Mathf.Rad2Deg;
             }
         }
-        spec.blocked = checkable && IsBlocked(blockCenter, blockLen, span, thickness, blockYaw);
+        bool buried = false;
+        spec.blocked = forceBlocked || (checkable && IsBlocked(blockCenter, blockLen, span, thickness, blockYaw,
+            ignoreWalls, out buried));
+        spec.buriedInMember = buried;
         if (spec.blocked && !includeBlocked)
             return;
 
@@ -948,12 +1091,14 @@ public class SplineWall : MonoBehaviour
 
     // A section that would duplicate an existing wall is dropped: the
     // physics test is the build's occupancy answer. Crossings at a real
-    // angle are junctions (handled by band trimming, not blocking), so
-    // only near-parallel overlap (a second wall drawn through the same
-    // space) blocks. The test box is shrunk so touching neighbours and
-    // snapped endpoints don't count either.
-    static bool IsBlocked(Vector3 center, float length, float height, float thickness, float yaw)
+    // angle are refused upstream (through bands force-block their span
+    // before this test runs), so this only judges near-parallel overlap —
+    // a second wall drawn through the same space. The test box is shrunk
+    // so touching neighbours and snapped endpoints don't count either.
+    static bool IsBlocked(Vector3 center, float length, float height, float thickness, float yaw,
+        List<SplineWall> ignoreWalls, out bool buriedInMember)
     {
+        buriedInMember = false;
         // The thickness extent is deliberately slim: only a wall whose
         // CENTERLINE reaches another wall's body is a duplicate. A wall
         // merely leaning its face into a neighbour is legal — the graze
@@ -961,8 +1106,19 @@ public class SplineWall : MonoBehaviour
         Vector3 halfExtents = new Vector3(length * 0.35f, height * 0.4f, thickness * 0.15f);
         foreach (Collider c in Physics.OverlapBox(center, halfExtents, Quaternion.Euler(0f, yaw, 0f)))
         {
-            if (c.isTrigger || c.GetComponent<SplineWallSection>() == null)
+            if (c.isTrigger)
                 continue;
+            SplineWallSection section = c.GetComponent<SplineWallSection>();
+            if (section == null)
+                continue;
+            // Node partners never block — overlap with one is legal buried
+            // masonry at the shared joint (recorded so an ALL-buried wall
+            // can still be refused as a redraw along the member).
+            if (ignoreWalls != null && ignoreWalls.Contains(section.wall))
+            {
+                buriedInMember = true;
+                continue;
+            }
 
             float otherYaw = c.transform.eulerAngles.y;
             float delta = Mathf.Abs(Mathf.DeltaAngle(yaw, otherYaw));
