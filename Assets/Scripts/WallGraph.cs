@@ -1,0 +1,506 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+// Graph mutations: the ONLY way walls come to exist, split, or die.
+// Nodes and edges are the stored model — placement gestures resolve into
+// node reuse / creation / edge splits here, crossings are computed on the
+// curves themselves (never physics), and every mutation leaves the
+// invariant standing: edges meet only at nodes, and never overlap.
+public static class WallGraph
+{
+    public struct EdgeParams
+    {
+        public float height;
+        public float thickness;
+        public float baseWallHeight;
+        public float targetSectionLength;
+        public float baseStep;
+        public float fixedTopY;
+        public Material material;
+    }
+
+    // Where a proposed curve crosses an existing edge. reuseNode is set
+    // when the crossing lands close enough to an existing node to thread
+    // through it instead of splitting the host.
+    public struct Crossing
+    {
+        public WallEdge edge;
+        public WallNode reuseNode;
+        public float tSelf;
+        public float tHost;
+        public Vector3 point;
+    }
+
+    // Crossings this close to a proposed curve's end belong to the end's
+    // own node resolution, not to a split.
+    const float EndClearance = 0.35f;
+    // A crossing landing this close to an existing node reuses it.
+    const float NodeReuse = 0.3f;
+    // Two crossings closer than this together collapse into one (tangent
+    // grazes, several hosts meeting at one point).
+    const float CrossingMerge = 0.5f;
+    // An end landing within this of an edge's centerline splits the host
+    // there (the flank snap puts its point exactly on the centerline).
+    const float CenterlineLand = 0.12f;
+    const int CurveSamples = 48;
+
+    // ------------------------------------------------------------------
+    // Queries (also used by previews)
+    // ------------------------------------------------------------------
+
+    // All points where the proposed curve crosses existing ground edges,
+    // sorted along the proposed run. Every one becomes a shared node at
+    // commit — both walls split, four edges meet, the node draws the
+    // joint.
+    public static List<Crossing> FindCrossings(Vector3 s, Vector3 c, Vector3 e)
+    {
+        var crossings = new List<Crossing>();
+        Vector3[] mine = SampleCurve(s, c, e);
+        Bounds myBounds = CurveBounds(s, c, e, 0.5f);
+
+        foreach (WallEdge host in WallEdge.All)
+        {
+            if (host.IsCourse)
+                continue;
+            if (!myBounds.Intersects(CurveBounds(host.A, host.control, host.B, 0.5f)))
+                continue;
+
+            Vector3[] theirs = SampleCurve(host.A, host.control, host.B);
+            for (int i = 0; i < CurveSamples; i++)
+            {
+                for (int j = 0; j < CurveSamples; j++)
+                {
+                    if (!TrySegmentHit(mine[i], mine[i + 1], theirs[j], theirs[j + 1],
+                        out float fi, out float fj))
+                        continue;
+                    Vector3 p = Vector3.Lerp(mine[i], mine[i + 1], fi);
+                    if (Flat(p, s) < EndClearance || Flat(p, e) < EndClearance)
+                        continue;
+                    WallNode reuse = null;
+                    if (Flat(p, host.A) < NodeReuse)
+                        reuse = host.nodeA;
+                    else if (Flat(p, host.B) < NodeReuse)
+                        reuse = host.nodeB;
+                    crossings.Add(new Crossing
+                    {
+                        edge = reuse == null ? host : null,
+                        reuseNode = reuse,
+                        tSelf = (i + fi) / CurveSamples,
+                        tHost = (j + fj) / CurveSamples,
+                        point = reuse != null ? reuse.point : p,
+                    });
+                }
+            }
+        }
+
+        crossings.Sort((x, y) => x.tSelf.CompareTo(y.tSelf));
+        for (int i = crossings.Count - 1; i > 0; i--)
+        {
+            if (Flat(crossings[i].point, crossings[i - 1].point) < CrossingMerge)
+            {
+                // Prefer keeping a node-reuse entry over a fresh split.
+                if (crossings[i].reuseNode != null && crossings[i - 1].reuseNode == null)
+                    crossings[i - 1] = crossings[i];
+                crossings.RemoveAt(i);
+            }
+        }
+        return crossings;
+    }
+
+    // The one refusal left: a near-exact redraw along an existing wall —
+    // same line, either direction, sustained. Angled contact, shallow V's
+    // off a shared node, flush parallel runs, and crossings are all legal
+    // (crossings split); this only guards the degenerate coincident case
+    // that would z-fight and hide a duplicate edge inside another.
+    public static bool OverlapsExisting(Vector3 s, Vector3 c, Vector3 e)
+    {
+        const float MaxDist = 0.15f;
+        const float MinParallel = 0.9986f; // cos 3°
+        const float RefuseRun = 0.6f;
+
+        Vector3[] mine = SampleCurve(s, c, e);
+        Bounds myBounds = CurveBounds(s, c, e, MaxDist + 0.1f);
+
+        foreach (WallEdge host in WallEdge.All)
+        {
+            if (host.IsCourse)
+                continue;
+            if (!myBounds.Intersects(CurveBounds(host.A, host.control, host.B, MaxDist + 0.1f)))
+                continue;
+
+            float run = 0f;
+            for (int i = 0; i <= CurveSamples; i++)
+            {
+                float t = (float)i / CurveSamples;
+                float tHost = host.NearestT(mine[i], out float distSq);
+                bool close = distSq < MaxDist * MaxDist;
+                if (close)
+                {
+                    Vector3 myTan = WallEdge.Tangent(s, c, e, t).normalized;
+                    Vector3 hostTan = WallEdge.Tangent(host.A, host.control, host.B, tHost).normalized;
+                    float dot = Mathf.Abs(myTan.x * hostTan.x + myTan.z * hostTan.z);
+                    close = dot >= MinParallel;
+                }
+                if (!close)
+                {
+                    run = 0f;
+                    continue;
+                }
+                if (i > 0)
+                    run += Flat(mine[i], mine[i - 1]);
+                if (run >= RefuseRun)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Mutations
+    // ------------------------------------------------------------------
+
+    // Commits a placement gesture: resolve the end nodes (existing node /
+    // split-at-landing / new), split every crossed host at the crossing
+    // point, and chain sub-edges of the proposed curve through the nodes
+    // in order. Returns the created edges (empty = the gesture was
+    // refused).
+    public static List<WallEdge> CommitEdge(Transform parent, Vector3 s, Vector3 c, Vector3 e,
+        EdgeParams p)
+    {
+        var created = new List<WallEdge>();
+        if (Flat(s, e) < 0.05f)
+            return created;
+        if (OverlapsExisting(s, c, e))
+            return created;
+
+        WallNode start = ResolveEndNode(parent, s, p);
+        WallNode end = ResolveEndNode(parent, e, p);
+        if (start == null || end == null || start == end)
+            return created;
+
+        var crossings = FindCrossings(s, c, e);
+
+        // Split each crossed host once, at every crossing it carries.
+        var chain = new List<(float t, WallNode node)> { (0f, start), (1f, end) };
+        var byHost = new Dictionary<WallEdge, List<Crossing>>();
+        foreach (Crossing x in crossings)
+        {
+            if (x.reuseNode != null)
+            {
+                chain.Add((x.tSelf, x.reuseNode));
+                continue;
+            }
+            if (!byHost.TryGetValue(x.edge, out List<Crossing> list))
+                byHost[x.edge] = list = new List<Crossing>();
+            list.Add(x);
+        }
+        foreach (KeyValuePair<WallEdge, List<Crossing>> pair in byHost)
+        {
+            var ts = new List<float>();
+            foreach (Crossing x in pair.Value)
+                ts.Add(x.tHost);
+            List<WallNode> nodes = SplitEdgeAtMany(parent, pair.Key, ts);
+            for (int i = 0; i < pair.Value.Count; i++)
+                if (nodes[i] != null)
+                    chain.Add((pair.Value[i].tSelf, nodes[i]));
+        }
+        chain.Sort((x, y) => x.t.CompareTo(y.t));
+
+        var touched = new HashSet<WallNode>();
+        for (int i = 0; i + 1 < chain.Count; i++)
+        {
+            (float t0, WallNode n0) = chain[i];
+            (float t1, WallNode n1) = chain[i + 1];
+            if (n0 == n1 || t1 - t0 < 0.001f)
+                continue;
+            SubCurve(s, c, e, t0, t1, out _, out Vector3 subC, out _);
+            created.Add(WallEdge.Create(parent, n0, n1, subC, p.height, p.thickness,
+                p.baseWallHeight, p.material, p.targetSectionLength, p.baseStep, p.fixedTopY));
+            touched.Add(n0);
+            touched.Add(n1);
+        }
+        foreach (WallNode n in touched)
+            if (n != null)
+                n.RebuildMesh();
+        Physics.SyncTransforms();
+        return created;
+    }
+
+    // Lays a course over every span of `below` not already covered by
+    // one, and lifts the end posts to match.
+    public static void CommitCourse(Transform parent, WallEdge below, float courseHeight,
+        float courseBaseWallHeight, Material material)
+    {
+        foreach ((float lo, float hi) in below.UncoveredRanges())
+            if (hi - lo > 0.01f)
+                WallEdge.CreateCourse(parent, below, courseHeight, courseBaseWallHeight,
+                    material, lo, hi);
+        if (below.nodeA != null)
+            below.nodeA.RebuildMesh();
+        if (below.nodeB != null)
+            below.nodeB.RebuildMesh();
+        Physics.SyncTransforms();
+    }
+
+    // Deletes a run of sections from an edge. A ground edge splits into
+    // sub-edges over the kept ranges — hole boundaries get new flat-capped
+    // 1-valent nodes, end nodes are reused where a range touches them,
+    // and nodes left with no members dissolve. A course splits off-graph
+    // into partial courses. Stacked courses above follow the survivors
+    // either way.
+    public static void DeleteSections(Transform parent, WallEdge edge, int minIndex, int maxIndex)
+    {
+        var ranges = new List<(float lo, float hi)>();
+        foreach (WallEdgeSection section in edge.SectionsInOrder())
+        {
+            if (section.index >= minIndex && section.index <= maxIndex)
+                continue;
+            if (ranges.Count > 0 && Mathf.Abs(ranges[ranges.Count - 1].hi - section.tStart) < 0.001f)
+                ranges[ranges.Count - 1] = (ranges[ranges.Count - 1].lo, section.tEnd);
+            else
+                ranges.Add((section.tStart, section.tEnd));
+        }
+
+        WallNode nodeA = edge.nodeA;
+        WallNode nodeB = edge.nodeB;
+
+        if (edge.IsCourse)
+        {
+            // Courses split off-graph: same base, partial coverage. Their
+            // curve is the base's, so no reparametrization happens here.
+            var slots = new List<StackSlot>();
+            foreach ((float lo, float hi) in ranges)
+            {
+                WallEdge sub = WallEdge.CreateCourse(parent, edge.stackBase, edge.height,
+                    edge.baseWallHeight, edge.material, lo, hi);
+                slots.Add(new StackSlot { below = sub, mapLo = 0f, mapHi = 1f, covLo = lo, covHi = hi });
+            }
+            RebuildStackOver(parent, edge, slots);
+            Object.DestroyImmediate(edge.gameObject);
+            if (nodeA != null)
+                nodeA.RebuildMesh();
+            if (nodeB != null)
+                nodeB.RebuildMesh();
+            Physics.SyncTransforms();
+            return;
+        }
+
+        Vector3 s = edge.A, c = edge.control, e = edge.B;
+        var slots2 = new List<StackSlot>();
+        var touched = new HashSet<WallNode> { nodeA, nodeB };
+        foreach ((float lo, float hi) in ranges)
+        {
+            WallNode n0 = lo < 0.001f
+                ? nodeA
+                : WallNode.Create(parent, WallEdge.Evaluate(s, c, e, lo), edge.thickness * 0.5f, edge.material);
+            WallNode n1 = hi > 0.999f
+                ? nodeB
+                : WallNode.Create(parent, WallEdge.Evaluate(s, c, e, hi), edge.thickness * 0.5f, edge.material);
+            if (n0 == n1)
+                continue;
+            SubCurve(s, c, e, lo, hi, out _, out Vector3 subC, out _);
+            WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
+                edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
+                edge.fixedTopY);
+            slots2.Add(new StackSlot { below = sub, mapLo = lo, mapHi = hi, covLo = lo, covHi = hi });
+            touched.Add(n0);
+            touched.Add(n1);
+        }
+        RebuildStackOver(parent, edge, slots2);
+        Object.DestroyImmediate(edge.gameObject);
+        foreach (WallNode n in touched)
+            if (n != null)
+                n.RebuildMesh();
+        Physics.SyncTransforms();
+    }
+
+    // ------------------------------------------------------------------
+    // Internals
+    // ------------------------------------------------------------------
+
+    // Splits one ground edge at several curve parameters in a single
+    // pass: nodes at the split points, exact sub-curves between them, the
+    // course stack remapped over the sub-edges, the original destroyed.
+    // Returns one node per requested t (an end node where the t lands on
+    // one). The end nodes never dissolve mid-split: sub-edges attach
+    // before the original detaches.
+    public static List<WallNode> SplitEdgeAtMany(Transform parent, WallEdge edge, List<float> ts)
+    {
+        Vector3 s = edge.A, c = edge.control, e = edge.B;
+        var result = new List<WallNode>();
+        var bounds = new List<(float t, WallNode node)> { (0f, edge.nodeA), (1f, edge.nodeB) };
+        foreach (float t in ts)
+        {
+            Vector3 pt = WallEdge.Evaluate(s, c, e, t);
+            if (Flat(pt, edge.A) < NodeReuse)
+            {
+                result.Add(edge.nodeA);
+                continue;
+            }
+            if (Flat(pt, edge.B) < NodeReuse)
+            {
+                result.Add(edge.nodeB);
+                continue;
+            }
+            WallNode node = WallNode.Create(parent, pt, edge.thickness * 0.5f, edge.material);
+            result.Add(node);
+            bounds.Add((t, node));
+        }
+        if (bounds.Count == 2)
+            return result;
+
+        bounds.Sort((x, y) => x.t.CompareTo(y.t));
+        var slots = new List<StackSlot>();
+        var touched = new HashSet<WallNode>();
+        for (int i = 0; i + 1 < bounds.Count; i++)
+        {
+            (float t0, WallNode n0) = bounds[i];
+            (float t1, WallNode n1) = bounds[i + 1];
+            if (n0 == n1 || t1 - t0 < 0.001f)
+                continue;
+            SubCurve(s, c, e, t0, t1, out _, out Vector3 subC, out _);
+            WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
+                edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
+                edge.fixedTopY);
+            slots.Add(new StackSlot { below = sub, mapLo = t0, mapHi = t1, covLo = t0, covHi = t1 });
+            touched.Add(n0);
+            touched.Add(n1);
+        }
+        RebuildStackOver(parent, edge, slots);
+        Object.DestroyImmediate(edge.gameObject);
+        foreach (WallNode n in touched)
+            if (n != null)
+                n.RebuildMesh();
+        Physics.SyncTransforms();
+        return result;
+    }
+
+    // The node a placement end lands on: an existing node under the
+    // point, a split of whatever edge the point sits on (the flank snap
+    // puts it exactly on the centerline), or a brand new free node.
+    static WallNode ResolveEndNode(Transform parent, Vector3 point, EdgeParams p)
+    {
+        WallNode node = WallNode.FindAt(point);
+        if (node != null)
+            return node;
+
+        foreach (WallEdge edge in new List<WallEdge>(WallEdge.All))
+        {
+            if (edge == null || edge.IsCourse)
+                continue;
+            float t = edge.NearestT(point, out float distSq);
+            if (distSq > CenterlineLand * CenterlineLand)
+                continue;
+            List<WallNode> nodes = SplitEdgeAtMany(parent, edge, new List<float> { t });
+            return nodes[0];
+        }
+
+        return WallNode.Create(parent, point, p.thickness * 0.5f, p.material);
+    }
+
+    // One replacement piece under a course stack: `below` is the new
+    // supporting edge, mapLo/mapHi say how the old curve parameter maps
+    // into its own (t_old → (t_old − mapLo) / (mapHi − mapLo)), and
+    // covLo/covHi is the old-parameter span it actually covers.
+    struct StackSlot
+    {
+        public WallEdge below;
+        public float mapLo;
+        public float mapHi;
+        public float covLo;
+        public float covHi;
+    }
+
+    // Rebuilds the course stack of a dying edge over its replacement
+    // pieces, layer by layer: each course re-derives from whichever new
+    // supports its span overlaps, clipped to them, and courses above
+    // follow recursively. Spans over holes simply vanish — masonry never
+    // floats.
+    static void RebuildStackOver(Transform parent, WallEdge oldBelow, List<StackSlot> slots)
+    {
+        var courses = new List<WallEdge>();
+        foreach (WallEdge x in WallEdge.All)
+            if (x != null && x.stackBase == oldBelow)
+                courses.Add(x);
+
+        foreach (WallEdge course in courses)
+        {
+            var next = new List<StackSlot>();
+            foreach (StackSlot slot in slots)
+            {
+                float lo = Mathf.Max(course.tMin, slot.covLo);
+                float hi = Mathf.Min(course.tMax, slot.covHi);
+                if (hi - lo < 0.01f)
+                    continue;
+                float span = slot.mapHi - slot.mapLo;
+                WallEdge sub = WallEdge.CreateCourse(parent, slot.below, course.height,
+                    course.baseWallHeight, course.material,
+                    (lo - slot.mapLo) / span, (hi - slot.mapLo) / span);
+                next.Add(new StackSlot
+                {
+                    below = sub,
+                    mapLo = slot.mapLo,
+                    mapHi = slot.mapHi,
+                    covLo = lo,
+                    covHi = hi,
+                });
+            }
+            RebuildStackOver(parent, course, next);
+            Object.DestroyImmediate(course.gameObject);
+        }
+    }
+
+    // Exact Bézier segment extraction: the quadratic's polar form gives
+    // the sub-curve's control point, so split walls follow the original
+    // curve exactly.
+    public static void SubCurve(Vector3 s, Vector3 c, Vector3 e, float a, float b,
+        out Vector3 s2, out Vector3 c2, out Vector3 e2)
+    {
+        s2 = WallEdge.Evaluate(s, c, e, a);
+        e2 = WallEdge.Evaluate(s, c, e, b);
+        c2 = (1f - a) * (1f - b) * s + ((1f - a) * b + a * (1f - b)) * c + a * b * e;
+    }
+
+    static Vector3[] SampleCurve(Vector3 s, Vector3 c, Vector3 e)
+    {
+        var pts = new Vector3[CurveSamples + 1];
+        for (int i = 0; i <= CurveSamples; i++)
+        {
+            Vector3 p = WallEdge.Evaluate(s, c, e, (float)i / CurveSamples);
+            pts[i] = new Vector3(p.x, 0f, p.z);
+        }
+        return pts;
+    }
+
+    static Bounds CurveBounds(Vector3 s, Vector3 c, Vector3 e, float pad)
+    {
+        // The curve lies inside its control polygon's bounds.
+        var bounds = new Bounds(new Vector3(s.x, 0f, s.z), Vector3.zero);
+        bounds.Encapsulate(new Vector3(c.x, 0f, c.z));
+        bounds.Encapsulate(new Vector3(e.x, 0f, e.z));
+        bounds.Expand(pad * 2f);
+        return bounds;
+    }
+
+    static bool TrySegmentHit(Vector3 a0, Vector3 a1, Vector3 b0, Vector3 b1,
+        out float fa, out float fb)
+    {
+        fa = 0f;
+        fb = 0f;
+        float rx = a1.x - a0.x, rz = a1.z - a0.z;
+        float sx = b1.x - b0.x, sz = b1.z - b0.z;
+        float denom = rx * sz - rz * sx;
+        if (Mathf.Abs(denom) < 1e-6f)
+            return false;
+        float qx = b0.x - a0.x, qz = b0.z - a0.z;
+        fa = (qx * sz - qz * sx) / denom;
+        fb = (qx * rz - qz * rx) / denom;
+        return fa >= 0f && fa <= 1f && fb >= 0f && fb <= 1f;
+    }
+
+    static float Flat(Vector3 a, Vector3 b)
+    {
+        float dx = a.x - b.x, dz = a.z - b.z;
+        return Mathf.Sqrt(dx * dx + dz * dz);
+    }
+}

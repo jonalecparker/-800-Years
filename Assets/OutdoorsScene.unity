@@ -442,15 +442,17 @@ MonoBehaviour:
   baseStepSize: 0.5
   minHeightMultiplier: 0.25
   maxHeightMultiplier: 3
-  heightMultiplierStep: 0.25
+  heightScrollRate: 0.25
   curveBulgeStep: 0.5
   endpointSnapRadius: 0.75
   previewColor: {r: 0.3, g: 0.9, b: 1, a: 1}
   deletePreviewColor: {r: 1, g: 0.3, b: 0.25, a: 1}
+  snapColor: {r: 1, g: 0.78, b: 0.12, a: 1}
   guideRange: 5
   guideColor: {r: 1, g: 0.85, b: 0.2, a: 1}
-  angleStep: 15
+  angleStep: 5
   lengthStep: 0.5
+  lockTopHeight: 0
 --- !u!4 &1064011757
 Transform:
   m_ObjectHideFlags: 0

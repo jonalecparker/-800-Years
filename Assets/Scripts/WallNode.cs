@@ -1,18 +1,18 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-// A corner node: the point where endpoint-snapped wall ends meet. Member
-// walls end in flat caps exactly ON the point (no end extension — see
-// SplineWall.nodeAtStart/nodeAtEnd) and the node supplies the corner
-// masonry itself: an implicit round post of radius = half wall thickness,
-// which every member's cap and flank faces are tangent to by construction.
-// Only the EXPOSED arc wedges between adjacent members are meshed —
-// member bearings sorted around the circle, each wall's body covering the
-// semicircle behind its cap, so a gap of g degrees between neighbours
-// exposes g − 180 of arc. A collinear butt joint therefore shows no post
-// at all, an L-corner a quarter barrel, a hairpin a rounded tip, and a
-// straight-through T keeps its flat far face — one rule, any angle, any
-// number of walls, and no cut geometry anywhere at a corner.
+// A graph node: the point where wall edges meet — and the owner of ALL
+// joint geometry. Every edge end caps flat exactly ON the point, and the
+// node supplies the joint masonry itself: an implicit round post of
+// radius = half wall thickness, which every member's cap and flank faces
+// are tangent to by construction. Only the EXPOSED arc wedges between
+// adjacent members are meshed — member bearings sorted around the circle,
+// each wall's body covering the semicircle behind its cap, so a gap of g
+// degrees between neighbours exposes g − 180 of arc. A collinear butt
+// joint therefore shows no post at all, an L-corner a quarter barrel, a
+// 90° tee stays flush, and an 8° tee shows one shoulder arc — one rule,
+// any angle, any valence, and no cut geometry anywhere. A valence-1 node
+// renders nothing: the edge's own flat cap IS the finished end.
 public class WallNode : MonoBehaviour
 {
     public static readonly List<WallNode> All = new List<WallNode>();
@@ -20,46 +20,24 @@ public class WallNode : MonoBehaviour
     public Vector3 point;
     public float radius;
 
-    // A member is either a wall ENDING at the node (its cap sits on the
-    // point, its node flags set) or a FLANK member — a wall whose side
-    // the node sits on (a T-joint at any angle): it contributes its
-    // body's half-plane to the wedge rule but its geometry is untouched —
-    // no cap, no retraction, no flags.
+    // One edge end resting on this node. An edge appears once per end it
+    // parks here (a loop edge would appear twice, but placement refuses
+    // those). Stacked courses are NOT members — the node climbs stacks
+    // itself when reading heights, so posts rise with the courses.
     public struct Member
     {
-        public SplineWall wall;
-        public bool flank;
+        public WallEdge edge;
+        public bool atStart;
     }
 
     public readonly List<Member> members = new List<Member>();
 
-    public bool HasMember(SplineWall wall)
-    {
-        foreach (Member m in members)
-            if (m.wall == wall)
-                return true;
-        return false;
-    }
-
-    // The walls joined here — the set the junction machinery stands down
-    // for: members never band against or duplicate-block each other, the
-    // node owns their meeting.
-    public List<SplineWall> MemberWalls
-    {
-        get
-        {
-            var walls = new List<SplineWall>();
-            foreach (Member m in members)
-                if (m.wall != null)
-                    walls.Add(m.wall);
-            return walls;
-        }
-    }
+    public int Valence => members.Count;
 
     Material material;
     Mesh ownedMesh;
 
-    // Two stored endpoints within this distance are the same corner.
+    // Two stored points within this distance are the same node.
     const float PointSq = 0.0025f;
     // Wedge columns roughly every this many degrees of arc.
     const float SegmentDegrees = 12f;
@@ -84,101 +62,50 @@ public class WallNode : MonoBehaviour
         return null;
     }
 
-    // Commit-side entry: a wall end landed on `p` as a joint. Ensures the
-    // node exists, and makes every wall whose stored endpoint lies on the
-    // point an end member — walls built before the corner existed have
-    // their caps retracted to the point (a rebuild; their end extensions
-    // stand down via the node flags), so the post owns the corner space.
-    // `flankHost` is the T-joint case: the wall whose FACE the point sits
-    // on joins as a flank member, geometry untouched.
-    public static WallNode Connect(Transform parent, Vector3 p, float radius, Material material,
-        SplineWall flankHost = null)
+    // The node at p, existing or new. Graph code is the only caller —
+    // nodes are never created as a side effect of geometry.
+    public static WallNode Create(Transform parent, Vector3 p, float radius, Material material)
     {
         WallNode node = FindAt(p);
-        if (node == null)
-        {
-            GameObject obj = new GameObject("WallNode");
-            obj.transform.SetParent(parent, false);
-            obj.transform.position = new Vector3(p.x, 0f, p.z);
-            node = obj.AddComponent<WallNode>();
-            node.point = new Vector3(p.x, 0f, p.z);
-            node.radius = radius;
-            node.material = material;
-        }
-
-        // Pass 1: flag every wall ending on the point. Pass 2: retract the
-        // newly flagged ones (they were built with overshoot caps — the
-        // stacked-course/gapped refusal inside RebuildSections stands, so
-        // those keep their old caps). Pass 3: rebuild the REST of the
-        // members — a wall committed a moment ago probed the world before
-        // the retractions and must re-derive against the retracted caps,
-        // or it keeps trims against masonry that no longer exists.
-        var joined = new List<SplineWall>();
-        var retract = new List<SplineWall>();
-        foreach (SplineWall wall in SplineWall.All)
-        {
-            bool atStart = node.IsAt(wall.curveStart);
-            bool atEnd = node.IsAt(wall.curveEnd);
-            if (!atStart && !atEnd)
-                continue;
-            if ((atStart && !wall.nodeAtStart) || (atEnd && !wall.nodeAtEnd))
-                retract.Add(wall);
-            if (atStart)
-                wall.nodeAtStart = true;
-            if (atEnd)
-                wall.nodeAtEnd = true;
-            joined.Add(wall);
-            if (!node.HasMember(wall))
-                node.members.Add(new Member { wall = wall, flank = false });
-        }
-        if (flankHost != null && !node.HasMember(flankHost))
-            node.members.Add(new Member { wall = flankHost, flank = true });
-        foreach (SplineWall wall in retract)
-            wall.RebuildSections();
-        foreach (SplineWall wall in joined)
-            if (!retract.Contains(wall))
-                wall.RebuildSections();
-        Physics.SyncTransforms();
-        node.RebuildMesh();
+        if (node != null)
+            return node;
+        GameObject obj = new GameObject("WallNode");
+        obj.transform.SetParent(parent, false);
+        obj.transform.position = new Vector3(p.x, 0f, p.z);
+        node = obj.AddComponent<WallNode>();
+        node.point = new Vector3(p.x, 0f, p.z);
+        node.radius = radius;
+        node.material = material;
         return node;
     }
 
-    bool IsAt(Vector3 p)
+    // Membership only — meshes are rebuilt explicitly by the graph ops
+    // once a whole mutation (with all its attaches) is done.
+    public void Attach(WallEdge edge, bool atStart)
     {
-        float dx = p.x - point.x, dz = p.z - point.z;
-        return dx * dx + dz * dz < PointSq;
+        foreach (Member m in members)
+            if (m.edge == edge && m.atStart == atStart)
+                return;
+        members.Add(new Member { edge = edge, atStart = atStart });
     }
 
-    // Called from a dying member's OnDisable. With one member left there
-    // is no corner anymore: the survivor's end un-nodes (its cap regrows
-    // on its next rebuild — the delete flow rebuilds linked survivors)
-    // and the post goes away. Removed from the registry immediately so a
-    // same-frame commit can't join a corpse.
-    public void Unregister(SplineWall wall)
+    // Called from a dying edge's OnDisable. A node left with no members
+    // has no reason to exist and dissolves immediately (removed from the
+    // registry first, so a same-frame commit can't join a corpse).
+    public void OnMemberGone(WallEdge edge)
     {
-        if (members.RemoveAll(m => m.wall == wall) == 0)
+        if (members.RemoveAll(m => m.edge == edge) == 0)
             return;
-        members.RemoveAll(m => m.wall == null);
-        if (members.Count >= 2)
+        if (members.Count == 0)
         {
-            RebuildMesh();
-            return;
+            All.Remove(this);
+            Destroy(gameObject);
         }
-        foreach (Member last in members)
-        {
-            if (last.flank || last.wall == null)
-                continue;
-            if (IsAt(last.wall.curveStart))
-                last.wall.nodeAtStart = false;
-            if (IsAt(last.wall.curveEnd))
-                last.wall.nodeAtEnd = false;
-        }
-        All.Remove(this);
-        Destroy(gameObject);
     }
 
     // One member end at this node: the direction its body runs off in,
-    // and the vertical span of its masonry here (its end section).
+    // and the vertical span of its masonry here (its end section, plus
+    // any stacked courses reaching this end — the post rises with them).
     struct MemberEnd
     {
         public float bearing;
@@ -188,21 +115,11 @@ public class WallNode : MonoBehaviour
 
     public void RebuildMesh()
     {
-        members.RemoveAll(m => m.wall == null);
+        members.RemoveAll(m => m.edge == null);
 
         var ends = new List<MemberEnd>();
         foreach (Member m in members)
-        {
-            if (m.flank)
-            {
-                AddMemberFlank(ends, m.wall);
-                continue;
-            }
-            if (IsAt(m.wall.curveStart))
-                AddMemberEnd(ends, m.wall, true);
-            if (IsAt(m.wall.curveEnd))
-                AddMemberEnd(ends, m.wall, false);
-        }
+            AddMemberEnd(ends, m.edge, m.atStart);
 
         Mesh mesh = ends.Count >= 2 ? BuildWedgeMesh(ends) : null;
 
@@ -218,29 +135,38 @@ public class WallNode : MonoBehaviour
         ownedMesh = mesh;
     }
 
-    void AddMemberEnd(List<MemberEnd> ends, SplineWall wall, bool atStart)
+    void AddMemberEnd(List<MemberEnd> ends, WallEdge edge, bool atStart)
     {
         // Inward: the direction from the node INTO the wall's body.
-        Vector3 inward = -wall.EndOutwardDir(atStart);
+        Vector3 inward = -edge.EndOutwardDir(atStart);
         if (inward.sqrMagnitude < 0.01f)
             return;
+        if (!TryEndSpan(edge, atStart, out float bottom, out float top))
+            return;
 
-        // The masonry span at this end: the section closest to the end
-        // parameter (end pieces can be dropped by junction bands — the
-        // nearest survivor still reads the right heights).
-        float bottom = 0f, top = 0f, bestD = float.MaxValue;
-        foreach (SplineWallSection section in wall.GetComponentsInChildren<SplineWallSection>())
+        // Climb the course stack: each course that reaches this end lifts
+        // the post's top to its own.
+        WallEdge below = edge;
+        bool climbed = true;
+        while (climbed)
         {
-            float d = atStart ? Mathf.Abs(section.tSweepStart) : Mathf.Abs(section.tSweepEnd - 1f);
-            if (d < bestD)
+            climbed = false;
+            foreach (WallEdge course in WallEdge.All)
             {
-                bestD = d;
-                bottom = section.bottomY;
-                top = section.topY;
+                if (course.stackBase != below)
+                    continue;
+                bool reaches = atStart
+                    ? course.tMin <= below.tMin + 0.02f
+                    : course.tMax >= below.tMax - 0.02f;
+                if (!reaches)
+                    continue;
+                if (TryEndSpan(course, atStart, out _, out float courseTop))
+                    top = Mathf.Max(top, courseTop);
+                below = course;
+                climbed = true;
+                break;
             }
         }
-        if (bestD == float.MaxValue)
-            return;
 
         ends.Add(new MemberEnd
         {
@@ -250,31 +176,18 @@ public class WallNode : MonoBehaviour
         });
     }
 
-    // A flank member: the node sits ON the host's face, and the host's
-    // body covers the half-plane behind it. Inward = from the node toward
-    // the host's centerline — its flank normal, pointing into the body —
-    // which is all the wedge rule needs; heights come from the host's
-    // section at the contact.
-    void AddMemberFlank(List<MemberEnd> ends, SplineWall wall)
+    // The masonry span at one end of an edge: its section nearest that
+    // end (a locked-top edge can lose buried end sections — the nearest
+    // survivor still reads the right heights).
+    static bool TryEndSpan(WallEdge edge, bool atStart, out float bottom, out float top)
     {
-        float bestT = 0f, bestSq = float.MaxValue;
-        for (int i = 0; i <= 64; i++)
+        bottom = 0f;
+        top = 0f;
+        float target = atStart ? edge.tMin : edge.tMax;
+        float bestD = float.MaxValue;
+        foreach (WallEdgeSection section in edge.GetComponentsInChildren<WallEdgeSection>())
         {
-            float t = i / 64f;
-            Vector3 q = SplineWall.Evaluate(wall.curveStart, wall.curveControl, wall.curveEnd, t);
-            float dx = q.x - point.x, dz = q.z - point.z;
-            float sq = dx * dx + dz * dz;
-            if (sq < bestSq) { bestSq = sq; bestT = t; }
-        }
-        Vector3 c = SplineWall.Evaluate(wall.curveStart, wall.curveControl, wall.curveEnd, bestT);
-        Vector3 inward = new Vector3(c.x - point.x, 0f, c.z - point.z);
-        if (inward.sqrMagnitude < 0.0001f)
-            return;
-
-        float bottom = 0f, top = 0f, bestD = float.MaxValue;
-        foreach (SplineWallSection section in wall.GetComponentsInChildren<SplineWallSection>())
-        {
-            float d = Mathf.Abs((section.tSweepStart + section.tSweepEnd) * 0.5f - bestT);
+            float d = atStart ? Mathf.Abs(section.tStart - target) : Mathf.Abs(section.tEnd - target);
             if (d < bestD)
             {
                 bestD = d;
@@ -282,15 +195,7 @@ public class WallNode : MonoBehaviour
                 top = section.topY;
             }
         }
-        if (bestD == float.MaxValue)
-            return;
-
-        ends.Add(new MemberEnd
-        {
-            bearing = Mathf.Atan2(inward.z, inward.x) * Mathf.Rad2Deg,
-            bottomY = bottom,
-            topY = top,
-        });
+        return bestD != float.MaxValue;
     }
 
     // The exposed wedges: sort member bearings, and for each gap between
@@ -350,7 +255,7 @@ public class WallNode : MonoBehaviour
         int columns = Mathf.Max(2, Mathf.CeilToInt((toDeg - fromDeg) / SegmentDegrees));
         float baseWall = 3.5f;
         foreach (Member m in members)
-            if (m.wall != null) { baseWall = m.wall.baseWallHeight; break; }
+            if (m.edge != null) { baseWall = m.edge.baseWallHeight; break; }
         float vBottom = bottom / baseWall;
         float vTop = top / baseWall;
 

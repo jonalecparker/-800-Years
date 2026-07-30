@@ -1,5 +1,16 @@
 # Wall graph rebuild — design brief (decided 2026-07-29)
 
+> **✅ SHIPPED 2026-07-29** — all six build-order steps landed in one pass
+> (core, placement, crossings, delete, courses) and were verified
+> programmatically in play mode. `SplineWall`/`SplineWallSection` are
+> deleted; the model is `WallNode` + `WallEdge` + `WallGraph`. One
+> deliberate departure from the brief: the redraw-along refusal is the
+> narrowest possible gate (<3°, <0.15m, sustained >0.6m) — shallow V's
+> and hugs are legal because the graph doesn't care, only true coincident
+> redraws refuse. (Valence-1 rounded tips were tried and flattened
+> same-day: free ends and delete-hole boundaries cap flat.) This file is
+> now history; CLAUDE.md describes the living system.
+
 User decision after two sessions of whack-a-mole junction fixes: rebuild the wall
 system core around a **node/edge graph**. Root cause being fixed: walls are
 independent objects whose relationships are *inferred* by physics probes
