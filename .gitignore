@@ -31,3 +31,13 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Claude's verification screenshots — working artifacts, not project
+# assets. Wiped at each /wrap; the folder itself stays so captures have
+# somewhere to land (Unity ignores dotfiles, so .gitkeep is invisible).
+Assets/Screenshots/*
+!Assets/Screenshots/.gitkeep
+
+# Unity's recovery scratch folder
+Assets/_Recovery/
+Assets/_Recovery.meta

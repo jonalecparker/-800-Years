@@ -47,7 +47,14 @@ Mirror the format of the existing `Docs/SessionLog/*.md` files (read one to matc
 
 Show me a quick summary of what you're about to commit (which files, one-line description of each change).
 
-## Step 5 — commit and push
+## Step 5 — clear the screenshot scratch folder
+
+`Assets/Screenshots/` holds Claude's verification captures — working artifacts, not project assets. It's gitignored (except `.gitkeep`), so nothing there is in version control.
+
+- Delete `Assets/Screenshots/*.png` and `*.png.meta`. Leave `.gitkeep` alone.
+- **Look before deleting.** If a capture doesn't look like one you took this session (an unfamiliar name, or something I might have saved there myself), say so and leave it rather than wiping it.
+
+## Step 6 — commit and push
 
 - `git add -A` (commits everything in the working tree, including in-progress code — this is the project policy). Quickly scan the list for anything that looks like a secret or a giant binary; flag it before committing if so.
 - Commit with a message styled after recent commits — check `git log -3 --pretty=format:"%s%n%n%b"` for the format. Subject line is a short summary; body is a bulleted list of what changed and why. Include a `Co-Authored-By: <current Claude model> <noreply@anthropic.com>` trailer (e.g. `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`).
