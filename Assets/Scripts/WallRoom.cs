@@ -4,9 +4,10 @@ using UnityEngine;
 // A designated room: one enclosed face of the wall graph, STORED — the
 // boundary is a directed ring of ground edges captured at designation,
 // never re-inferred. The room owns its floor slab (flat, snapped up to
-// the base step above the highest ground it covers) and, once every
-// boundary wall crowns level, a flat stone roof slab resting on that
-// shared top. Splitting a boundary wall (a new tee or crossing) just
+// the base step above the highest ground it covers) and, once the
+// boundary offers a level crown to rest on, a flat stone roof slab.
+// Borrowed walls may stand taller than that crown; the room's own may
+// not. Splitting a boundary wall (a new tee or crossing) just
 // re-points the ring at the sub-edges — the slabs never rebuild.
 // Deleting boundary masonry breaches the room: the roof goes, the floor
 // stays, and the record marks itself broken. The roof's elevation is
@@ -19,6 +20,9 @@ public class WallRoom : MonoBehaviour
     public readonly List<WallGraph.DirEdge> boundary = new List<WallGraph.DirEdge>();
     public float floorY;
     public float roofY = float.NegativeInfinity;
+    // Set by TryBuildRoof: empty when the whole crown was one level, else
+    // a phrase naming the borrowed walls that stand above the deck.
+    public string roofNote = "";
     public bool broken;
 
     public bool HasRoof => roofObj != null;
@@ -76,7 +80,7 @@ public class WallRoom : MonoBehaviour
         room.BuildFloor();
         string roofFail = room.TryBuildRoof();
         BuildLog.Add(roofFail == null
-            ? $"Room designated — {ring.Count} walls, roofed."
+            ? $"Room designated — {ring.Count} walls, roofed{room.roofNote}."
             : $"Room designated — {ring.Count} walls, floor only: {roofFail}.");
         return room;
     }
@@ -86,6 +90,35 @@ public class WallRoom : MonoBehaviour
     public static float RingArea(List<WallGraph.DirEdge> ring)
     {
         return SignedArea(SampleOutline(ring));
+    }
+
+    // Does a candidate ring's face contain this point? (Designating an
+    // existing enclosure asks the graph for the face under the cursor.)
+    public static bool RingContains(List<WallGraph.DirEdge> ring, Vector3 point)
+    {
+        return PointInPolygon(new Vector3(point.x, 0f, point.z), SampleOutline(ring));
+    }
+
+    // The floor footprint a room on this face would cover: the ring
+    // sampled and pushed in to the walls' inner faces. What to SHOW when
+    // offering the face — the ring itself runs down the middle of the
+    // masonry, where a guide line is buried inside the wall.
+    public static List<Vector3> FaceFootprint(List<WallGraph.DirEdge> ring, float inset)
+    {
+        List<Vector3> outline = SampleOutline(ring);
+        if (outline.Count < 3)
+            return outline;
+        if (SignedArea(outline) < 0f)
+            outline.Reverse();
+        return InsetOutline(outline, inset);
+    }
+
+    // Is the point inside THIS room's designated face — the test that
+    // keeps a second designation off a face that already has one.
+    public bool ContainsPoint(Vector3 point)
+    {
+        return !broken && outline != null && outline.Count >= 3
+            && PointInPolygon(new Vector3(point.x, 0f, point.z), outline);
     }
 
     // ------------------------------------------------------------------
@@ -139,7 +172,9 @@ public class WallRoom : MonoBehaviour
         foreach (WallRoom room in All)
             if (!room.broken && room.roofObj == null && room.ContainsEdge(below)
                 && room.TryBuildRoof() == null)
-                BuildLog.Add("Roof added — walls now level.");
+                BuildLog.Add(room.roofNote.Length == 0
+                    ? "Roof added — walls now level."
+                    : $"Roof added{room.roofNote}.");
     }
 
     // A breached room doesn't linger as a half-object: the same rule as
@@ -206,43 +241,146 @@ public class WallRoom : MonoBehaviour
         floorObj = BuildSlab("RoomFloor", outline, bottom, floorY, out floorMesh);
     }
 
-    // The roof requires a level crown: every boundary section's masonry
-    // stack (base wall plus any courses) must top out at one elevation.
-    // Uneven tops leave the room floor-only until the player levels them
-    // — usually by stacking courses, which retries this automatically.
-    // The deck sits FLUSH: its top at the shared wall top, its footprint
-    // inset to the walls' inner faces, so the wall-top rim stays walkable
-    // beside it and a course stacked later rises as a parapet around it.
+    // The roof rests on the boundary's DOMINANT crown — the elevation the
+    // greatest length of wall tops out at, over each section's masonry
+    // stack (base wall plus any courses). Ties go to the lower level.
+    // Anything BELOW that plane refuses: the deck would hang over a gap.
+    // Masonry standing ABOVE it is allowed only where it belongs to a
+    // structure that continues past this room — a borrowed keep or
+    // curtain flank, which the deck simply butts into at its inner face
+    // while the wall carries on upward. A span of the room's OWN ring
+    // left off-level has nothing beyond it to justify the difference, so
+    // it still refuses and says where: raggedness is a mistake worth
+    // reporting, a lean-to against a taller wall is not.
+    // Dominance is what keeps the two apart when both walls are borrowed
+    // structure — three tall flanks and one short new wall roof at the
+    // tall crown (and so refuse until the short one is levelled), not at
+    // whatever happened to be lowest.
+    // Levelling by stacking courses retries this automatically.
+    // The deck sits FLUSH: its top at the plane, its footprint inset to
+    // the walls' inner faces, so the wall-top rim stays walkable beside
+    // it and a course stacked later rises as a parapet around it.
     // Returns null on success (or an existing roof), else the reason.
     public string TryBuildRoof()
     {
         if (broken || roofObj != null)
             return null;
 
-        float lo = float.MaxValue;
-        float hi = float.MinValue;
-        Vector3 loPos = default;
+        int n = boundary.Count;
+        var ring = new HashSet<WallEdge>();
         foreach (WallGraph.DirEdge d in boundary)
         {
             if (d.edge == null)
                 return "a boundary wall is missing";
-            List<WallEdgeSection> sections = d.edge.SectionsInOrder();
+            ring.Add(d.edge);
+        }
+
+        // Each span's own crown range, plus how much wall it is worth when
+        // the levels vote on the plane.
+        var lo = new float[n];
+        var hi = new float[n];
+        var loPos = new Vector3[n];
+        var hiPos = new Vector3[n];
+        var len = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            WallEdge e = boundary[i].edge;
+            List<WallEdgeSection> sections = e.SectionsInOrder();
             if (sections.Count == 0)
                 return "a boundary wall has no masonry";
+            lo[i] = float.MaxValue;
+            hi[i] = float.MinValue;
+            len[i] = Vector3.Distance(e.A, e.B);
             foreach (WallEdgeSection s in sections)
             {
-                float top = StackTopOver(d.edge, (s.tStart + s.tEnd) * 0.5f, s.topY);
-                if (top < lo)
+                float top = StackTopOver(e, (s.tStart + s.tEnd) * 0.5f, s.topY);
+                if (top < lo[i])
                 {
-                    lo = top;
-                    loPos = s.transform.position;
+                    lo[i] = top;
+                    loPos[i] = s.transform.position;
                 }
-                hi = Mathf.Max(hi, top);
+                if (top > hi[i])
+                {
+                    hi[i] = top;
+                    hiPos[i] = s.transform.position;
+                }
             }
         }
-        if (hi - lo > LevelEps)
-            return $"wall tops uneven by {hi - lo:0.0}m — lowest on the {CompassFrom(loPos)} side"
-                + " (level with courses or lock-top)";
+
+        // The plane: the level carrying the most boundary length, lowest
+        // level winning a tie. A span votes with its low crown — the
+        // elevation a deck could actually rest on there.
+        float plane = float.MaxValue;
+        float bestLength = -1f;
+        for (int i = 0; i < n; i++)
+        {
+            float total = 0f;
+            for (int k = 0; k < n; k++)
+                if (Mathf.Abs(lo[k] - lo[i]) <= LevelEps)
+                    total += len[k];
+            if (total > bestLength + 0.001f
+                || (total > bestLength - 0.001f && lo[i] < plane))
+            {
+                bestLength = total;
+                plane = lo[i];
+            }
+        }
+
+        // A wall that stops short of the plane leaves the deck hanging —
+        // no structure beyond the room can excuse that.
+        for (int i = 0; i < n; i++)
+            if (plane - lo[i] > LevelEps)
+                return $"wall tops uneven by {plane - lo[i]:0.0}m — lowest on the "
+                    + $"{CompassFrom(loPos[i])} side (level with courses or lock-top)";
+
+        // Spans carrying masonry above the plane, grouped into contiguous
+        // runs and judged as one: a single node leaving the ring anchors
+        // the whole run to the structure it belongs to. (Per-span would
+        // condemn the middle of a three-span borrowed flank, whose inner
+        // nodes touch nothing but the run itself.)
+        var above = new bool[n];
+        for (int i = 0; i < n; i++)
+            above[i] = hi[i] - plane > LevelEps;
+        var borrowed = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            if (!above[i] || borrowed[i])
+                continue;
+            int start = i;
+            while (above[(start + n - 1) % n] && (start + n - 1) % n != i)
+                start = (start + n - 1) % n;
+            var run = new List<int>();
+            for (int k = start; above[k]; k = (k + 1) % n)
+            {
+                run.Add(k);
+                if (run.Count == n || (k + 1) % n == start)
+                    break;
+            }
+            bool anchored = false;
+            foreach (int k in run)
+                if (LeavesRing(boundary[k].edge.nodeA, ring)
+                    || LeavesRing(boundary[k].edge.nodeB, ring))
+                {
+                    anchored = true;
+                    break;
+                }
+            foreach (int k in run)
+                borrowed[k] = anchored;
+        }
+
+        float highest = plane;
+        int tallest = -1;
+        for (int i = 0; i < n; i++)
+        {
+            if (above[i] && !borrowed[i])
+                return $"the {CompassFrom(hiPos[i])} wall stands {hi[i] - plane:0.0}m above"
+                    + " the rest (level with courses or lock-top)";
+            if (above[i] && hi[i] > highest)
+            {
+                highest = hi[i];
+                tallest = i;
+            }
+        }
 
         float inset = 0.5f;
         foreach (WallGraph.DirEdge d in boundary)
@@ -255,9 +393,25 @@ public class WallRoom : MonoBehaviour
         if (deck.Count < 3 || SignedArea(deck) < 0.5f)
             return "room too narrow for the roof slab";
 
-        roofY = hi;
+        roofY = plane;
+        roofNote = tallest < 0 ? ""
+            : $" at {plane:0.0}m — the {CompassFrom(hiPos[tallest])} wall stands"
+                + $" {highest - plane:0.0}m higher";
         roofObj = BuildSlab("RoomRoof", deck, roofY - RoofThickness, roofY, out roofMesh);
         return null;
+    }
+
+    // Does this node carry masonry the room's ring doesn't own — i.e.
+    // does the wall continue past the room here? That's what tells a
+    // borrowed flank from one of the room's own walls left off-level.
+    static bool LeavesRing(WallNode node, HashSet<WallEdge> ring)
+    {
+        if (node == null)
+            return false;
+        foreach (WallNode.Member m in node.members)
+            if (!ring.Contains(m.edge))
+                return true;
+        return false;
     }
 
     // The outline pushed inward by `inset` (mitered per vertex) — the

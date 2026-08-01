@@ -70,6 +70,14 @@ public class GridPlacementSystem : MonoBehaviour
     public enum ToolMode { Build, Delete, Offset, Room }
     public ToolMode Mode { get; private set; } = ToolMode.Build;
 
+    // The Room tool's two jobs, picked in the menu. Build chains walls
+    // into a new room. Designate hands an EXISTING enclosure a floor and
+    // roof — the answer to "I fixed the wall and nothing re-checked" —
+    // and runs ONLY when it's selected, so an ordinary room-building
+    // click can never designate something by accident.
+    public enum RoomAction { Build, Designate }
+    public RoomAction RoomTask { get; private set; } = RoomAction.Build;
+
     // Straight and Curved shape the wall tool's drag; Circle and Rect are
     // whole-figure gestures (center-out ring, corner-to-corner box) that
     // apply to whichever tool is in hand — walls or rooms.
@@ -312,6 +320,11 @@ public class GridPlacementSystem : MonoBehaviour
     // A figure side at least this coincident with existing masonry is
     // reused instead of redrawn.
     const float ReuseCoverage = 0.9f;
+    // How far past the cursor a Shift-stepped room segment will run to
+    // meet a wall the cursor is already grazing, so the step and the
+    // landing can both be honoured. Overshooting is safe — the clamp
+    // takes the FIRST crossing along the run.
+    const float SteppedLandingReach = 2f;
 
     void Start()
     {
@@ -361,6 +374,10 @@ public class GridPlacementSystem : MonoBehaviour
             UpdateDelete(mouse, keyboard, ray, overUI);
         else if (Mode == ToolMode.Offset)
             UpdateOffset(mouse, keyboard, ray, overUI);
+        // Designating has no gesture, so it outranks the shape helpers —
+        // an armed Circle or Rectangle has nothing to do with it.
+        else if (Mode == ToolMode.Room && RoomTask == RoomAction.Designate)
+            UpdateRoomDesignate(mouse, ray, overUI);
         else if (Shape == BuildShape.Circle || Shape == BuildShape.Rect)
             UpdateShapeGesture(mouse, keyboard, ray, overUI, Mode == ToolMode.Room);
         else if (Mode == ToolMode.Room)
@@ -388,11 +405,147 @@ public class GridPlacementSystem : MonoBehaviour
         if (Mode == mode)
             return;
         Mode = mode;
+        // Entering the Room tool always starts on Build — designating is
+        // a deliberate pick, never a state you return to unawares.
+        if (mode == ToolMode.Room)
+            RoomTask = RoomAction.Build;
         offsetSource = null;
         CancelCurve();
         CancelShape();
         CancelRoomChain();
         CancelDelete();
+    }
+
+    // What the keyboard means RIGHT NOW, for the HUD's modifier panel.
+    // Every line below mirrors a key the current tool actually reads in
+    // its current phase — a key that does nothing here is left off rather
+    // than listed hopefully, which is the whole value of the panel. Any
+    // new modifier (or any change to the scroll-wheel arbitration) has to
+    // be added here in the same edit, or the HUD starts lying.
+    public void ModifierHints(out string context, out string hints)
+    {
+        var lines = new List<string>();
+        if (Mode == ToolMode.Delete)
+        {
+            context = "Delete";
+            lines.Add("Drag over walls — paint a selection");
+            lines.Add("Drag from open ground — marquee");
+            lines.Add("Esc — clear the selection");
+        }
+        else if (Mode == ToolMode.Offset)
+        {
+            context = offsetSource == null ? "Offset · pick a wall" : "Offset · placing";
+            if (offsetSource != null)
+                lines.Add("Scroll — offset distance");
+            lines.Add("Ctrl + scroll — wall height");
+            if (offsetSource != null)
+                lines.Add("Esc — release the source wall");
+        }
+        else if (Mode == ToolMode.Room && RoomTask == RoomAction.Designate)
+        {
+            context = "Room · Designate";
+            lines.Add("Click an outlined enclosure — make it a room");
+            lines.Add("(no modifiers in this mode)");
+        }
+        else if (Shape == BuildShape.Circle || Shape == BuildShape.Rect)
+        {
+            string tool = Mode == ToolMode.Room ? "Room" : "Wall";
+            string figure = Shape == BuildShape.Circle ? "Circle" : "Rectangle";
+            if (!shapeAnchor.HasValue)
+            {
+                context = $"{tool} · {figure} · anchor";
+                if (Shape == BuildShape.Rect)
+                    lines.Add("Ctrl + click — centre the first side here");
+                lines.Add("Alt — free placement (no snapping)");
+                lines.Add("Ctrl + scroll — wall height");
+            }
+            else if (Shape == BuildShape.Circle)
+            {
+                context = $"{tool} · {figure} · radius";
+                lines.Add("Alt — free radius (no 0.5m steps)");
+                lines.Add("Ctrl + scroll — wall height");
+                lines.Add("Esc — cancel the figure");
+            }
+            else if (!shapeSideEnd.HasValue)
+            {
+                context = $"{tool} · {figure} · side";
+                lines.Add(shapeCentered
+                    ? "Shift — 5° steps off the anchor wall's face"
+                    : "Shift — 5° direction steps");
+                lines.Add("Alt — free direction and length");
+                lines.Add("Ctrl + scroll — wall height");
+                lines.Add("Esc — cancel the figure");
+            }
+            else
+            {
+                context = $"{tool} · {figure} · width";
+                lines.Add("Shift — square it (width = side)");
+                lines.Add("Alt — free width (no 0.5m steps)");
+                lines.Add("Ctrl + scroll — wall height");
+                lines.Add("Esc — cancel the figure");
+            }
+        }
+        else if (Mode == ToolMode.Room)
+        {
+            bool chaining = roomChain.Count > 0;
+            context = chaining ? "Room · Build · chaining" : "Room · Build";
+            if (chaining)
+                lines.Add("Shift — 5° steps from the last corner");
+            lines.Add("Alt — free placement (no snapping or stepping)");
+            lines.Add("Ctrl + scroll — wall height");
+            if (chaining)
+                lines.Add("Esc — abandon the chain");
+        }
+        else if (Shape == BuildShape.Curved)
+        {
+            if (splineEnd.HasValue)
+            {
+                context = "Wall · Curved · bend";
+                lines.Add("Scroll — curve bulge");
+                lines.Add("Ctrl + scroll — wall height");
+                lines.Add("Esc — cancel the wall");
+            }
+            else if (splineStart.HasValue)
+            {
+                context = "Wall · Curved · drag";
+                lines.Add("Alt — free placement (no snapping)");
+                lines.Add("Ctrl + scroll — wall height");
+                lines.Add("Esc — cancel the wall");
+            }
+            else
+            {
+                context = "Wall · Curved";
+                lines.Add("Alt — free placement (no snapping)");
+                lines.Add("Ctrl + scroll — wall height");
+            }
+        }
+        else if (splineStart.HasValue)
+        {
+            context = "Wall · drag";
+            lines.Add("Shift — 5° direction steps");
+            lines.Add("C — tangent-tied connector (both ends snapped)");
+            lines.Add("Alt — free placement (no snapping or stepping)");
+            lines.Add("Ctrl + scroll — wall height");
+            lines.Add("Esc — cancel the drag");
+        }
+        else
+        {
+            context = "Wall";
+            lines.Add("R — turn the stub 45°");
+            lines.Add("Alt — free placement (no snapping)");
+            lines.Add("Ctrl + scroll — wall height");
+        }
+        hints = string.Join("\n", lines);
+    }
+
+    // Switching jobs abandons a half-drawn chain, like switching tools.
+    public void SetRoomTask(RoomAction task)
+    {
+        if (RoomTask == task)
+            return;
+        RoomTask = task;
+        CancelRoomChain();
+        CancelShape();
     }
 
     public void SetShape(BuildShape shape)
@@ -489,6 +642,8 @@ public class GridPlacementSystem : MonoBehaviour
             // preview stays visible and release commits exactly what it
             // shows, instead of getting stuck dragging.
             bool snapAngle = keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
+            bool tangentKey = keyboard != null && keyboard.cKey.isPressed;
+            bool steppedAim = !freePlace && snapAngle;
             if (hasPoint)
             {
                 // The far end snaps to nodes first, so closing a loop
@@ -496,12 +651,19 @@ public class GridPlacementSystem : MonoBehaviour
                 // outranks length stepping while it holds. Failing that, a
                 // wall's centerline grabs the end: the wall terminates
                 // there and the commit T-splits the host, at any angle.
+                // Under Shift the bearing outranks that grab — same rule
+                // as the room chain — and the landing is found ON the
+                // stepped ray instead (TrySteppedLanding), so a stepped
+                // drag can still end exactly on the masonry.
+                EndSnap flankSnap = default;
+                bool flankInReach = !freePlace
+                    && TryFlankSnap(rawSurface, splineStart, anchorBaseY, out flankSnap);
                 if (!freePlace && TryNodeSnap(rawSurface, splineStart, anchorBaseY, out EndSnap endSnap))
                 {
                     splineEnd = endSnap.point;
                     dragEndSnap = endSnap;
                 }
-                else if (!freePlace && TryFlankSnap(rawSurface, splineStart, anchorBaseY, out EndSnap flankSnap))
+                else if (flankInReach && !steppedAim)
                 {
                     splineEnd = flankSnap.point;
                     dragEndSnap = flankSnap;
@@ -516,7 +678,7 @@ public class GridPlacementSystem : MonoBehaviour
                     // host arms on a flank), so a lazy Shift-drag off a
                     // face lands exactly 90° flush and stepped corners
                     // read clean multiples even off the world grid.
-                    if (!freePlace && snapAngle && anchorSnap.HasValue)
+                    if (steppedAim && anchorSnap.HasValue)
                     {
                         Vector3 d = splineEnd.Value - splineStart.Value;
                         d.y = 0f;
@@ -528,19 +690,31 @@ public class GridPlacementSystem : MonoBehaviour
                                 splineStart.Value, splineEnd.Value);
                         }
                     }
-                    AddExtensionAlignGuides(splineEnd.Value);
+                    if (steppedAim && flankInReach
+                        && TrySteppedLanding(splineStart.Value, splineEnd.Value, anchorBaseY,
+                            out Vector3 landing, out EndSnap landSnap))
+                    {
+                        splineEnd = landing;
+                        dragEndSnap = landSnap;
+                    }
+                    else
+                    {
+                        AddExtensionAlignGuides(splineEnd.Value);
+                    }
                 }
             }
 
             Vector3 anchor = splineStart.Value;
             Vector3 end = splineEnd ?? anchor;
             // Ends default to corner nodes on a straight wall — all the
-            // turning lives in the posts. Holding Shift with both ends
-            // snapped opts into the tangent-tied connector instead: the
-            // wall auto-curves to leave one host and arrive at the other
-            // straight-on, both joints flush end-on fuses.
+            // turning lives in the posts. Holding C with both ends snapped
+            // opts into the tangent-tied connector instead: the wall
+            // auto-curves to leave one host and arrive at the other
+            // straight-on, both joints flush end-on fuses. (It lived on
+            // Shift until Shift was made to mean angle stepping and
+            // nothing else, in the wall tool and the room chain alike.)
             float dragBulge = 0f, dragApexT = 0.5f;
-            bool tangentTied = anchorSnap.HasValue && dragEndSnap.HasValue && snapAngle
+            bool tangentTied = anchorSnap.HasValue && dragEndSnap.HasValue && tangentKey
                 && TryTangentControl(anchor, end, out dragBulge, out dragApexT);
             if (!tangentTied)
             {
@@ -684,7 +858,7 @@ public class GridPlacementSystem : MonoBehaviour
         return Mathf.Min(half * 2f, half / Mathf.Max(0.35f, along));
     }
 
-    // Shift held with both drag ends snapped: solve the quadratic control
+    // C held with both drag ends snapped: solve the quadratic control
     // point that makes the connector LEAVE the anchor's host straight-on
     // and ARRIVE at the far host straight-on — the intersection of the
     // two snaps' departure rays. Each joint then meets its host collinear
@@ -935,7 +1109,7 @@ public class GridPlacementSystem : MonoBehaviour
     }
 
     WallGraph.EdgeParams EdgeParamsNow(float height, float topY,
-        float baseY = float.NegativeInfinity)
+        float baseY = float.NegativeInfinity, bool roomBuilt = false)
     {
         return new WallGraph.EdgeParams
         {
@@ -947,6 +1121,7 @@ public class GridPlacementSystem : MonoBehaviour
             fixedTopY = topY,
             baseY = baseY,
             material = wallMaterial,
+            roomBuilt = roomBuilt,
         };
     }
 
@@ -1516,7 +1691,7 @@ public class GridPlacementSystem : MonoBehaviour
         WallEdge lastEdge = null;
         int reused = 0;
         WallGraph.EdgeParams p = EdgeParamsNow(ShapeHeight(), shapeTopY,
-            shapeBaseY ?? float.NegativeInfinity);
+            shapeBaseY ?? float.NegativeInfinity, designate);
         foreach ((Vector3 s, Vector3 c, Vector3 e) in shapeEdgesLive)
         {
             // Re-derived rather than read from preview state, so the
@@ -1655,6 +1830,19 @@ public class GridPlacementSystem : MonoBehaviour
             Vector3 end;
             EndSnap? endAttach = null;
             bool closingToStart = false;
+            // With Shift down the BEARING rules. A flank landing would
+            // otherwise steer the segment to wherever the cursor grazed the
+            // host — the step silently lost — so the stepped aim wins and
+            // the segment runs on to MEET the wall, the crossing clamp
+            // below landing it on the centerline at the stepped angle. A
+            // node snap still wins outright: an existing corner is a
+            // stronger intent than an angle, and only one of the two can
+            // be honoured at a point.
+            bool steppedAim = !freePlace && snapAngle;
+            EndSnap flankSnap = default;
+            bool flankInReach = canSnap
+                && TryFlankSnap(raw, last, roomChainBaseY ?? deckY, out flankSnap);
+            float landingReach = 0f;
             if (roomChain.Count >= 3 && FlatDistance(raw, roomChain[0]) < endpointSnapRadius)
             {
                 // Back onto the chain's own first vertex: a pure loop.
@@ -1666,7 +1854,7 @@ public class GridPlacementSystem : MonoBehaviour
                 end = nodeSnap.point;
                 endAttach = nodeSnap;
             }
-            else if (canSnap && TryFlankSnap(raw, last, roomChainBaseY ?? deckY, out EndSnap flankSnap))
+            else if (flankInReach && !steppedAim)
             {
                 end = flankSnap.point;
                 endAttach = flankSnap;
@@ -1678,7 +1866,7 @@ public class GridPlacementSystem : MonoBehaviour
                 // from — the previous segment's run, or the snapped
                 // start's masonry — so stepped chain corners land on
                 // clean 5° readings even off the world grid.
-                if (!freePlace && snapAngle)
+                if (steppedAim)
                 {
                     Vector3 d = end - last;
                     d.y = 0f;
@@ -1689,22 +1877,36 @@ public class GridPlacementSystem : MonoBehaviour
                         if (refB.HasValue)
                             end = StepBearingFrom(refB.Value, last, end);
                     }
+                    if (flankInReach)
+                        landingReach = SteppedLandingReach;
                 }
                 AddExtensionAlignGuides(end);
             }
 
             // No crossings in room mode: the first wall the segment
             // passes over clamps its end onto that wall's centerline.
+            // A stepped aim probes past the cursor so the wall it was
+            // grazing still catches the end — the step is kept, the
+            // landing is exact, and the run stops at the FIRST wall it
+            // meets either way.
             if (!closingToStart)
             {
-                var crossings = WallGraph.FindCrossings(last, (last + end) * 0.5f, end);
+                Vector3 probe = end;
+                if (landingReach > 0f)
+                {
+                    Vector3 run = end - last;
+                    run.y = 0f;
+                    if (run.sqrMagnitude > 0.000001f)
+                        probe = end + run.normalized * landingReach;
+                }
+                var crossings = WallGraph.FindCrossings(last, (last + probe) * 0.5f, probe);
                 if (crossings.Count > 0)
                 {
                     WallGraph.Crossing x = crossings[0];
                     end = new Vector3(x.point.x, 0f, x.point.z);
                     endAttach = x.reuseNode != null
                         ? MakeNodeSnap(x.reuseNode)
-                        : new EndSnap { edge = x.edge, point = end, isFlank = true };
+                        : FlankSnapAt(x.edge, end, last);
                 }
             }
 
@@ -1755,6 +1957,85 @@ public class GridPlacementSystem : MonoBehaviour
             // Off-target frames (HUD, sky) keep the chain visible.
             ShowRoomGhosts();
         }
+    }
+
+    // Designate mode: no gesture at all. The cursor asks the graph which
+    // face it stands in, an eligible one outlines in white, and a click
+    // hands it a floor and a roof. A refused click SAYS which of the
+    // three reasons applied — silence would read as a broken button.
+    void UpdateRoomDesignate(Mouse mouse, Ray ray, bool overUI)
+    {
+        HideGhosts();
+        if (overUI || !TryGetBuildSurface(ray, out Vector3 raw, out float? deckY))
+            return;
+        List<WallGraph.DirEdge> face = DesignatableFaceAt(raw, out string why);
+        if (face != null)
+        {
+            OutlineFace(face);
+            snapTint = true;
+        }
+        if (!mouse.leftButton.wasPressedThisFrame)
+            return;
+        if (face != null)
+            WallRoom.Create(splineParent, face, wallMaterial, baseStepSize, BaseHeight);
+        else
+            BuildLog.Add(why);
+    }
+
+    // The enclosure under the cursor that a click may designate: an
+    // interior face, not already a room, whose walls the ROOM tool laid.
+    // Provenance is judged by LENGTH, so a room that borrows a span of
+    // someone else's masonry still qualifies while a bailey ringed by
+    // curtain walls never does, however room-shaped it looks.
+    List<WallGraph.DirEdge> DesignatableFaceAt(Vector3 point, out string why)
+    {
+        why = "Nothing to designate — the cursor isn't inside an enclosure.";
+        List<WallGraph.DirEdge> face = WallGraph.FaceAt(point);
+        if (face == null)
+            return null;
+        foreach (WallRoom room in WallRoom.All)
+            if (!room.broken && room.ContainsPoint(point))
+            {
+                why = "That enclosure is already a room.";
+                return null;
+            }
+        float mine = 0f;
+        float total = 0f;
+        foreach (WallGraph.DirEdge d in face)
+        {
+            if (d.edge == null)
+                return null;
+            float len = FlatDistance(d.edge.A, d.edge.B);
+            total += len;
+            if (d.edge.roomBuilt)
+                mine += len;
+        }
+        if (total < 0.01f || mine <= total * 0.5f)
+        {
+            why = "Not a room: these walls were laid with the wall tool."
+                + " Only an enclosure the room tool built can be designated.";
+            return null;
+        }
+        why = null;
+        return face;
+    }
+
+    // The face drawn as guide lines — the "click to designate"
+    // affordance, in the same white as the alignment ties. Drawn on the
+    // FOOTPRINT, not the ring: the ring runs down the middle of the
+    // masonry, where a guide line is buried inside the wall and invisible.
+    void OutlineFace(List<WallGraph.DirEdge> ring)
+    {
+        float inset = 0.5f;
+        foreach (WallGraph.DirEdge d in ring)
+            if (d.edge != null)
+            {
+                inset = d.edge.thickness * 0.5f;
+                break;
+            }
+        List<Vector3> poly = WallRoom.FaceFootprint(ring, inset);
+        for (int i = 0; i < poly.Count; i++)
+            alignLines.Add((poly[i], poly[(i + 1) % poly.Count]));
     }
 
     // The chain's angle reference at its growing tip: the previous
@@ -1880,7 +2161,7 @@ public class GridPlacementSystem : MonoBehaviour
             Vector3 b = roomChain[i + 1];
             List<WallEdge> created = WallGraph.CommitEdge(splineParent, a, (a + b) * 0.5f, b,
                 EdgeParamsNow(roomChainHeight, roomChainTopY,
-                    roomChainBaseY ?? float.NegativeInfinity));
+                    roomChainBaseY ?? float.NegativeInfinity, true));
             if (created.Count > 0)
                 lastEdge = created[created.Count - 1];
         }
@@ -2234,23 +2515,72 @@ public class GridPlacementSystem : MonoBehaviour
                 continue;
             if (from.HasValue && FlatDistance(cPoint, from.Value) < lengthStep)
                 continue;
-            Vector3 side = edge.SideOf(from ?? raw) * FlankNormalAt(edge, t);
-
             bestSq = centerSq;
             found = true;
-            snap = new EndSnap
-            {
-                edge = edge,
-                node = null,
-                point = cPoint,
-                backBearing = Mathf.Atan2(-side.z, -side.x) * Mathf.Rad2Deg,
-                stubYaw = Mathf.Atan2(-side.z, side.x) * Mathf.Rad2Deg,
-                outDir = side,
-                isFlank = true,
-                stubTrim = halfThick,
-            };
+            snap = FlankSnapAt(edge, cPoint, from ?? raw);
         }
         return found;
+    }
+
+    // A flank landing on `edge` at a point already known to lie on its
+    // centerline. Shared by proximity snapping (above) and by the stepped
+    // landing, which finds its point by intersecting the drag's stepped
+    // ray with the host rather than by nearest approach.
+    static EndSnap FlankSnapAt(WallEdge edge, Vector3 centerPoint, Vector3 from)
+    {
+        float t = edge.NearestT(centerPoint, out _);
+        Vector3 side = edge.SideOf(from) * FlankNormalAt(edge, t);
+        return new EndSnap
+        {
+            edge = edge,
+            node = null,
+            point = centerPoint,
+            backBearing = Mathf.Atan2(-side.z, -side.x) * Mathf.Rad2Deg,
+            stubYaw = Mathf.Atan2(-side.z, side.x) * Mathf.Rad2Deg,
+            outDir = side,
+            isFlank = true,
+            stubTrim = edge.thickness * 0.5f,
+        };
+    }
+
+    // Shift rules the bearing, so a landing can't be found by nearest
+    // approach — it has to lie ON the stepped ray. The run probes
+    // SteppedLandingReach past the cursor and takes the FIRST wall it
+    // meets, which is the one the cursor was already grazing (callers ask
+    // only when a flank is in reach). Storey-filtered like every other
+    // snap; a crossing that reuses a node lands as a node snap.
+    // A shallow approach (under ~40°) needs more run to reach the host
+    // than the probe gives it — the segment then stays free at the
+    // stepped bearing instead of guessing a landing further along.
+    bool TrySteppedLanding(Vector3 from, Vector3 steppedEnd, float? atBase,
+        out Vector3 point, out EndSnap snap)
+    {
+        point = steppedEnd;
+        snap = default;
+        Vector3 run = steppedEnd - from;
+        run.y = 0f;
+        if (run.sqrMagnitude < 0.000001f)
+            return false;
+        Vector3 probe = steppedEnd + run.normalized * SteppedLandingReach;
+        foreach (WallGraph.Crossing x in
+            WallGraph.FindCrossings(from, (from + probe) * 0.5f, probe))
+        {
+            if (x.reuseNode != null)
+            {
+                EndSnap nodeSnap = MakeNodeSnap(x.reuseNode, atBase);
+                if (nodeSnap.edge == null)
+                    continue;
+                point = x.reuseNode.point;
+                snap = nodeSnap;
+                return true;
+            }
+            if (x.edge == null || x.edge.IsCourse || !BaseMatches(x.edge, atBase))
+                continue;
+            point = new Vector3(x.point.x, 0f, x.point.z);
+            snap = FlankSnapAt(x.edge, point, from);
+            return true;
+        }
+        return false;
     }
 
     // The host's left-hand flank normal at t, flattened — SideOf's sign

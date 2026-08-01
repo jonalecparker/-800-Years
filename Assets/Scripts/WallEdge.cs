@@ -40,6 +40,12 @@ public class WallEdge : MonoBehaviour
     // wall stands on when built ON a room slab (roof deck or floor)
     // instead of the terrain. -Infinity (default) rides the terrain.
     public float baseY = float.NegativeInfinity;
+    // Provenance: laid by the ROOM tool, not the wall tool. Stored, never
+    // inferred from shape — a bailey ringed by curtain walls encloses a
+    // face exactly like a hall does, and only this tells them apart when
+    // the player asks to designate an enclosure after the fact. Surgery
+    // copies it onto sub-edges: splitting a room wall leaves room walls.
+    public bool roomBuilt;
     // Stacked course: this edge rides on stackBase's section tops.
     public WallEdge stackBase;
     // Coverage along the curve, in curve parameter — courses can be

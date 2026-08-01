@@ -20,6 +20,10 @@ public static class WallGraph
         // rides the terrain.
         public float baseY;
         public Material material;
+        // Stamped onto every edge the gesture creates: the room tool's
+        // walls can be designated a room after the fact, the wall tool's
+        // cannot. See WallEdge.roomBuilt.
+        public bool roomBuilt;
     }
 
     // Where a proposed curve crosses an existing edge. reuseNode is set
@@ -164,6 +168,37 @@ public static class WallGraph
             }
         }
         return false;
+    }
+
+    // The smallest enclosed face containing `point`, traced fresh from
+    // every edge in both directions and kept only if it comes back as an
+    // interior face (positive area) the point falls inside. Smallest
+    // wins, so a face nested inside another designates the room you are
+    // standing in, not the one around it. Null when the point sits in no
+    // enclosure at all.
+    public static List<DirEdge> FaceAt(Vector3 point)
+    {
+        List<DirEdge> best = null;
+        float bestArea = float.MaxValue;
+        foreach (WallEdge e in WallEdge.All)
+        {
+            if (e == null || e.IsCourse)
+                continue;
+            for (int dir = 0; dir < 2; dir++)
+            {
+                List<DirEdge> face = TraceFace(e, dir == 0);
+                if (face == null)
+                    continue;
+                float area = WallRoom.RingArea(face);
+                if (area <= 0.5f || area >= bestArea)
+                    continue;
+                if (!WallRoom.RingContains(face, point))
+                    continue;
+                best = face;
+                bestArea = area;
+            }
+        }
+        return best;
     }
 
     // Walks the boundary of one planar face: travel the directed edge,
@@ -343,9 +378,11 @@ public static class WallGraph
             if (n0 == n1 || t1 - t0 < 0.001f)
                 continue;
             SubCurve(s, c, e, t0, t1, out _, out Vector3 subC, out _);
-            created.Add(WallEdge.Create(parent, n0, n1, subC, p.height, p.thickness,
+            WallEdge made = WallEdge.Create(parent, n0, n1, subC, p.height, p.thickness,
                 p.baseWallHeight, p.material, p.targetSectionLength, p.baseStep, p.fixedTopY,
-                p.baseY));
+                p.baseY);
+            made.roomBuilt = p.roomBuilt;
+            created.Add(made);
             touched.Add(n0);
             touched.Add(n1);
         }
@@ -451,6 +488,7 @@ public static class WallGraph
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
                 edge.fixedTopY, edge.baseY);
+            sub.roomBuilt = edge.roomBuilt;
             slots2.Add(new StackSlot { below = sub, mapLo = lo, mapHi = hi, covLo = lo, covHi = hi });
             touched.Add(n0);
             touched.Add(n1);
@@ -511,6 +549,7 @@ public static class WallGraph
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
                 edge.fixedTopY, edge.baseY);
+            sub.roomBuilt = edge.roomBuilt;
             slots.Add(new StackSlot { below = sub, mapLo = t0, mapHi = t1, covLo = t0, covHi = t1 });
             touched.Add(n0);
             touched.Add(n1);

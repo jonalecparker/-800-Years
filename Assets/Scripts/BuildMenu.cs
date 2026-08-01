@@ -32,6 +32,11 @@ public class BuildMenu : MonoBehaviour
     private string openCategory;
     private Image deleteButtonImage;
     private Image roomButtonImage;
+    // The Room tool's job buttons, shown in the item row while it's in
+    // hand — tinted from the placement system's actual state like every
+    // other control here.
+    private readonly List<(Image image, GridPlacementSystem.RoomAction task)> roomTaskButtons =
+        new List<(Image, GridPlacementSystem.RoomAction)>();
     private Toggle curvedToggle;
     private Toggle offsetToggle;
     private Toggle circleToggle;
@@ -45,6 +50,9 @@ public class BuildMenu : MonoBehaviour
     private Text logHeaderText;
     private bool logCollapsed;
     private int logVersionSeen = -1;
+    private Text hintHeaderText;
+    private Text hintText;
+    private string hintContextSeen;
 
     const int LogLinesShown = 6;
 
@@ -130,6 +138,54 @@ public class BuildMenu : MonoBehaviour
 
         CreateOptionsPanel(canvasObj.transform);
         CreateLogPanel(canvasObj.transform);
+        CreateHintPanel(canvasObj.transform);
+    }
+
+    // Top-right: what the keyboard means for the tool in hand, right now.
+    // The placement system answers (ModifierHints) so the list lives
+    // beside the input code it describes and can't drift from it.
+    void CreateHintPanel(Transform parent)
+    {
+        GameObject panel = new GameObject("ModifierPanel", typeof(RectTransform));
+        panel.transform.SetParent(parent, false);
+        RectTransform rt = panel.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(1f, 1f);
+        rt.anchorMax = new Vector2(1f, 1f);
+        rt.pivot = new Vector2(1f, 1f);
+        rt.anchoredPosition = new Vector2(-8f, -8f);
+        rt.sizeDelta = new Vector2(340f, 0f);
+
+        Image bg = panel.AddComponent<Image>();
+        bg.color = barColor;
+        VerticalLayoutGroup layout = panel.AddComponent<VerticalLayoutGroup>();
+        layout.padding = new RectOffset(10, 10, 6, 8);
+        layout.spacing = 4f;
+        layout.childForceExpandWidth = true;
+        layout.childForceExpandHeight = false;
+        ContentSizeFitter fitter = panel.AddComponent<ContentSizeFitter>();
+        fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+        hintHeaderText = CreateHintLabel(panel.transform, "Header", 14,
+            new Color(0.65f, 0.78f, 1f, 1f));
+        hintText = CreateHintLabel(panel.transform, "Hints", 13,
+            new Color(0.92f, 0.92f, 0.92f, 1f));
+    }
+
+    Text CreateHintLabel(Transform parent, string name, int fontSize, Color color)
+    {
+        GameObject obj = new GameObject(name, typeof(RectTransform));
+        obj.transform.SetParent(parent, false);
+        Text text = obj.AddComponent<Text>();
+        text.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        text.alignment = TextAnchor.UpperLeft;
+        text.horizontalOverflow = HorizontalWrapMode.Wrap;
+        text.verticalOverflow = VerticalWrapMode.Overflow;
+        text.raycastTarget = false;
+        text.color = color;
+        text.fontSize = fontSize;
+        text.text = "";
+        obj.AddComponent<ContentSizeFitter>().verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+        return text;
     }
 
     // The build log, top-left: a header that collapses the feed, and the
@@ -382,6 +438,16 @@ public class BuildMenu : MonoBehaviour
             heightText.text = $"Height ×{height / placementSystem.BaseHeight:0.##}  ({height:0.##}m)";
         }
 
+        // The hint panel follows the tool's phase, so it re-reads only
+        // when the context line changes rather than every frame.
+        placementSystem.ModifierHints(out string context, out string hints);
+        if (context != hintContextSeen)
+        {
+            hintContextSeen = context;
+            hintHeaderText.text = context;
+            hintText.text = hints;
+        }
+
         if (BuildLog.Version != logVersionSeen)
         {
             logVersionSeen = BuildLog.Version;
@@ -407,6 +473,11 @@ public class BuildMenu : MonoBehaviour
         offsetToggle.SetIsOnWithoutNotify(placementSystem.Mode == GridPlacementSystem.ToolMode.Offset);
         roomButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Room
             ? selectedColor : buttonColor;
+        bool roomTool = placementSystem.Mode == GridPlacementSystem.ToolMode.Room;
+        foreach ((Image image, GridPlacementSystem.RoomAction task) in roomTaskButtons)
+            if (image != null)
+                image.color = roomTool && placementSystem.RoomTask == task
+                    ? selectedColor : buttonColor;
         deleteButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Delete
             ? deleteActiveColor : buttonColor;
     }
@@ -414,7 +485,8 @@ public class BuildMenu : MonoBehaviour
     // The Room tool: chained wall placement that closes into a designated
     // room (floor now, roof when the walls crown level). The active shape
     // helper applies — Circle or Rectangle draws the whole room in one
-    // gesture.
+    // gesture. Its two jobs open in the item row like a category's
+    // contents: Build (the default) and Designate.
     void ToggleRoomMode()
     {
         if (placementSystem == null)
@@ -423,10 +495,35 @@ public class BuildMenu : MonoBehaviour
         bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Room;
         placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Room : GridPlacementSystem.ToolMode.Build);
         if (entering)
+            ShowRoomTasks();
+        else
         {
             itemRow.gameObject.SetActive(false);
             openCategory = null;
         }
+    }
+
+    // Build chains walls into a new room; Designate hands an EXISTING
+    // enclosure a floor and roof, and only runs while it's picked.
+    void ShowRoomTasks()
+    {
+        openCategory = null;
+        roomTaskButtons.Clear();
+        foreach (Transform child in itemRow)
+            Destroy(child.gameObject);
+        AddRoomTaskButton("Build", GridPlacementSystem.RoomAction.Build);
+        AddRoomTaskButton("Designate", GridPlacementSystem.RoomAction.Designate);
+        itemRow.gameObject.SetActive(true);
+    }
+
+    void AddRoomTaskButton(string label, GridPlacementSystem.RoomAction task)
+    {
+        GameObject button = CreateButton(itemRow, label, () =>
+        {
+            if (placementSystem != null)
+                placementSystem.SetRoomTask(task);
+        });
+        roomTaskButtons.Add((button.GetComponent<Image>(), task));
     }
 
     void ToggleDeleteMode()
@@ -512,6 +609,7 @@ public class BuildMenu : MonoBehaviour
         }
 
         openCategory = category.categoryName;
+        roomTaskButtons.Clear();
         foreach (Transform child in itemRow)
             Destroy(child.gameObject);
 
