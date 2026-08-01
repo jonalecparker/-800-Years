@@ -31,18 +31,29 @@ public class BuildMenu : MonoBehaviour
     private RectTransform itemRow;
     private string openCategory;
     private Image deleteButtonImage;
-    private Image curveButtonImage;
-    private Image offsetButtonImage;
+    private Image roomButtonImage;
+    private Toggle curvedToggle;
+    private Toggle offsetToggle;
+    private Toggle circleToggle;
+    private Toggle rectToggle;
     private GameObject dragCountPanel;
     private Text dragCountText;
     private GameObject heightPanel;
     private Text heightText;
+    private GameObject logBody;
+    private Text logText;
+    private Text logHeaderText;
+    private bool logCollapsed;
+    private int logVersionSeen = -1;
+
+    const int LogLinesShown = 6;
 
     void Start()
     {
         if (categories == null || categories.Length == 0)
             categories = DefaultCategories();
 
+        BuildLog.Clear();
         EnsureEventSystem();
         BuildUI();
     }
@@ -58,7 +69,9 @@ public class BuildMenu : MonoBehaviour
             new MenuCategory
             {
                 categoryName = "Walls",
-                items = new[] { new MenuItem { itemName = "Wall Segment", prefab = wallPrefab } }
+                // The bottom of the wall-type ladder. One type exists so
+                // far; stronger walls join this list as they're designed.
+                items = new[] { new MenuItem { itemName = "Palisade", prefab = wallPrefab } }
             }
         };
     }
@@ -97,15 +110,12 @@ public class BuildMenu : MonoBehaviour
             CreateButton(categoryRow, capturedCategory.categoryName, () => ToggleCategory(capturedCategory));
         }
 
-        // Curved toggles the build tool between straight runs and the
-        // three-click curve flow; it stays lit while the curve shape is
-        // armed. Offset arms the parallel-wall tool (click a wall, scroll
-        // the distance, click to lay a parallel copy). Delete sits
-        // beside them: one click arms the delete tool (button turns
-        // red), a second click — or picking any build item — returns to
-        // building.
-        curveButtonImage = CreateButton(categoryRow, "Curved", ToggleCurveShape).GetComponent<Image>();
-        offsetButtonImage = CreateButton(categoryRow, "Offset", ToggleOffsetMode).GetComponent<Image>();
+        // The bar holds objects and tools: build items by category, the
+        // Room tool, and Delete (one click arms it — button turns red — a
+        // second click or picking any build item returns to building).
+        // Gesture helpers (Curved, Offset, Circle, Rectangle) live as
+        // checkboxes in the options panel instead.
+        roomButtonImage = CreateButton(categoryRow, "Room", ToggleRoomMode).GetComponent<Image>();
         deleteButtonImage = CreateButton(categoryRow, "Delete", ToggleDeleteMode).GetComponent<Image>();
 
         // Small readouts tucked above the bar's right end: the wall height
@@ -119,11 +129,84 @@ public class BuildMenu : MonoBehaviour
         heightPanel.SetActive(false);
 
         CreateOptionsPanel(canvasObj.transform);
+        CreateLogPanel(canvasObj.transform);
     }
 
-    // Session option toggles, stacked on the left edge above the bar.
-    // First one: lock the wall top level (bottom follows the terrain
-    // down) instead of the default fixed height above the ground.
+    // The build log, top-left: a header that collapses the feed, and the
+    // last few BuildLog entries newest-first — why a room came out
+    // floor-only, what a gesture refusal meant, what a breach did.
+    void CreateLogPanel(Transform parent)
+    {
+        GameObject panel = new GameObject("BuildLogPanel", typeof(RectTransform));
+        panel.transform.SetParent(parent, false);
+        RectTransform rt = panel.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0f, 1f);
+        rt.anchorMax = new Vector2(0f, 1f);
+        rt.pivot = new Vector2(0f, 1f);
+        rt.anchoredPosition = new Vector2(8f, -8f);
+        rt.sizeDelta = new Vector2(460f, 0f);
+
+        VerticalLayoutGroup layout = panel.AddComponent<VerticalLayoutGroup>();
+        layout.spacing = 2f;
+        layout.childForceExpandWidth = true;
+        layout.childForceExpandHeight = false;
+        ContentSizeFitter fitter = panel.AddComponent<ContentSizeFitter>();
+        fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+        GameObject header = new GameObject("LogHeader", typeof(RectTransform));
+        header.transform.SetParent(panel.transform, false);
+        header.AddComponent<LayoutElement>().minHeight = 24f;
+        Image headerBg = header.AddComponent<Image>();
+        headerBg.color = barColor;
+        Button headerButton = header.AddComponent<Button>();
+        headerButton.targetGraphic = headerBg;
+        headerButton.onClick.AddListener(() =>
+        {
+            logCollapsed = !logCollapsed;
+            logBody.SetActive(!logCollapsed);
+            logHeaderText.text = logCollapsed ? "Build Log [+]" : "Build Log [-]";
+        });
+        GameObject headerTextObj = new GameObject("Label", typeof(RectTransform));
+        headerTextObj.transform.SetParent(header.transform, false);
+        RectTransform headerTextRt = headerTextObj.GetComponent<RectTransform>();
+        headerTextRt.anchorMin = Vector2.zero;
+        headerTextRt.anchorMax = Vector2.one;
+        headerTextRt.offsetMin = new Vector2(8f, 0f);
+        headerTextRt.offsetMax = Vector2.zero;
+        logHeaderText = headerTextObj.AddComponent<Text>();
+        logHeaderText.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        logHeaderText.alignment = TextAnchor.MiddleLeft;
+        logHeaderText.color = Color.white;
+        logHeaderText.fontSize = 14;
+        logHeaderText.text = "Build Log [-]";
+
+        logBody = new GameObject("LogBody", typeof(RectTransform));
+        logBody.transform.SetParent(panel.transform, false);
+        Image bodyBg = logBody.AddComponent<Image>();
+        bodyBg.color = new Color(barColor.r, barColor.g, barColor.b, barColor.a * 0.85f);
+        VerticalLayoutGroup bodyLayout = logBody.AddComponent<VerticalLayoutGroup>();
+        bodyLayout.padding = new RectOffset(8, 8, 6, 6);
+        bodyLayout.childForceExpandWidth = true;
+        bodyLayout.childForceExpandHeight = false;
+        ContentSizeFitter bodyFitter = logBody.AddComponent<ContentSizeFitter>();
+        bodyFitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+        GameObject textObj = new GameObject("Entries", typeof(RectTransform));
+        textObj.transform.SetParent(logBody.transform, false);
+        logText = textObj.AddComponent<Text>();
+        logText.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        logText.alignment = TextAnchor.UpperLeft;
+        logText.color = new Color(0.92f, 0.92f, 0.92f, 1f);
+        logText.fontSize = 13;
+        logText.text = "";
+    }
+
+    // The helper panel on the left edge above the bar: gesture helpers
+    // first (Curved bends the wall drag; Offset arms the parallel-wall
+    // tool; Circle and Rectangle turn the drag into a whole figure, for
+    // walls AND rooms), then session options like the top lock. The
+    // shape checkboxes are mutually exclusive — Update() keeps all of
+    // them honest against the placement system's actual state.
     void CreateOptionsPanel(Transform parent)
     {
         GameObject panel = new GameObject("OptionsPanel", typeof(RectTransform));
@@ -149,13 +232,52 @@ public class BuildMenu : MonoBehaviour
         ContentSizeFitter fitter = panel.AddComponent<ContentSizeFitter>();
         fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
 
+        curvedToggle = CreateToggleRow(panel.transform, "Curved", false,
+            on => SetShapeChecked(GridPlacementSystem.BuildShape.Curved, on));
+        offsetToggle = CreateToggleRow(panel.transform, "Offset", false, on =>
+        {
+            if (placementSystem == null)
+                return;
+            placementSystem.SetMode(on
+                ? GridPlacementSystem.ToolMode.Offset
+                : GridPlacementSystem.ToolMode.Build);
+            if (on)
+            {
+                itemRow.gameObject.SetActive(false);
+                openCategory = null;
+            }
+        });
+        circleToggle = CreateToggleRow(panel.transform, "Circle", false,
+            on => SetShapeChecked(GridPlacementSystem.BuildShape.Circle, on));
+        rectToggle = CreateToggleRow(panel.transform, "Rectangle", false,
+            on => SetShapeChecked(GridPlacementSystem.BuildShape.Rect, on));
         CreateToggleRow(panel.transform, "Lock top height", false,
             on => { if (placementSystem != null) placementSystem.lockTopHeight = on; });
     }
 
+    // Checking a shape arms it (leaving Delete/Offset for the build tool
+    // if one of those was in hand — the shape rides Build and Room);
+    // unchecking falls back to straight/freeform.
+    void SetShapeChecked(GridPlacementSystem.BuildShape shape, bool on)
+    {
+        if (placementSystem == null)
+            return;
+        if (on)
+        {
+            if (placementSystem.Mode == GridPlacementSystem.ToolMode.Delete
+                || placementSystem.Mode == GridPlacementSystem.ToolMode.Offset)
+                placementSystem.SetMode(GridPlacementSystem.ToolMode.Build);
+            placementSystem.SetShape(shape);
+        }
+        else if (placementSystem.Shape == shape)
+        {
+            placementSystem.SetShape(GridPlacementSystem.BuildShape.Straight);
+        }
+    }
+
     // A checkbox row: box + checkmark + label, clickable anywhere on the
     // row (the label Text is a raycast target too).
-    void CreateToggleRow(Transform parent, string label, bool initial, UnityEngine.Events.UnityAction<bool> onChanged)
+    Toggle CreateToggleRow(Transform parent, string label, bool initial, UnityEngine.Events.UnityAction<bool> onChanged)
     {
         GameObject row = new GameObject(label + "Toggle", typeof(RectTransform));
         row.transform.SetParent(parent, false);
@@ -202,6 +324,7 @@ public class BuildMenu : MonoBehaviour
         toggle.graphic = checkImage;
         toggle.isOn = initial;
         toggle.onValueChanged.AddListener(onChanged);
+        return toggle;
     }
 
     GameObject CreateReadout(Transform parent, string name, Vector2 anchoredPosition, Vector2 size, out Text text)
@@ -258,38 +381,47 @@ public class BuildMenu : MonoBehaviour
             float height = placementSystem.EffectiveWallHeight;
             heightText.text = $"Height ×{height / placementSystem.BaseHeight:0.##}  ({height:0.##}m)";
         }
-    }
 
-    void ToggleCurveShape()
-    {
-        if (placementSystem == null)
-            return;
-
-        // Arming a build shape always puts the build tool back in hand.
-        if (placementSystem.Mode != GridPlacementSystem.ToolMode.Build)
+        if (BuildLog.Version != logVersionSeen)
         {
-            placementSystem.SetMode(GridPlacementSystem.ToolMode.Build);
-            deleteButtonImage.color = buttonColor;
-            offsetButtonImage.color = buttonColor;
+            logVersionSeen = BuildLog.Version;
+            int shownLines = Mathf.Min(LogLinesShown, BuildLog.Entries.Count);
+            var lines = new System.Text.StringBuilder();
+            for (int i = 0; i < shownLines; i++)
+            {
+                if (i > 0)
+                    lines.Append('\n');
+                lines.Append(BuildLog.Entries[BuildLog.Entries.Count - 1 - i]);
+            }
+            logText.text = lines.ToString();
+            logBody.SetActive(!logCollapsed && BuildLog.Entries.Count > 0);
         }
 
-        bool entering = placementSystem.Shape == GridPlacementSystem.BuildShape.Straight;
-        placementSystem.SetShape(entering
-            ? GridPlacementSystem.BuildShape.Curved
-            : GridPlacementSystem.BuildShape.Straight);
-        curveButtonImage.color = entering ? selectedColor : buttonColor;
+        // The checkboxes and tool buttons mirror the placement system's
+        // actual state rather than tracking their own — arming any tool
+        // or shape by any route updates every control, and the shape
+        // boxes stay mutually exclusive for free.
+        curvedToggle.SetIsOnWithoutNotify(placementSystem.Shape == GridPlacementSystem.BuildShape.Curved);
+        circleToggle.SetIsOnWithoutNotify(placementSystem.Shape == GridPlacementSystem.BuildShape.Circle);
+        rectToggle.SetIsOnWithoutNotify(placementSystem.Shape == GridPlacementSystem.BuildShape.Rect);
+        offsetToggle.SetIsOnWithoutNotify(placementSystem.Mode == GridPlacementSystem.ToolMode.Offset);
+        roomButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Room
+            ? selectedColor : buttonColor;
+        deleteButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Delete
+            ? deleteActiveColor : buttonColor;
     }
 
-    void ToggleOffsetMode()
+    // The Room tool: chained wall placement that closes into a designated
+    // room (floor now, roof when the walls crown level). The active shape
+    // helper applies — Circle or Rectangle draws the whole room in one
+    // gesture.
+    void ToggleRoomMode()
     {
         if (placementSystem == null)
             return;
 
-        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Offset;
-        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Offset : GridPlacementSystem.ToolMode.Build);
-        offsetButtonImage.color = entering ? selectedColor : buttonColor;
-        deleteButtonImage.color = buttonColor;
-
+        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Room;
+        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Room : GridPlacementSystem.ToolMode.Build);
         if (entering)
         {
             itemRow.gameObject.SetActive(false);
@@ -304,9 +436,6 @@ public class BuildMenu : MonoBehaviour
 
         bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Delete;
         placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Delete : GridPlacementSystem.ToolMode.Build);
-        deleteButtonImage.color = entering ? deleteActiveColor : buttonColor;
-        offsetButtonImage.color = buttonColor;
-
         if (entering)
         {
             itemRow.gameObject.SetActive(false);
@@ -402,10 +531,9 @@ public class BuildMenu : MonoBehaviour
             if (item.prefab != null)
                 placementSystem.piecePrefab = item.prefab;
 
-            // Picking something to build always disarms the other tools.
+            // Picking something to build always disarms the other tools
+            // (the bar and checkboxes re-sync from state in Update).
             placementSystem.SetMode(GridPlacementSystem.ToolMode.Build);
-            deleteButtonImage.color = buttonColor;
-            offsetButtonImage.color = buttonColor;
         }
 
         itemRow.gameObject.SetActive(false);

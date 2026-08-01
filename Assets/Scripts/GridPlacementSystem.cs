@@ -67,10 +67,13 @@ public class GridPlacementSystem : MonoBehaviour
     // instead of the top riding the ground section by section.
     public bool lockTopHeight;
 
-    public enum ToolMode { Build, Delete, Offset }
+    public enum ToolMode { Build, Delete, Offset, Room }
     public ToolMode Mode { get; private set; } = ToolMode.Build;
 
-    public enum BuildShape { Straight, Curved }
+    // Straight and Curved shape the wall tool's drag; Circle and Rect are
+    // whole-figure gestures (center-out ring, corner-to-corner box) that
+    // apply to whichever tool is in hand — walls or rooms.
+    public enum BuildShape { Straight, Curved, Circle, Rect }
     public BuildShape Shape { get; private set; } = BuildShape.Straight;
 
     // True while a curve is in its bend-adjust phase, where the plain
@@ -121,7 +124,13 @@ public class GridPlacementSystem : MonoBehaviour
     {
         get
         {
-            if (Mode == ToolMode.Delete || previewBlocked)
+            if (Mode == ToolMode.Delete)
+                return 0;
+            if (Shape == BuildShape.Circle || Shape == BuildShape.Rect)
+                return shapeBlocked ? 0 : shapeSpecs.Count;
+            if (Mode == ToolMode.Room)
+                return roomFixedSpecs.Count + (roomLiveBlocked ? 0 : roomLiveSpecs.Count);
+            if (previewBlocked)
                 return 0;
             return splineSpecs.Count;
         }
@@ -169,11 +178,11 @@ public class GridPlacementSystem : MonoBehaviour
     private readonly List<Transform> doomedSections = new List<Transform>();
     private readonly List<WallEdge.SectionSpec> splineSpecs = new List<WallEdge.SectionSpec>();
     private readonly List<Mesh> previewMeshes = new List<Mesh>();
-    private (Vector3 start, Vector3 end, float bulge, float apexT, float height, float topY, float trimStart, float trimEnd)? lastPreviewKey;
+    private (Vector3 start, Vector3 end, float bulge, float apexT, float height, float topY, float baseY, float trimStart, float trimEnd)? lastPreviewKey;
     // The TRUE curve a release will commit — the preview may trim its
     // display back to a host's face, but the graph always gets the full
     // centerline-to-centerline gesture.
-    private (Vector3 s, Vector3 c, Vector3 e, float height, float topY)? pendingCommit;
+    private (Vector3 s, Vector3 c, Vector3 e, float height, float topY, float baseY)? pendingCommit;
     private (WallEdge edge, float height)? lastCourseKey;
     private bool previewBlocked;
     private List<WallGraph.Crossing> previewCrossings = new List<WallGraph.Crossing>();
@@ -206,6 +215,15 @@ public class GridPlacementSystem : MonoBehaviour
     private Vector3? splineStart;
     private Vector3? splineEnd;
     private WallEdgeSection deleteAnchor;
+    // What release will actually remove, as per-edge index ranges — the
+    // overlay list above is just its visual shadow.
+    private readonly List<(WallEdge edge, int lo, int hi)> deleteRanges =
+        new List<(WallEdge edge, int lo, int hi)>();
+    // Marquee state: a press on empty ground rubber-bands a screen rect;
+    // everything whose center lands inside dies on release.
+    private Vector2? marqueeStart;
+    private Vector2? marqueeEnd;
+    private readonly List<WallRoom> marqueeRooms = new List<WallRoom>();
     private WallEdge offsetSource;
     private float offsetDistance = 3f;
     private float offsetSide = 1f;
@@ -224,6 +242,76 @@ public class GridPlacementSystem : MonoBehaviour
     private readonly List<GameObject> nodeGhostPool = new List<GameObject>();
     private readonly List<Mesh> nodeGhostMeshes = new List<Mesh>();
     private readonly List<float> nodeGhostHeights = new List<float>();
+    // Room tool chain: vertices fixed so far, the baked segments' preview
+    // meshes (held until the loop closes or cancels), and the live
+    // segment following the cursor. The chain carries ONE height and one
+    // locked top, captured at the first click.
+    private readonly List<Vector3> roomChain = new List<Vector3>();
+    private EndSnap? roomStartAttach;
+    private float roomChainHeight;
+    private float roomChainTopY;
+    private readonly List<WallEdge.SectionSpec> roomFixedSpecs = new List<WallEdge.SectionSpec>();
+    private readonly List<Mesh> roomFixedMeshes = new List<Mesh>();
+    private readonly List<WallEdge.SectionSpec> roomLiveSpecs = new List<WallEdge.SectionSpec>();
+    private readonly List<Mesh> roomLiveMeshes = new List<Mesh>();
+    private (Vector3 a, Vector3 b, float h, float topY, float trimA, float trimB)? lastRoomKey;
+    private bool roomLiveBlocked;
+    private bool roomLiveClosing;
+    // Circle/Rect gesture state: the anchor (circle center or first
+    // corner), the whole figure's preview specs, and the crossing points
+    // it would split (shown as gold posts).
+    private Vector3? shapeAnchor;
+    private readonly List<WallEdge.SectionSpec> shapeSpecs = new List<WallEdge.SectionSpec>();
+    private readonly List<Mesh> shapeMeshes = new List<Mesh>();
+    private readonly List<Vector3> shapeCrossings = new List<Vector3>();
+    private (Vector3 anchor, Vector3 to, float w, float h, float topY)? lastShapeKey;
+    private bool shapeBlocked;
+    // Rotated-rect gesture: the first side's far end (fixed by click 2)
+    // and the anchor's snap, kept for relative Shift-stepping and the
+    // corner-angle arc while the side is laid along existing masonry.
+    private Vector3? shapeSideEnd;
+    private EndSnap? shapeAnchorSnap;
+    // Ctrl+click plants the side's MIDPOINT instead of a corner — on a
+    // free wall end the side poses perpendicular to that wall, so a
+    // curtain wall runs into the center of the tower face (the classic
+    // corner-tower junction). Click 2 bakes the derived corners and the
+    // rest of the gesture proceeds as usual.
+    private bool shapeCentered;
+    // The figure's locked-top plane, captured AT THE ANCHOR CLICK while
+    // the hover snap still feeds EffectiveWallHeight — ground(anchor) +
+    // adopted height puts a snapped figure's plane exactly at the
+    // host's. Recomputing later would silently use the HUD height (the
+    // hover snap is gone by the drag frames) and miss by a step.
+    private float shapeTopY = float.NegativeInfinity;
+    // White alignment lines: shown whenever a point being placed lines
+    // up with existing masonry.
+    private readonly List<(Vector3 from, Vector3 to)> alignLines =
+        new List<(Vector3, Vector3)>();
+    private readonly List<LineRenderer> alignPool = new List<LineRenderer>();
+    private Material alignMaterial;
+    // The figure's edges as last previewed — exactly what a commit lays.
+    private readonly List<(Vector3 s, Vector3 c, Vector3 e)> shapeEdgesLive =
+        new List<(Vector3 s, Vector3 c, Vector3 e)>();
+    // On-figure dimension labels (side, width, radius), cleared per frame
+    // — the answer to "are my towers actually the same size?"
+    private readonly List<(Vector3 from, Vector3 to, float distance)> dimGuides =
+        new List<(Vector3, Vector3, float)>();
+    // Elevated ground: hovering a room slab (roof deck or floor) makes
+    // its top the gesture's base — walls stand ON it instead of falling
+    // to the terrain. Captured per gesture at the anchor click.
+    private float? hoverBaseY;
+    private float? anchorBaseY;
+    private float? roomChainBaseY;
+    private float? shapeBaseY;
+    // Shape gestures adopt a snapped anchor's height like walls do.
+    private float? shapeSnapHeight;
+
+    const int CircleSegments = 8;
+    const float MinCircleRadius = 1.5f;
+    const float MinRectSide = 1f;
+    // A figure side at least this coincident with existing masonry is
+    // reused instead of redrawn.
+    const float ReuseCoverage = 0.9f;
 
     void Start()
     {
@@ -260,16 +348,23 @@ public class GridPlacementSystem : MonoBehaviour
         // state and the corner-angle readout.
         guideCenter = null;
         activeAngle = null;
+        dimGuides.Clear();
+        alignLines.Clear();
         snapTint = false;
         hoverSnap = null;
         hoverSnapYaw = null;
         hoverSnapHeight = null;
+        hoverBaseY = null;
         pendingNodeGhosts.Clear();
 
         if (Mode == ToolMode.Delete)
-            UpdateDelete(mouse, ray, overUI);
+            UpdateDelete(mouse, keyboard, ray, overUI);
         else if (Mode == ToolMode.Offset)
             UpdateOffset(mouse, keyboard, ray, overUI);
+        else if (Shape == BuildShape.Circle || Shape == BuildShape.Rect)
+            UpdateShapeGesture(mouse, keyboard, ray, overUI, Mode == ToolMode.Room);
+        else if (Mode == ToolMode.Room)
+            UpdateRoom(mouse, keyboard, ray, overUI);
         else
             UpdateBuild(mouse, keyboard, ray, overUI);
 
@@ -280,6 +375,7 @@ public class GridPlacementSystem : MonoBehaviour
             heightOverride = false;
 
         UpdateDistanceGuides();
+        UpdateAlignGuides();
         UpdateAngleGuide();
         UpdateNodeGhostVisuals();
     }
@@ -292,11 +388,11 @@ public class GridPlacementSystem : MonoBehaviour
         if (Mode == mode)
             return;
         Mode = mode;
-        deleteAnchor = null;
         offsetSource = null;
-        doomedSections.Clear();
         CancelCurve();
-        HideDeleteOverlays();
+        CancelShape();
+        CancelRoomChain();
+        CancelDelete();
     }
 
     public void SetShape(BuildShape shape)
@@ -305,6 +401,8 @@ public class GridPlacementSystem : MonoBehaviour
             return;
         Shape = shape;
         CancelCurve();
+        CancelShape();
+        CancelRoomChain();
     }
 
     void UpdateBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
@@ -377,6 +475,7 @@ public class GridPlacementSystem : MonoBehaviour
                     anchorSnap = hoverSnap;
                     anchorSnapYaw = hoverSnapYaw;
                     anchorSnapHeight = hoverSnapHeight;
+                    anchorBaseY = hoverBaseY;
                 }
             }
             else
@@ -397,12 +496,12 @@ public class GridPlacementSystem : MonoBehaviour
                 // outranks length stepping while it holds. Failing that, a
                 // wall's centerline grabs the end: the wall terminates
                 // there and the commit T-splits the host, at any angle.
-                if (!freePlace && TryNodeSnap(rawSurface, splineStart, out EndSnap endSnap))
+                if (!freePlace && TryNodeSnap(rawSurface, splineStart, anchorBaseY, out EndSnap endSnap))
                 {
                     splineEnd = endSnap.point;
                     dragEndSnap = endSnap;
                 }
-                else if (!freePlace && TryFlankSnap(rawSurface, splineStart, out EndSnap flankSnap))
+                else if (!freePlace && TryFlankSnap(rawSurface, splineStart, anchorBaseY, out EndSnap flankSnap))
                 {
                     splineEnd = flankSnap.point;
                     dragEndSnap = flankSnap;
@@ -411,24 +510,25 @@ public class GridPlacementSystem : MonoBehaviour
                 {
                     splineEnd = SteppedDragEnd(splineStart.Value, rawSurface, freePlace, snapAngle);
                     dragEndSnap = null;
-                    // A flank-anchored drag is fully free by default;
-                    // holding Shift steps its direction FROM the face
-                    // normal in angleStep increments, so a lazy
-                    // Shift-drag lands exactly 90° flush and deliberate
-                    // angles land on clean steps off the host's face.
-                    if (!freePlace && snapAngle && anchorSnap.HasValue && anchorSnap.Value.isFlank)
+                    // A snapped-anchor drag is fully free by default;
+                    // holding Shift steps its direction RELATIVE to the
+                    // anchor's own masonry (nearest member run at a node,
+                    // host arms on a flank), so a lazy Shift-drag off a
+                    // face lands exactly 90° flush and stepped corners
+                    // read clean multiples even off the world grid.
+                    if (!freePlace && snapAngle && anchorSnap.HasValue)
                     {
                         Vector3 d = splineEnd.Value - splineStart.Value;
                         d.y = 0f;
-                        float len = d.magnitude;
-                        if (len > 0.001f)
+                        if (d.sqrMagnitude > 0.000001f)
                         {
-                            float rel = Vector3.SignedAngle(anchorSnap.Value.outDir, d, Vector3.up);
-                            float snapped = Mathf.Round(rel / angleStep) * angleStep;
-                            Vector3 dir = Quaternion.AngleAxis(snapped, Vector3.up) * anchorSnap.Value.outDir;
-                            splineEnd = splineStart.Value + dir * len;
+                            float dragB = Mathf.Atan2(d.z, d.x) * Mathf.Rad2Deg;
+                            splineEnd = StepBearingFrom(
+                                AngleRefBearing(anchorSnap.Value, dragB),
+                                splineStart.Value, splineEnd.Value);
                         }
                     }
+                    AddExtensionAlignGuides(splineEnd.Value);
                 }
             }
 
@@ -479,7 +579,8 @@ public class GridPlacementSystem : MonoBehaviour
             // The corner-angle readout only means something for a kinked
             // joint — a tangent-tied connector has no corner by design.
             if (anchorSnap.HasValue && !tangentTied && FlatDistance(anchor, end) >= 0.25f)
-                activeAngle = (anchor, anchorSnap.Value.backBearing, guideBearing);
+                activeAngle = (anchor,
+                    AngleRefBearing(anchorSnap.Value, guideBearing), guideBearing);
 
             if (mouse.leftButton.wasReleasedThisFrame)
                 CommitSpline();
@@ -545,8 +646,19 @@ public class GridPlacementSystem : MonoBehaviour
             MeshFilter filter = end.GetComponent<MeshFilter>();
             SetGhostMesh(ghost, filter != null ? filter.sharedMesh : null);
             SetGhostTint(ghost, snapColor);
-            ghost.transform.SetPositionAndRotation(end.transform.position, end.transform.rotation);
-            ghost.transform.localScale = Vector3.one * DeleteOverlayScale;
+            FitShell(ghost.transform, end.transform, filter != null ? filter.sharedMesh : null);
+        }
+        // The node's own post glows too — without it the joint reads as
+        // two separate highlighted pieces with a dark seam between them,
+        // as if two nodes overlapped there.
+        MeshFilter postFilter = node.GetComponent<MeshFilter>();
+        if (postFilter != null && postFilter.sharedMesh != null)
+        {
+            GameObject ghost = GetPooled(ghostPool, count++, snapColor, "PlacementPreview");
+            ghost.SetActive(true);
+            SetGhostMesh(ghost, postFilter.sharedMesh);
+            SetGhostTint(ghost, snapColor);
+            FitShell(ghost.transform, node.transform, postFilter.sharedMesh);
         }
         for (int i = count; i < ghostPool.Count; i++)
             ghostPool[i].SetActive(false);
@@ -717,6 +829,7 @@ public class GridPlacementSystem : MonoBehaviour
                     anchorSnap = hoverSnap;
                     anchorSnapYaw = hoverSnapYaw;
                     anchorSnapHeight = hoverSnapHeight;
+                    anchorBaseY = hoverBaseY;
                 }
             }
             else
@@ -738,7 +851,7 @@ public class GridPlacementSystem : MonoBehaviour
                 if (chordSnap.HasValue && chordSnap.Value.isFlank)
                     chordSnap = null;
                 if (!freePlace && !chordSnap.HasValue
-                    && TryFlankSnap(rawSurface, splineStart, out EndSnap chordFlank))
+                    && TryFlankSnap(rawSurface, splineStart, anchorBaseY, out EndSnap chordFlank))
                 {
                     chordSnap = chordFlank;
                     point = chordFlank.point;
@@ -753,7 +866,8 @@ public class GridPlacementSystem : MonoBehaviour
                 guideCenter = (splineStart.Value + point) * 0.5f;
                 guideBearing = Mathf.Atan2(point.z - splineStart.Value.z, point.x - splineStart.Value.x) * Mathf.Rad2Deg;
                 if (anchorSnap.HasValue && FlatDistance(splineStart.Value, point) >= 0.25f)
-                    activeAngle = (splineStart.Value, anchorSnap.Value.backBearing, guideBearing);
+                    activeAngle = (splineStart.Value,
+                        AngleRefBearing(anchorSnap.Value, guideBearing), guideBearing);
                 Vector3 flat = point - splineStart.Value;
                 flat.y = 0f;
                 if (flat.sqrMagnitude > 0.25f
@@ -798,7 +912,8 @@ public class GridPlacementSystem : MonoBehaviour
             guideBearing = Mathf.Atan2(splineEnd.Value.z - splineStart.Value.z,
                 splineEnd.Value.x - splineStart.Value.x) * Mathf.Rad2Deg;
             if (anchorSnap.HasValue)
-                activeAngle = (splineStart.Value, anchorSnap.Value.backBearing, guideBearing);
+                activeAngle = (splineStart.Value,
+                    AngleRefBearing(anchorSnap.Value, guideBearing), guideBearing);
 
             if (mouse.leftButton.wasPressedThisFrame)
                 CommitSpline();
@@ -813,13 +928,14 @@ public class GridPlacementSystem : MonoBehaviour
     {
         if (!previewBlocked && splineSpecs.Count > 0 && pendingCommit.HasValue)
         {
-            (Vector3 s, Vector3 c, Vector3 e, float height, float topY) = pendingCommit.Value;
-            WallGraph.CommitEdge(splineParent, s, c, e, EdgeParamsNow(height, topY));
+            (Vector3 s, Vector3 c, Vector3 e, float height, float topY, float baseY) = pendingCommit.Value;
+            WallGraph.CommitEdge(splineParent, s, c, e, EdgeParamsNow(height, topY, baseY));
         }
         CancelCurve();
     }
 
-    WallGraph.EdgeParams EdgeParamsNow(float height, float topY)
+    WallGraph.EdgeParams EdgeParamsNow(float height, float topY,
+        float baseY = float.NegativeInfinity)
     {
         return new WallGraph.EdgeParams
         {
@@ -829,8 +945,31 @@ public class GridPlacementSystem : MonoBehaviour
             targetSectionLength = gridSize,
             baseStep = baseStepSize,
             fixedTopY = topY,
+            baseY = baseY,
             material = wallMaterial,
         };
+    }
+
+    // Cursor surface for the room/shape tools: the first non-trigger hit
+    // flattened, plus the slab top when that hit is a room's roof deck or
+    // floor — elevated ground the gesture builds on.
+    bool TryGetBuildSurface(Ray ray, out Vector3 point, out float? deckY)
+    {
+        point = default;
+        deckY = null;
+        RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (RaycastHit hit in hits)
+        {
+            if (hit.collider.isTrigger)
+                continue;
+            point = new Vector3(hit.point.x, 0f, hit.point.z);
+            WallRoom room = hit.collider.GetComponentInParent<WallRoom>();
+            if (room != null)
+                deckY = hit.collider.gameObject.name == "RoomRoof" ? room.roofY : room.floorY;
+            return true;
+        }
+        return false;
     }
 
     void CommitCourse(WallEdge below)
@@ -857,9 +996,933 @@ public class GridPlacementSystem : MonoBehaviour
         anchorSnap = null;
         anchorSnapYaw = null;
         anchorSnapHeight = null;
+        anchorBaseY = null;
         heightOverride = false;
         dragEndSnap = null;
         pendingNodeGhosts.Clear();
+        HideGhosts();
+    }
+
+    // Circle and Rect: whole-figure gestures shared by the wall and room
+    // tools. Press plants the anchor (circle center / first corner), the
+    // drag sizes the figure — radius and sides step in lengthStep, Shift
+    // squares the rectangle, Alt frees — and release commits every edge
+    // through the graph (splitting whatever they cross, gold posts
+    // previewing the joints). With the Room tool in hand the closed
+    // figure designates its face as a room in the same act.
+    void UpdateShapeGesture(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI, bool designate)
+    {
+        HandleHeightScroll(mouse, keyboard);
+        if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
+        {
+            CancelShape();
+            return;
+        }
+
+        bool freePlace = keyboard != null && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
+        // Shift's meaning follows the phase: 5° direction steps while
+        // laying the rect's first side, the square constraint while
+        // pulling its width.
+        bool shiftHeld = keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
+        Vector3 raw = default;
+        float? deckY = null;
+        bool hasPoint = !overUI && TryGetBuildSurface(ray, out raw, out deckY);
+        // Snapping works on decks too, filtered to that deck's own walls
+        // — the masonry a storey down never grabs the gesture.
+        bool canSnap = !freePlace;
+        hoverBaseY = deckY;
+
+        if (!shapeAnchor.HasValue)
+        {
+            if (!hasPoint)
+            {
+                HideGhosts();
+                return;
+            }
+            // The anchor snaps like any wall end: onto a node, or onto a
+            // host's centerline — so a rect drawn against a wall starts
+            // ON the wall's line, not half a thickness off on its face.
+            // The snapped wall's height AND storey are adopted, and the
+            // hover borrows the wall tool's presentation (highlight or
+            // face-flush stub) instead of burying a ghost box in the host.
+            Vector3 point = raw;
+            EndSnap? attach = null;
+            if (canSnap && TryNodeSnap(raw, null, deckY, out EndSnap nodeSnap))
+            {
+                attach = nodeSnap;
+                point = nodeSnap.point;
+                if (nodeSnap.edge != null)
+                    hoverSnapHeight = SnapHeightOf(nodeSnap.edge, nodeSnap.point);
+                AdoptSnapElevation(nodeSnap);
+            }
+            else if (canSnap && TryFlankSnap(raw, null, deckY, out EndSnap flankSnap))
+            {
+                attach = flankSnap;
+                point = flankSnap.point;
+                if (flankSnap.edge != null)
+                    hoverSnapHeight = SnapHeightOf(flankSnap.edge, flankSnap.point);
+                AdoptSnapElevation(flankSnap);
+            }
+            snapTint = attach.HasValue;
+            if (attach.HasValue && attach.Value.node != null)
+            {
+                ShowNodeEndHighlight(attach.Value.node);
+            }
+            else if (attach.HasValue)
+            {
+                BuildSnappedStubPreview(attach.Value, point);
+                ShowSplineGhosts();
+            }
+            else
+            {
+                ShowStartMarker(point);
+            }
+            guideCenter = point;
+            guideBearing = 0f;
+            if (mouse.leftButton.wasPressedThisFrame)
+            {
+                shapeAnchor = point;
+                shapeAnchorSnap = attach;
+                shapeSnapHeight = hoverSnapHeight;
+                shapeCentered = Shape == BuildShape.Rect && keyboard != null
+                    && (keyboard.leftCtrlKey.isPressed || keyboard.rightCtrlKey.isPressed);
+                // The deck under the cursor, or a snapped elevated wall's
+                // own storey — either way the figure builds from there.
+                shapeBaseY = hoverBaseY;
+                // Plane captured NOW, while the hover snap still feeds
+                // EffectiveWallHeight — a snapped figure locks exactly
+                // onto the host's plane.
+                shapeTopY = hoverBaseY.HasValue
+                    ? float.NegativeInfinity : LockedTopFor(point);
+            }
+            return;
+        }
+
+        Vector3 anchor = shapeAnchor.Value;
+
+        // Circle keeps its press-drag-release feel: the radius follows
+        // the cursor and release commits.
+        if (Shape == BuildShape.Circle)
+        {
+            if (hasPoint)
+            {
+                float r = FlatDistance(anchor, raw);
+                if (!freePlace)
+                    r = Mathf.Round(r / lengthStep) * lengthStep;
+                r = Mathf.Max(MinCircleRadius, r);
+                BuildShapePreview(CircleEdges(anchor, r), anchor, anchor + Vector3.right * r, r);
+                Vector3 toward = raw - anchor;
+                toward.y = 0f;
+                Vector3 rim = anchor + (toward.sqrMagnitude > 0.01f
+                    ? toward.normalized : Vector3.right) * r;
+                dimGuides.Add((anchor, rim, r));
+                ShowShapeGhosts();
+                foreach (Vector3 p in shapeCrossings)
+                    AddNodeGhost(p);
+                guideCenter = anchor;
+                guideBearing = 0f;
+            }
+            else
+            {
+                ShowShapeGhosts();
+            }
+
+            if (mouse.leftButton.wasReleasedThisFrame)
+            {
+                if (shapeBlocked)
+                    BuildLog.Add("Refused: a side partially overlaps a wall — line it up fully (the wall becomes that side) or move clear.");
+                else if (shapeSpecs.Count > 0 && shapeEdgesLive.Count > 0)
+                    CommitShape(designate);
+                CancelShape();
+            }
+            return;
+        }
+
+        // The rect is three clicks — corner, side, width — so it can sit
+        // at ANY angle: lay the first side flush along a rotated curtain
+        // wall, then pull the width out. Click 2 fixes the side.
+        if (!shapeSideEnd.HasValue && shapeCentered)
+        {
+            // Centered side (Ctrl anchor): the anchor is the side's
+            // MIDPOINT. Anchored on a free wall end, the side locks
+            // perpendicular to that wall — the face a curtain runs into
+            // — with Shift stepping deliberate tilts off it and Alt
+            // freeing direction and length. The cursor sets the length,
+            // symmetric about the anchor.
+            if (hasPoint)
+            {
+                Vector3 m = anchor;
+                Vector3 cur = raw - m;
+                cur.y = 0f;
+                Vector3? faceDir = null;
+                if (shapeAnchorSnap.HasValue && shapeAnchorSnap.Value.node != null
+                    && shapeAnchorSnap.Value.node.Valence == 1
+                    && shapeAnchorSnap.Value.node.members[0].edge != null)
+                {
+                    WallNode.Member fm = shapeAnchorSnap.Value.node.members[0];
+                    Vector3 outward = fm.edge.EndOutwardDir(fm.atStart);
+                    faceDir = new Vector3(-outward.z, 0f, outward.x).normalized;
+                }
+                Vector3 sideDir;
+                if (faceDir.HasValue && !freePlace)
+                {
+                    sideDir = faceDir.Value;
+                    float refB = Mathf.Atan2(sideDir.z, sideDir.x) * Mathf.Rad2Deg;
+                    float dragB = cur.sqrMagnitude > 0.0001f
+                        ? Mathf.Atan2(cur.z, cur.x) * Mathf.Rad2Deg : refB;
+                    if (Mathf.Abs(Mathf.DeltaAngle(refB, dragB)) > 90f)
+                    {
+                        sideDir = -sideDir;
+                        refB = Mathf.Repeat(refB + 180f, 360f);
+                    }
+                    if (shiftHeld)
+                    {
+                        float stepped = Mathf.Round(Mathf.DeltaAngle(refB, dragB) / angleStep) * angleStep;
+                        float rr = (refB + stepped) * Mathf.Deg2Rad;
+                        sideDir = new Vector3(Mathf.Cos(rr), 0f, Mathf.Sin(rr));
+                    }
+                }
+                else
+                {
+                    sideDir = cur.sqrMagnitude > 0.0001f ? cur.normalized : Vector3.right;
+                    if (!freePlace && shiftHeld)
+                    {
+                        float dragB = Mathf.Atan2(sideDir.z, sideDir.x) * Mathf.Rad2Deg;
+                        float rr = Mathf.Round(dragB / angleStep) * angleStep * Mathf.Deg2Rad;
+                        sideDir = new Vector3(Mathf.Cos(rr), 0f, Mathf.Sin(rr));
+                    }
+                }
+                float sideLen = Mathf.Abs(Vector3.Dot(cur, sideDir)) * 2f;
+                if (!freePlace)
+                    sideLen = Mathf.Round(sideLen / lengthStep) * lengthStep;
+                sideLen = Mathf.Max(MinRectSide, sideLen);
+                // Length solve: when another free wall end projects onto
+                // this side's line near the current half-length, the
+                // length clicks so the side's END lines up with it — then
+                // the width phase can land that wall on the adjacent
+                // side's exact midpoint.
+                bool lenSnapped = false;
+                Vector3 lenSnapNode = default;
+                if (!freePlace)
+                {
+                    float bestOff = endpointSnapRadius;
+                    foreach (WallNode node in WallNode.All)
+                    {
+                        if (node.Valence != 1
+                            || (shapeAnchorSnap.HasValue && node == shapeAnchorSnap.Value.node))
+                            continue;
+                        Vector3 v = node.point - m;
+                        v.y = 0f;
+                        float candidate = Mathf.Abs(Vector3.Dot(v, sideDir)) * 2f;
+                        if (candidate < MinRectSide)
+                            continue;
+                        float off = Mathf.Abs(candidate - sideLen);
+                        if (off < bestOff)
+                        {
+                            bestOff = off;
+                            sideLen = candidate;
+                            lenSnapped = true;
+                            lenSnapNode = node.point;
+                        }
+                    }
+                }
+                Vector3 aC = m - sideDir * (sideLen * 0.5f);
+                Vector3 bC = m + sideDir * (sideLen * 0.5f);
+                snapTint = faceDir.HasValue || lenSnapped;
+                // White tie from the solving wall end to the side end it
+                // lined up with.
+                if (lenSnapped)
+                    alignLines.Add((lenSnapNode,
+                        Vector3.Dot(lenSnapNode - m, sideDir) >= 0f ? bC : aC));
+                AddExtensionAlignGuides(aC);
+                AddExtensionAlignGuides(bC);
+                BuildShapePreview(
+                    new List<(Vector3 s, Vector3 c, Vector3 e)> { (aC, (aC + bC) * 0.5f, bC) },
+                    aC, bC, 0f);
+                ShowShapeGhosts();
+                foreach (Vector3 p in shapeCrossings)
+                    AddNodeGhost(p);
+                dimGuides.Add((aC, bC, sideLen));
+                guideCenter = m;
+                guideBearing = Mathf.Atan2(sideDir.z, sideDir.x) * Mathf.Rad2Deg;
+                if (mouse.leftButton.wasPressedThisFrame && sideLen >= MinRectSide)
+                {
+                    // Bake the derived corners; the width phase runs the
+                    // same for centered and cornered sides.
+                    shapeAnchor = aC;
+                    shapeSideEnd = bC;
+                }
+            }
+            else
+            {
+                ShowShapeGhosts();
+            }
+            return;
+        }
+        if (!shapeSideEnd.HasValue)
+        {
+            if (hasPoint)
+            {
+                Vector3 b;
+                EndSnap? sideSnap = null;
+                if (canSnap && TryNodeSnap(raw, anchor, shapeBaseY ?? deckY, out EndSnap sideNode))
+                {
+                    b = sideNode.point;
+                    sideSnap = sideNode;
+                }
+                else if (canSnap && TryFlankSnap(raw, anchor, shapeBaseY ?? deckY, out EndSnap sideFlank))
+                {
+                    b = sideFlank.point;
+                    sideSnap = sideFlank;
+                }
+                else
+                {
+                    b = SteppedDragEnd(anchor, raw, freePlace, shiftHeld);
+                    // Shift steps the side RELATIVE to the anchor's
+                    // masonry — 0° lays it exactly along the host wall.
+                    if (!freePlace && shiftHeld && shapeAnchorSnap.HasValue)
+                    {
+                        Vector3 d = b - anchor;
+                        d.y = 0f;
+                        if (d.sqrMagnitude > 0.000001f)
+                        {
+                            float dragB = Mathf.Atan2(d.z, d.x) * Mathf.Rad2Deg;
+                            b = StepBearingFrom(
+                                AngleRefBearing(shapeAnchorSnap.Value, dragB), anchor, b);
+                        }
+                    }
+                    AddExtensionAlignGuides(b);
+                }
+                snapTint = sideSnap.HasValue;
+                BuildShapePreview(
+                    new List<(Vector3 s, Vector3 c, Vector3 e)> { (anchor, (anchor + b) * 0.5f, b) },
+                    anchor, b, 0f);
+                ShowShapeGhosts();
+                foreach (Vector3 p in shapeCrossings)
+                    AddNodeGhost(p);
+                float len = FlatDistance(anchor, b);
+                dimGuides.Add((anchor, b, len));
+                guideCenter = (anchor + b) * 0.5f;
+                guideBearing = Mathf.Atan2(b.z - anchor.z, b.x - anchor.x) * Mathf.Rad2Deg;
+                if (shapeAnchorSnap.HasValue && len >= 0.25f)
+                    activeAngle = (anchor,
+                        AngleRefBearing(shapeAnchorSnap.Value, guideBearing), guideBearing);
+                if (mouse.leftButton.wasPressedThisFrame && len >= MinRectSide)
+                    shapeSideEnd = b;
+            }
+            else
+            {
+                ShowShapeGhosts();
+            }
+            return;
+        }
+
+        // Width phase: the rect extends perpendicular from the fixed side
+        // toward the cursor. Shift squares it (width = side), click 3
+        // commits — a refusal keeps the gesture alive to adjust.
+        Vector3 sideA = anchor;
+        Vector3 sideB = shapeSideEnd.Value;
+        if (hasPoint)
+        {
+            Vector3 ab = sideB - sideA;
+            ab.y = 0f;
+            float sideLen = ab.magnitude;
+            Vector3 n = new Vector3(-ab.z, 0f, ab.x) / Mathf.Max(0.001f, sideLen);
+            float depth = Vector3.Dot(raw - sideA, n);
+            float dir = depth >= 0f ? 1f : -1f;
+            float w = Mathf.Abs(depth);
+            if (shiftHeld)
+                w = sideLen;
+            else if (!freePlace)
+                w = Mathf.Round(w / lengthStep) * lengthStep;
+            w = Mathf.Max(MinRectSide, w);
+            // Solve the second curtain: if a free wall end lines up with
+            // an adjacent side's midline (on the cursor's side), the
+            // width snaps so that side's MIDPOINT lands exactly on it.
+            bool widthSnapped = false;
+            Vector3 widthSnapRoot = default;
+            if (!freePlace)
+            {
+                Vector3 along = ab / Mathf.Max(0.001f, sideLen);
+                float bestErr = endpointSnapRadius;
+                foreach (WallNode node in WallNode.All)
+                {
+                    if (node.Valence != 1)
+                        continue;
+                    foreach (Vector3 root in new[] { sideA, sideB })
+                    {
+                        Vector3 v = node.point - root;
+                        v.y = 0f;
+                        float lateral = Mathf.Abs(Vector3.Dot(v, along));
+                        float longi = Vector3.Dot(v, n) * dir;
+                        if (lateral < bestErr && longi * 2f >= MinRectSide)
+                        {
+                            bestErr = lateral;
+                            w = longi * 2f;
+                            widthSnapped = true;
+                            widthSnapRoot = root;
+                        }
+                    }
+                }
+            }
+            snapTint = widthSnapped;
+            Vector3 offset = n * (w * dir);
+            // White tie along the adjacent side whose midpoint just
+            // caught the wall end, plus extension lines off the far
+            // corners.
+            if (widthSnapped)
+                alignLines.Add((widthSnapRoot, widthSnapRoot + offset));
+            AddExtensionAlignGuides(sideA + offset);
+            AddExtensionAlignGuides(sideB + offset);
+            BuildShapePreview(RectEdges(sideA, sideB, offset), sideA, sideB, w * dir);
+            ShowShapeGhosts();
+            foreach (Vector3 p in shapeCrossings)
+                AddNodeGhost(p);
+            dimGuides.Add((sideA, sideB, sideLen));
+            dimGuides.Add((sideB, sideB + offset, w));
+            guideCenter = (sideA + sideB) * 0.5f + offset * 0.5f;
+            guideBearing = Mathf.Atan2(ab.z, ab.x) * Mathf.Rad2Deg;
+            if (mouse.leftButton.wasPressedThisFrame)
+            {
+                if (shapeBlocked)
+                {
+                    BuildLog.Add("Refused: a side partially overlaps a wall — line it up fully (the wall becomes that side) or move clear.");
+                }
+                else if (shapeSpecs.Count > 0)
+                {
+                    CommitShape(designate);
+                    CancelShape();
+                }
+            }
+        }
+        else
+        {
+            ShowShapeGhosts();
+        }
+    }
+
+    // A circle's edges, counter-clockwise (so a designated room traces
+    // its interior on the first try). Control points sit at the tangent
+    // intersections, so each 45-degree arc hugs the true circle to ~0.3%.
+    List<(Vector3 s, Vector3 c, Vector3 e)> CircleEdges(Vector3 center, float r)
+    {
+        var edges = new List<(Vector3 s, Vector3 c, Vector3 e)>();
+        float controlR = r / Mathf.Cos(Mathf.PI / CircleSegments);
+        for (int i = 0; i < CircleSegments; i++)
+        {
+            float a0 = i * 2f * Mathf.PI / CircleSegments;
+            float a1 = (i + 1) * 2f * Mathf.PI / CircleSegments;
+            float am = (a0 + a1) * 0.5f;
+            edges.Add((
+                center + new Vector3(Mathf.Cos(a0), 0f, Mathf.Sin(a0)) * r,
+                center + new Vector3(Mathf.Cos(am), 0f, Mathf.Sin(am)) * controlR,
+                center + new Vector3(Mathf.Cos(a1), 0f, Mathf.Sin(a1)) * r));
+        }
+        return edges;
+    }
+
+    // A rect from its first side (a→b, any bearing) and the perpendicular
+    // offset to the far side — corner order normalized counter-clockwise
+    // so designation traces the interior on the first try.
+    static List<(Vector3 s, Vector3 c, Vector3 e)> RectEdges(Vector3 a, Vector3 b, Vector3 offset)
+    {
+        var corners = new List<Vector3> { a, b, b + offset, a + offset };
+        float area = 0f;
+        for (int i = 0; i < 4; i++)
+        {
+            Vector3 p = corners[i];
+            Vector3 q = corners[(i + 1) % 4];
+            area += p.x * q.z - q.x * p.z;
+        }
+        if (area < 0f)
+            corners.Reverse();
+        var edges = new List<(Vector3 s, Vector3 c, Vector3 e)>();
+        for (int i = 0; i < 4; i++)
+        {
+            Vector3 p = corners[i];
+            Vector3 q = corners[(i + 1) % 4];
+            edges.Add((p, (p + q) * 0.5f, q));
+        }
+        return edges;
+    }
+
+    // The height a shape builds at: a snapped anchor's adopted height,
+    // unless Ctrl+scroll explicitly overrode it.
+    float ShapeHeight()
+    {
+        if (!heightOverride && shapeSnapHeight.HasValue)
+            return shapeSnapHeight.Value;
+        return EffectiveWallHeight;
+    }
+
+    void BuildShapePreview(List<(Vector3 s, Vector3 c, Vector3 e)> figure,
+        Vector3 keyA, Vector3 keyB, float keyW)
+    {
+        float height = ShapeHeight();
+        float topY = shapeTopY;
+        var key = (keyA, keyB, keyW, height, topY);
+        if (lastShapeKey.HasValue && lastShapeKey.Value == key)
+            return;
+        lastShapeKey = key;
+
+        foreach (Mesh m in shapeMeshes)
+            Destroy(m);
+        shapeMeshes.Clear();
+        shapeSpecs.Clear();
+        shapeCrossings.Clear();
+        shapeBlocked = false;
+        shapeEdgesLive.Clear();
+        shapeEdgesLive.AddRange(figure);
+        foreach ((Vector3 s, Vector3 c, Vector3 e) in figure)
+        {
+            // A side lying wholly along an existing wall is REUSED: no
+            // ghost, no commit — the masonry is already there and the
+            // face closes through it. A partial overlap refuses the
+            // figure (it would leave a gap or a buried duplicate).
+            float coverage = WallGraph.CoincidentCoverage(s, c, e);
+            if (coverage >= ReuseCoverage)
+                continue;
+            if (coverage > 0.05f)
+                shapeBlocked = true;
+            shapeSpecs.AddRange(WallEdge.BuildSpecs(s, c, e, height,
+                gridSize, gridSize, baseStepSize, BaseHeight, topY,
+                shapeBaseY ?? float.NegativeInfinity));
+            foreach (WallGraph.Crossing x in WallGraph.FindCrossings(s, c, e))
+                shapeCrossings.Add(x.point);
+        }
+        foreach (WallEdge.SectionSpec spec in shapeSpecs)
+            shapeMeshes.Add(spec.mesh);
+    }
+
+    void ShowShapeGhosts()
+    {
+        Color tint = shapeBlocked ? deletePreviewColor : previewColor;
+        int shown = 0;
+        foreach (WallEdge.SectionSpec spec in shapeSpecs)
+        {
+            GameObject ghost = GetPooled(ghostPool, shown++, previewColor, "PlacementPreview");
+            ghost.SetActive(true);
+            SetGhostMesh(ghost, spec.mesh);
+            SetGhostTint(ghost, tint);
+            ghost.transform.SetPositionAndRotation(spec.position, Quaternion.Euler(0f, spec.yaw, 0f));
+            ghost.transform.localScale = Vector3.one;
+        }
+        for (int i = shown; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    void CommitShape(bool designate)
+    {
+        WallEdge lastEdge = null;
+        int reused = 0;
+        WallGraph.EdgeParams p = EdgeParamsNow(ShapeHeight(), shapeTopY,
+            shapeBaseY ?? float.NegativeInfinity);
+        foreach ((Vector3 s, Vector3 c, Vector3 e) in shapeEdgesLive)
+        {
+            // Re-derived rather than read from preview state, so the
+            // commit can't disagree with a stale ghost.
+            if (WallGraph.CoincidentCoverage(s, c, e) >= ReuseCoverage)
+            {
+                reused++;
+                continue;
+            }
+            List<WallEdge> created = WallGraph.CommitEdge(splineParent, s, c, e, p);
+            if (created.Count > 0)
+                lastEdge = created[created.Count - 1];
+        }
+        if (reused > 0)
+            BuildLog.Add(reused == 1
+                ? "Reused an existing wall as a side."
+                : $"Reused existing walls as {reused} sides.");
+        // ShapeEdges runs counter-clockwise, so the interior is on the
+        // left of the last edge's own direction.
+        if (designate && lastEdge != null)
+            TryDesignateRoom(lastEdge, true);
+    }
+
+    void CancelShape()
+    {
+        shapeAnchor = null;
+        shapeAnchorSnap = null;
+        shapeSideEnd = null;
+        shapeCentered = false;
+        shapeTopY = float.NegativeInfinity;
+        shapeSnapHeight = null;
+        shapeBaseY = null;
+        lastShapeKey = null;
+        shapeBlocked = false;
+        shapeEdgesLive.Clear();
+        foreach (Mesh m in shapeMeshes)
+            Destroy(m);
+        shapeMeshes.Clear();
+        shapeSpecs.Clear();
+        shapeCrossings.Clear();
+        HideGhosts();
+    }
+
+    // The Room tool: chained clicks lay a pending loop of straight walls
+    // — each click fixes a vertex and the next segment grows from it. The
+    // whole chain stays a ghost until it CLOSES: the far end lands on the
+    // chain's own start, or on existing masonry connected back to the
+    // start attachment — then every segment commits through the graph at
+    // once and the enclosed face designates a WallRoom. Escape abandons
+    // the chain and leaves nothing. Segments never cross walls: a drag
+    // over one clamps to the first crossing point (a T at commit, and
+    // often the closure itself).
+    void UpdateRoom(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
+    {
+        HandleHeightScroll(mouse, keyboard);
+        if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
+        {
+            CancelRoomChain();
+            return;
+        }
+
+        bool freePlace = keyboard != null && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
+        bool snapAngle = keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
+        Vector3 raw = default;
+        float? deckY = null;
+        bool hasPoint = !overUI && TryGetBuildSurface(ray, out raw, out deckY);
+        // Snapping works on decks too, filtered to that deck's own walls
+        // — the masonry a storey down never grabs the gesture. A snap
+        // onto an elevated wall adopts its storey (AdoptSnapElevation),
+        // so a chain started from a second-storey wall builds beside it,
+        // not on the terrain below.
+        bool canSnap = !freePlace;
+        hoverBaseY = deckY;
+
+        if (roomChain.Count == 0)
+        {
+            if (!hasPoint)
+            {
+                HideGhosts();
+                return;
+            }
+            Vector3 point = raw;
+            EndSnap? attach = null;
+            if (canSnap && TryNodeSnap(raw, null, deckY, out EndSnap nodeSnap))
+            {
+                attach = nodeSnap;
+                point = nodeSnap.point;
+                if (nodeSnap.edge != null)
+                    hoverSnapHeight = SnapHeightOf(nodeSnap.edge, nodeSnap.point);
+                AdoptSnapElevation(nodeSnap);
+            }
+            else if (canSnap && TryFlankSnap(raw, null, deckY, out EndSnap flankSnap))
+            {
+                attach = flankSnap;
+                point = flankSnap.point;
+                if (flankSnap.edge != null)
+                    hoverSnapHeight = SnapHeightOf(flankSnap.edge, flankSnap.point);
+                AdoptSnapElevation(flankSnap);
+            }
+            snapTint = attach.HasValue;
+            // Snapped hovers borrow the wall tool's presentation — the
+            // existing joint highlights, or a stub leaves the face — so
+            // no ghost box sits buried inside the host's masonry.
+            if (attach.HasValue && attach.Value.node != null)
+            {
+                ShowNodeEndHighlight(attach.Value.node);
+            }
+            else if (attach.HasValue)
+            {
+                BuildSnappedStubPreview(attach.Value, point);
+                ShowSplineGhosts();
+            }
+            else
+            {
+                ShowStartMarker(point);
+            }
+            guideCenter = point;
+            guideBearing = 0f;
+            if (mouse.leftButton.wasPressedThisFrame)
+            {
+                roomChain.Add(point);
+                roomStartAttach = attach;
+                roomChainHeight = EffectiveWallHeight;
+                // The deck under the cursor, or a snapped elevated wall's
+                // own storey — the whole chain builds from there.
+                roomChainBaseY = hoverBaseY;
+                roomChainTopY = hoverBaseY.HasValue
+                    ? float.NegativeInfinity : LockedTopFor(point);
+            }
+            return;
+        }
+
+        Vector3 last = roomChain[roomChain.Count - 1];
+        if (hasPoint)
+        {
+            Vector3 end;
+            EndSnap? endAttach = null;
+            bool closingToStart = false;
+            if (roomChain.Count >= 3 && FlatDistance(raw, roomChain[0]) < endpointSnapRadius)
+            {
+                // Back onto the chain's own first vertex: a pure loop.
+                end = roomChain[0];
+                closingToStart = true;
+            }
+            else if (canSnap && TryNodeSnap(raw, last, roomChainBaseY ?? deckY, out EndSnap nodeSnap))
+            {
+                end = nodeSnap.point;
+                endAttach = nodeSnap;
+            }
+            else if (canSnap && TryFlankSnap(raw, last, roomChainBaseY ?? deckY, out EndSnap flankSnap))
+            {
+                end = flankSnap.point;
+                endAttach = flankSnap;
+            }
+            else
+            {
+                end = SteppedDragEnd(last, raw, freePlace, snapAngle);
+                // Shift steps the segment RELATIVE to the corner it grows
+                // from — the previous segment's run, or the snapped
+                // start's masonry — so stepped chain corners land on
+                // clean 5° readings even off the world grid.
+                if (!freePlace && snapAngle)
+                {
+                    Vector3 d = end - last;
+                    d.y = 0f;
+                    if (d.sqrMagnitude > 0.000001f)
+                    {
+                        float dragB = Mathf.Atan2(d.z, d.x) * Mathf.Rad2Deg;
+                        float? refB = ChainStepRef(dragB);
+                        if (refB.HasValue)
+                            end = StepBearingFrom(refB.Value, last, end);
+                    }
+                }
+                AddExtensionAlignGuides(end);
+            }
+
+            // No crossings in room mode: the first wall the segment
+            // passes over clamps its end onto that wall's centerline.
+            if (!closingToStart)
+            {
+                var crossings = WallGraph.FindCrossings(last, (last + end) * 0.5f, end);
+                if (crossings.Count > 0)
+                {
+                    WallGraph.Crossing x = crossings[0];
+                    end = new Vector3(x.point.x, 0f, x.point.z);
+                    endAttach = x.reuseNode != null
+                        ? MakeNodeSnap(x.reuseNode)
+                        : new EndSnap { edge = x.edge, point = end, isFlank = true };
+                }
+            }
+
+            bool closing = closingToStart;
+            if (!closing && endAttach.HasValue && roomStartAttach.HasValue)
+                closing = WallGraph.Connected(AttachNodes(roomStartAttach.Value),
+                    new HashSet<WallNode>(AttachNodes(endAttach.Value)));
+
+            // Display-only trims keep the ghost outside host masonry at
+            // snapped ends, exactly like the wall tool; the commit still
+            // runs centerline to centerline.
+            float trimStart = roomChain.Count == 1
+                ? TrimInto(roomStartAttach, last, end) : 0f;
+            BuildRoomLivePreview(last, end, trimStart, TrimInto(endAttach, end, last));
+            roomLiveClosing = closing && !roomLiveBlocked;
+            ShowRoomGhosts();
+            guideCenter = (last + end) * 0.5f;
+            guideBearing = Mathf.Atan2(end.z - last.z, end.x - last.x) * Mathf.Rad2Deg;
+            // Corner readout at the vertex the segment grows from, against
+            // the previous segment or the snapped start's masonry.
+            if (FlatDistance(last, end) >= 0.25f)
+            {
+                float? arcRef = ChainStepRef(guideBearing);
+                if (arcRef.HasValue)
+                    activeAngle = (last, arcRef.Value, guideBearing);
+            }
+            snapTint = roomLiveClosing || endAttach.HasValue;
+
+            if (mouse.leftButton.wasPressedThisFrame && FlatDistance(last, end) >= 0.25f)
+            {
+                if (roomLiveBlocked)
+                {
+                    BuildLog.Add("Refused: segment redraws an existing wall — end it ON the wall; the enclosure reuses the rest.");
+                }
+                else
+                {
+                    roomChain.Add(end);
+                    BakeRoomLiveSegment();
+                    if (closing)
+                        CommitRoomChain();
+                    else
+                        ShowRoomGhosts();
+                }
+            }
+        }
+        else
+        {
+            // Off-target frames (HUD, sky) keep the chain visible.
+            ShowRoomGhosts();
+        }
+    }
+
+    // The chain's angle reference at its growing tip: the previous
+    // segment's run (pointing back along it, so 180 reads as a straight
+    // continuation), or the snapped start's masonry for the first
+    // segment. Null for a free-standing first segment — world-absolute
+    // stepping applies there.
+    float? ChainStepRef(float dragBearing)
+    {
+        if (roomChain.Count >= 2)
+        {
+            Vector3 back = roomChain[roomChain.Count - 2] - roomChain[roomChain.Count - 1];
+            return Mathf.Atan2(back.z, back.x) * Mathf.Rad2Deg;
+        }
+        if (roomStartAttach.HasValue)
+            return AngleRefBearing(roomStartAttach.Value, dragBearing);
+        return null;
+    }
+
+    // The masonry a chain end is attached to, as graph nodes — a node
+    // snap is that node; a flank landing reaches both its host's ends.
+    static IEnumerable<WallNode> AttachNodes(EndSnap snap)
+    {
+        if (snap.node != null)
+        {
+            yield return snap.node;
+            yield break;
+        }
+        if (snap.edge != null)
+        {
+            yield return snap.edge.nodeA;
+            yield return snap.edge.nodeB;
+        }
+    }
+
+    void BuildRoomLivePreview(Vector3 a, Vector3 b, float trimStart = 0f, float trimEnd = 0f)
+    {
+        var key = (a, b, roomChainHeight, roomChainTopY, trimStart, trimEnd);
+        if (lastRoomKey.HasValue && lastRoomKey.Value == key)
+            return;
+        lastRoomKey = key;
+
+        foreach (Mesh m in roomLiveMeshes)
+            Destroy(m);
+        roomLiveMeshes.Clear();
+        roomLiveSpecs.Clear();
+        Vector3 mid = (a + b) * 0.5f;
+        Vector3 da = a, db = b;
+        if (trimStart > 0.001f || trimEnd > 0.001f)
+        {
+            float total = FlatDistance(a, b);
+            float budget = Mathf.Max(0.05f, total - 0.1f);
+            if (trimStart + trimEnd > budget)
+            {
+                float scale = budget / (trimStart + trimEnd);
+                trimStart *= scale;
+                trimEnd *= scale;
+            }
+            Vector3 dir = (b - a) / Mathf.Max(0.001f, total);
+            da = a + dir * trimStart;
+            db = b - dir * trimEnd;
+        }
+        roomLiveSpecs.AddRange(WallEdge.BuildSpecs(da, (da + db) * 0.5f, db, roomChainHeight,
+            gridSize, gridSize, baseStepSize, BaseHeight, roomChainTopY,
+            roomChainBaseY ?? float.NegativeInfinity));
+        foreach (WallEdge.SectionSpec spec in roomLiveSpecs)
+            roomLiveMeshes.Add(spec.mesh);
+        roomLiveBlocked = WallGraph.OverlapsExisting(a, mid, b);
+    }
+
+    // A click fixed the live segment: its specs and meshes move to the
+    // chain's baked set and the live slot starts over.
+    void BakeRoomLiveSegment()
+    {
+        roomFixedSpecs.AddRange(roomLiveSpecs);
+        roomFixedMeshes.AddRange(roomLiveMeshes);
+        roomLiveSpecs.Clear();
+        roomLiveMeshes.Clear();
+        lastRoomKey = null;
+        roomLiveBlocked = false;
+    }
+
+    // Baked chain in preview blue, live segment gold when the next click
+    // would close the loop (red when refused).
+    void ShowRoomGhosts()
+    {
+        int shown = 0;
+        foreach (WallEdge.SectionSpec spec in roomFixedSpecs)
+        {
+            GameObject ghost = GetPooled(ghostPool, shown++, previewColor, "PlacementPreview");
+            ghost.SetActive(true);
+            SetGhostMesh(ghost, spec.mesh);
+            SetGhostTint(ghost, previewColor);
+            ghost.transform.SetPositionAndRotation(spec.position, Quaternion.Euler(0f, spec.yaw, 0f));
+            ghost.transform.localScale = Vector3.one;
+        }
+        Color liveTint = roomLiveBlocked ? deletePreviewColor
+            : (roomLiveClosing ? snapColor : previewColor);
+        foreach (WallEdge.SectionSpec spec in roomLiveSpecs)
+        {
+            GameObject ghost = GetPooled(ghostPool, shown++, previewColor, "PlacementPreview");
+            ghost.SetActive(true);
+            SetGhostMesh(ghost, spec.mesh);
+            SetGhostTint(ghost, liveTint);
+            ghost.transform.SetPositionAndRotation(spec.position, Quaternion.Euler(0f, spec.yaw, 0f));
+            ghost.transform.localScale = Vector3.one;
+        }
+        for (int i = shown; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    // Closes the loop: every chain segment commits through the graph in
+    // order (splitting whatever it tees into), then the enclosed face is
+    // traced from the last chain edge and designated a WallRoom. The
+    // chain's own winding picks the trace side, so the room is the face
+    // the player drew around, not its complement.
+    void CommitRoomChain()
+    {
+        WallEdge lastEdge = null;
+        for (int i = 0; i + 1 < roomChain.Count; i++)
+        {
+            Vector3 a = roomChain[i];
+            Vector3 b = roomChain[i + 1];
+            List<WallEdge> created = WallGraph.CommitEdge(splineParent, a, (a + b) * 0.5f, b,
+                EdgeParamsNow(roomChainHeight, roomChainTopY,
+                    roomChainBaseY ?? float.NegativeInfinity));
+            if (created.Count > 0)
+                lastEdge = created[created.Count - 1];
+        }
+        // Chain wound counter-clockwise → its interior is on the left of
+        // travel, which is the side TraceFace walks — trace the last edge
+        // along the gesture. Clockwise → trace it reversed.
+        if (lastEdge != null)
+            TryDesignateRoom(lastEdge, WallRoom.SignedArea(roomChain) > 0f);
+        CancelRoomChain();
+    }
+
+    // Traces the enclosed face off one committed boundary edge and
+    // designates it a room. The caller's winding guess picks the side;
+    // if that walk comes back as the outer face (negative area), the
+    // other side is tried before giving up — walls stay either way.
+    void TryDesignateRoom(WallEdge lastEdge, bool ccw)
+    {
+        List<WallGraph.DirEdge> ring = WallGraph.TraceFace(lastEdge, ccw);
+        if (ring == null || WallRoom.RingArea(ring) <= 0f)
+            ring = WallGraph.TraceFace(lastEdge, !ccw);
+        if (ring != null && WallRoom.RingArea(ring) > 0f)
+            WallRoom.Create(splineParent, ring, wallMaterial, baseStepSize, BaseHeight);
+        else
+            BuildLog.Add("No room: the walls committed but no enclosed face could be traced.");
+    }
+
+    void CancelRoomChain()
+    {
+        roomChain.Clear();
+        roomStartAttach = null;
+        roomChainBaseY = null;
+        roomLiveClosing = false;
+        roomLiveBlocked = false;
+        lastRoomKey = null;
+        foreach (Mesh m in roomFixedMeshes)
+            Destroy(m);
+        roomFixedMeshes.Clear();
+        roomFixedSpecs.Clear();
+        foreach (Mesh m in roomLiveMeshes)
+            Destroy(m);
+        roomLiveMeshes.Clear();
+        roomLiveSpecs.Clear();
         HideGhosts();
     }
 
@@ -891,6 +1954,18 @@ public class GridPlacementSystem : MonoBehaviour
 
         rawSurface = new Vector3(first.point.x, 0f, first.point.z);
 
+        // A room slab is elevated ground: build ON it, exactly at the
+        // cursor. Snaps below stay live but filter to this deck's own
+        // walls — the masonry a storey down never grabs the gesture.
+        WallRoom slabRoom = first.collider.GetComponentInParent<WallRoom>();
+        float? deckY = null;
+        if (slabRoom != null)
+        {
+            deckY = first.collider.gameObject.name == "RoomRoof"
+                ? slabRoom.roofY : slabRoom.floorY;
+            hoverBaseY = deckY;
+        }
+
         if (freePlace)
         {
             point = rawSurface;
@@ -908,12 +1983,13 @@ public class GridPlacementSystem : MonoBehaviour
         // Node snapping: existing joints outrank everything nearby — the
         // point locks EXACTLY onto the node, so chains and closed loops
         // meet where the network already is.
-        if (TryNodeSnap(rawSurface, null, out EndSnap nodeSnap))
+        if (TryNodeSnap(rawSurface, null, deckY, out EndSnap nodeSnap))
         {
             hoverSnap = nodeSnap;
             hoverSnapYaw = nodeSnap.stubYaw;
             if (nodeSnap.edge != null)
                 hoverSnapHeight = SnapHeightOf(nodeSnap.edge, nodeSnap.point);
+            AdoptSnapElevation(nodeSnap);
             point = nodeSnap.point;
             return true;
         }
@@ -923,12 +1999,13 @@ public class GridPlacementSystem : MonoBehaviour
         // host) and the wall draws away from the face on the cursor's
         // side, at any angle. A parallel run beside a wall is the Offset
         // tool's job.
-        if (TryFlankSnap(rawSurface, null, out EndSnap flankSnap))
+        if (TryFlankSnap(rawSurface, null, deckY, out EndSnap flankSnap))
         {
             hoverSnap = flankSnap;
             hoverSnapYaw = flankSnap.stubYaw;
             if (flankSnap.edge != null)
                 hoverSnapHeight = SnapHeightOf(flankSnap.edge, flankSnap.point);
+            AdoptSnapElevation(flankSnap);
             point = flankSnap.point;
             return true;
         }
@@ -937,6 +2014,27 @@ public class GridPlacementSystem : MonoBehaviour
         // under the cursor — placement is free.
         point = rawSurface;
         return true;
+    }
+
+    // Whether an edge belongs to the storey being hovered: no filter on
+    // ground hovers (null — any wall grabs, and the gesture adopts its
+    // elevation), but a deck hover only offers walls standing ON that
+    // deck — the masonry a storey down keeps its distance.
+    static bool BaseMatches(WallEdge edge, float? atBase)
+    {
+        if (!atBase.HasValue)
+            return true;
+        return !float.IsNegativeInfinity(edge.baseY)
+            && Mathf.Abs(edge.baseY - atBase.Value) <= 0.25f;
+    }
+
+    // A snap onto an elevated wall carries its storey with it: the
+    // gesture builds from the host's deck, not from the terrain a storey
+    // below.
+    void AdoptSnapElevation(EndSnap snap)
+    {
+        if (snap.edge != null && !float.IsNegativeInfinity(snap.edge.baseY))
+            hoverBaseY = snap.edge.baseY;
     }
 
     // The nearest node snap within endpointSnapRadius of the raw point.
@@ -948,14 +2046,16 @@ public class GridPlacementSystem : MonoBehaviour
     // whatever angle the drag takes. Candidates near `exclude` (the drag
     // anchor) are skipped so a drag can't snap its far end back onto its
     // own start.
-    bool TryNodeSnap(Vector3 raw, Vector3? exclude, out EndSnap snap)
+    bool TryNodeSnap(Vector3 raw, Vector3? exclude, float? atBase, out EndSnap snap)
     {
         EndSnap best = default;
         float bestSq = endpointSnapRadius * endpointSnapRadius;
         bool found = false;
         foreach (WallNode node in WallNode.All)
         {
-            EndSnap baseSnap = MakeNodeSnap(node);
+            EndSnap baseSnap = MakeNodeSnap(node, atBase);
+            if (atBase.HasValue && baseSnap.edge == null)
+                continue;
 
             void Consider(Vector3 candidate)
             {
@@ -972,7 +2072,8 @@ public class GridPlacementSystem : MonoBehaviour
             }
 
             Consider(node.point);
-            if (node.Valence == 1 && node.members[0].edge != null)
+            if (node.Valence == 1 && node.members[0].edge != null
+                && BaseMatches(node.members[0].edge, atBase))
             {
                 WallEdge member = node.members[0].edge;
                 Vector3 outward = member.EndOutwardDir(node.members[0].atStart);
@@ -986,7 +2087,7 @@ public class GridPlacementSystem : MonoBehaviour
         return found;
     }
 
-    EndSnap MakeNodeSnap(WallNode node)
+    EndSnap MakeNodeSnap(WallNode node, float? atBase = null)
     {
         // Representative member: the tallest wall at the node — the one a
         // chained wall most likely wants to match heights with.
@@ -994,7 +2095,7 @@ public class GridPlacementSystem : MonoBehaviour
         float best = -1f;
         foreach (WallNode.Member m in node.members)
         {
-            if (m.edge == null)
+            if (m.edge == null || !BaseMatches(m.edge, atBase))
                 continue;
             float h = SnapHeightOf(m.edge, node.point);
             if (h > best)
@@ -1023,6 +2124,58 @@ public class GridPlacementSystem : MonoBehaviour
             outDir = outDir,
             isFlank = false,
         };
+    }
+
+    // The corner readout and relative Shift-stepping both measure the
+    // ghost against REAL masonry at the snapped joint: of every wall run
+    // leaving it (each member at a node, both arms of a flank host), the
+    // one forming the tightest corner with the drag is the reference —
+    // so the label matches the V you actually see, and stepped angles
+    // land on clean multiples even when the host sits off the world grid.
+    float AngleRefBearing(EndSnap snap, float dragBearing)
+    {
+        float best = snap.backBearing;
+        float bestDelta = float.MaxValue;
+        void Consider(Vector3 dir)
+        {
+            if (dir.sqrMagnitude < 0.0001f)
+                return;
+            float b = Mathf.Atan2(dir.z, dir.x) * Mathf.Rad2Deg;
+            float d = Mathf.Abs(Mathf.DeltaAngle(b, dragBearing));
+            if (d < bestDelta)
+            {
+                bestDelta = d;
+                best = b;
+            }
+        }
+        if (snap.node != null)
+        {
+            foreach (WallNode.Member m in snap.node.members)
+                if (m.edge != null)
+                    Consider(-m.edge.EndOutwardDir(m.atStart));
+        }
+        else if (snap.isFlank)
+        {
+            Vector3 arm = new Vector3(snap.outDir.z, 0f, -snap.outDir.x);
+            Consider(arm);
+            Consider(-arm);
+        }
+        return best;
+    }
+
+    // Re-aims `end` so the drag's bearing sits on an angleStep multiple
+    // RELATIVE to refBearing, keeping the dragged length.
+    Vector3 StepBearingFrom(float refBearing, Vector3 from, Vector3 end)
+    {
+        Vector3 d = end - from;
+        d.y = 0f;
+        float len = d.magnitude;
+        if (len < 0.001f)
+            return end;
+        float dragB = Mathf.Atan2(d.z, d.x) * Mathf.Rad2Deg;
+        float stepped = Mathf.Round(Mathf.DeltaAngle(refBearing, dragB) / angleStep) * angleStep;
+        float rad = (refBearing + stepped) * Mathf.Deg2Rad;
+        return from + new Vector3(Mathf.Cos(rad), 0f, Mathf.Sin(rad)) * len;
     }
 
     static Vector3 MostOpenDir(WallNode node)
@@ -1061,14 +2214,14 @@ public class GridPlacementSystem : MonoBehaviour
     // at any angle, and the wedge rule fills the shoulder. `from` (the
     // drag anchor) picks which side the wall leaves toward and excludes
     // candidates near itself; host end zones are left to node snapping.
-    bool TryFlankSnap(Vector3 raw, Vector3? from, out EndSnap snap)
+    bool TryFlankSnap(Vector3 raw, Vector3? from, float? atBase, out EndSnap snap)
     {
         snap = default;
         float bestSq = float.MaxValue;
         bool found = false;
         foreach (WallEdge edge in WallEdge.All)
         {
-            if (edge.IsCourse)
+            if (edge.IsCourse || !BaseMatches(edge, atBase))
                 continue;
             float halfThick = edge.thickness * 0.5f;
             float grabRange = halfThick + endpointSnapRadius;
@@ -1146,8 +2299,12 @@ public class GridPlacementSystem : MonoBehaviour
         float trimStart = 0f, float trimEnd = 0f)
     {
         float height = EffectiveWallHeight;
-        float topY = LockedTopFor(start);
-        var key = (start, end, bulge, apexT, height, topY, trimStart, trimEnd);
+        // On elevated ground (a room slab) the base is already flat, so
+        // the top lock is moot — bottom = deck, top = deck + height.
+        float? baseY = anchorBaseY ?? hoverBaseY;
+        float topY = baseY.HasValue ? float.NegativeInfinity : LockedTopFor(start);
+        float baseFloor = baseY ?? float.NegativeInfinity;
+        var key = (start, end, bulge, apexT, height, topY, baseFloor, trimStart, trimEnd);
         if (lastPreviewKey.HasValue && lastPreviewKey.Value == key)
             return;
         lastPreviewKey = key;
@@ -1156,7 +2313,7 @@ public class GridPlacementSystem : MonoBehaviour
         ClearPreviewMeshes();
         splineSpecs.Clear();
         Vector3 control = ControlPointFor(start, end, bulge, apexT);
-        pendingCommit = (start, control, end, height, topY);
+        pendingCommit = (start, control, end, height, topY, baseFloor);
 
         Vector3 ds = start, dc = control, de = end;
         if (trimStart > 0.001f || trimEnd > 0.001f)
@@ -1177,7 +2334,7 @@ public class GridPlacementSystem : MonoBehaviour
             WallGraph.SubCurve(start, control, end, tA, tB, out ds, out dc, out de);
         }
         splineSpecs.AddRange(WallEdge.BuildSpecs(ds, dc, de,
-            height, gridSize, gridSize, baseStepSize, BaseHeight, topY));
+            height, gridSize, gridSize, baseStepSize, BaseHeight, topY, baseFloor));
         foreach (WallEdge.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
 
@@ -1267,7 +2424,7 @@ public class GridPlacementSystem : MonoBehaviour
         pendingCommit = null;
         lastCourseKey = null;
 
-        float ground = SampleCellGroundY(point.x, point.z);
+        float ground = hoverBaseY ?? SampleCellGroundY(point.x, point.z);
         float height = EffectiveWallHeight;
         GameObject ghost = GetPooled(ghostPool, 0, previewColor, "PlacementPreview");
         ghost.SetActive(true);
@@ -1381,8 +2538,11 @@ public class GridPlacementSystem : MonoBehaviour
 
         if (mouse.leftButton.wasPressedThisFrame && !previewBlocked && splineSpecs.Count > 0)
         {
+            float srcBase = offsetSource.baseY;
             WallGraph.CommitEdge(splineParent, s2, c2, e2,
-                EdgeParamsNow(CurrentWallHeight, LockedTopFor(s2)));
+                EdgeParamsNow(CurrentWallHeight,
+                    float.IsNegativeInfinity(srcBase) ? LockedTopFor(s2) : float.NegativeInfinity,
+                    srcBase));
             splineSpecs.Clear();
             ClearPreviewMeshes();
             lastOffsetKey = null;
@@ -1393,7 +2553,10 @@ public class GridPlacementSystem : MonoBehaviour
 
     void BuildOffsetPreview(Vector3 s, Vector3 c, Vector3 e)
     {
-        float topY = LockedTopFor(s);
+        // An elevated source offsets along its own deck (where the base
+        // is already flat, so the top lock is moot).
+        float srcBase = offsetSource != null ? offsetSource.baseY : float.NegativeInfinity;
+        float topY = float.IsNegativeInfinity(srcBase) ? LockedTopFor(s) : float.NegativeInfinity;
         var key = (s, c, e, CurrentWallHeight, topY);
         if (lastOffsetKey.HasValue && lastOffsetKey.Value == key)
             return;
@@ -1405,7 +2568,7 @@ public class GridPlacementSystem : MonoBehaviour
         ClearPreviewMeshes();
         splineSpecs.Clear();
         splineSpecs.AddRange(WallEdge.BuildSpecs(s, c, e,
-            CurrentWallHeight, gridSize, gridSize, baseStepSize, BaseHeight, topY));
+            CurrentWallHeight, gridSize, gridSize, baseStepSize, BaseHeight, topY, srcBase));
         foreach (WallEdge.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
         previewBlocked = WallGraph.OverlapsExisting(s, c, e);
@@ -1433,8 +2596,7 @@ public class GridPlacementSystem : MonoBehaviour
             MeshFilter filter = section.GetComponent<MeshFilter>();
             SetGhostMesh(ghost, filter != null ? filter.sharedMesh : null);
             SetGhostTint(ghost, previewColor);
-            ghost.transform.SetPositionAndRotation(section.transform.position, section.transform.rotation);
-            ghost.transform.localScale = Vector3.one * DeleteOverlayScale;
+            FitShell(ghost.transform, section.transform, filter != null ? filter.sharedMesh : null);
         }
         for (int i = count; i < ghostPool.Count; i++)
             ghostPool[i].SetActive(false);
@@ -1458,33 +2620,66 @@ public class GridPlacementSystem : MonoBehaviour
         return false;
     }
 
-    // Deletion mirrors the build flow: hovering shows a red overlay on the
-    // single section the cursor is on, click-dragging extends that preview
-    // along the section's own edge, and nothing is destroyed until the
-    // button is released: exactly what's red when the button comes up is
-    // removed — as a graph edit. A hole splits the edge into two edges at
-    // new flat-capped nodes; survivors never rebuild because nothing about
-    // them depended on the dead wall.
-    void UpdateDelete(Mouse mouse, Ray ray, bool overUI)
+    // Deletion mirrors the build flow: hovering shows a red overlay,
+    // nothing is destroyed until the button is released, and exactly
+    // what's red when the button comes up is removed — as a graph edit.
+    // Two gestures share the button: a press ON a wall paints a run that
+    // follows the cursor THROUGH nodes (the doomed path re-resolves from
+    // anchor to cursor every frame, so backing up shrinks it), and a
+    // press on empty ground rubber-bands a screen marquee — every
+    // section whose center lands inside dies, and any room whose slab is
+    // caught un-rooms. A hole splits an edge at new flat-capped nodes;
+    // survivors never rebuild because nothing about them depended on the
+    // dead wall.
+    void UpdateDelete(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
-        if (deleteAnchor != null)
+        if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
         {
-            // Re-resolved only while the cursor is on the anchor's own
-            // edge; off-target frames (HUD, sky, other walls) keep the
+            CancelDelete();
+            return;
+        }
+
+        if (marqueeStart.HasValue)
+        {
+            marqueeEnd = mouse.position.ReadValue();
+            MarkMarqueeDoomed();
+        }
+        else if (deleteAnchor != null)
+        {
+            // Off-target frames (HUD, sky, unconnected walls) keep the
             // last preview so release still commits what the overlay
             // showed, matching build.
-            if (!overUI && TryGetSectionUnderCursor(ray, out WallEdgeSection under)
-                && under.edge == deleteAnchor.edge)
-                MarkEdgeRangeDoomed(deleteAnchor, under);
+            if (!overUI && TryGetSectionUnderCursor(ray, out WallEdgeSection under))
+                MarkPathDoomed(deleteAnchor, under);
         }
         else
         {
             doomedSections.Clear();
+            deleteRanges.Clear();
             if (!overUI && TryGetSectionUnderCursor(ray, out WallEdgeSection hovered))
             {
                 doomedSections.Add(hovered.transform);
+                deleteRanges.Add((hovered.edge, hovered.index, hovered.index));
                 if (mouse.leftButton.wasPressedThisFrame)
                     deleteAnchor = hovered;
+            }
+            else if (!overUI && TryGetRoomUnderCursor(ray, out WallRoom hoveredRoom))
+            {
+                // A room's slabs delete as one: the designation lifts,
+                // floor and roof go, the walls stay standing.
+                foreach (Transform child in hoveredRoom.transform)
+                    doomedSections.Add(child);
+                if (mouse.leftButton.wasPressedThisFrame)
+                {
+                    Destroy(hoveredRoom.gameObject);
+                    BuildLog.Add("Room removed — walls kept.");
+                    doomedSections.Clear();
+                }
+            }
+            else if (!overUI && mouse.leftButton.wasPressedThisFrame)
+            {
+                marqueeStart = mouse.position.ReadValue();
+                marqueeEnd = marqueeStart;
             }
         }
 
@@ -1492,39 +2687,227 @@ public class GridPlacementSystem : MonoBehaviour
 
         if (mouse.leftButton.wasReleasedThisFrame)
         {
-            if (deleteAnchor != null && doomedSections.Count > 0)
-            {
-                WallEdge edge = deleteAnchor.edge;
-                int min = int.MaxValue, max = int.MinValue;
-                foreach (Transform doomed in doomedSections)
-                {
-                    WallEdgeSection section = doomed != null ? doomed.GetComponent<WallEdgeSection>() : null;
-                    if (section == null)
-                        continue;
-                    min = Mathf.Min(min, section.index);
-                    max = Mathf.Max(max, section.index);
-                }
-                if (edge != null && min <= max)
-                    WallGraph.DeleteSections(splineParent, edge, min, max);
-                doomedSections.Clear();
-                HideDeleteOverlays();
-            }
-            deleteAnchor = null;
+            if (deleteAnchor != null || marqueeStart.HasValue)
+                CommitDelete();
         }
     }
 
-    // Delete run: every section of the edge between the two drag ends, by
-    // the edge's own ordering — terrain height plays no part.
-    void MarkEdgeRangeDoomed(WallEdgeSection a, WallEdgeSection b)
+    // Everything red dies in one pass: walls first (rooms whose whole
+    // boundary went breach themselves with their own log line), then any
+    // rooms the marquee caught directly un-room. Each edge is surgered
+    // exactly once — all of its doomed indices in a single graph call.
+    void CommitDelete()
+    {
+        var byEdge = new Dictionary<WallEdge, HashSet<int>>();
+        foreach ((WallEdge edge, int lo, int hi) in deleteRanges)
+        {
+            if (edge == null)
+                continue;
+            if (!byEdge.TryGetValue(edge, out HashSet<int> set))
+                byEdge[edge] = set = new HashSet<int>();
+            for (int i = lo; i <= hi; i++)
+                set.Add(i);
+        }
+        foreach (KeyValuePair<WallEdge, HashSet<int>> pair in byEdge)
+            if (pair.Key != null)
+                WallGraph.DeleteSections(splineParent, pair.Key, pair.Value);
+        foreach (WallRoom room in marqueeRooms)
+        {
+            if (room == null || room.broken)
+                continue;
+            Destroy(room.gameObject);
+            BuildLog.Add("Room removed — walls kept.");
+        }
+        CancelDelete();
+    }
+
+    void CancelDelete()
+    {
+        deleteAnchor = null;
+        marqueeStart = null;
+        marqueeEnd = null;
+        doomedSections.Clear();
+        deleteRanges.Clear();
+        marqueeRooms.Clear();
+        HideDeleteOverlays();
+    }
+
+    // The painted run, re-derived every frame as the path from the
+    // anchor section to the section under the cursor: walking the node
+    // graph, the first and last edges contribute the span from the
+    // touched section to the connecting joint, everything between dies
+    // whole. Courses live off-graph, so a course paint stays on its own
+    // edge. No path (separate wall, or the cursor skipped too far) keeps
+    // the previous preview.
+    void MarkPathDoomed(WallEdgeSection a, WallEdgeSection b)
+    {
+        if (a.edge == b.edge)
+        {
+            deleteRanges.Clear();
+            deleteRanges.Add((a.edge, Mathf.Min(a.index, b.index), Mathf.Max(a.index, b.index)));
+            RebuildDoomedFromRanges();
+            return;
+        }
+        if (a.edge.IsCourse || b.edge.IsCourse)
+            return;
+        List<WallEdge> path = EdgePath(a.edge, b.edge);
+        if (path == null)
+            return;
+
+        deleteRanges.Clear();
+        for (int i = 0; i < path.Count; i++)
+        {
+            WallEdge edge = path[i];
+            var sections = edge.SectionsInOrder();
+            if (sections.Count == 0)
+                continue;
+            int last = sections[sections.Count - 1].index;
+            if (i == 0)
+            {
+                WallNode exit = SharedNode(edge, path[1]);
+                deleteRanges.Add(exit == edge.nodeB
+                    ? (edge, a.index, last)
+                    : (edge, 0, a.index));
+            }
+            else if (i == path.Count - 1)
+            {
+                WallNode entry = SharedNode(edge, path[i - 1]);
+                deleteRanges.Add(entry == edge.nodeA
+                    ? (edge, 0, b.index)
+                    : (edge, b.index, last));
+            }
+            else
+            {
+                deleteRanges.Add((edge, 0, last));
+            }
+        }
+        RebuildDoomedFromRanges();
+    }
+
+    void RebuildDoomedFromRanges()
     {
         doomedSections.Clear();
-        int min = Mathf.Min(a.index, b.index);
-        int max = Mathf.Max(a.index, b.index);
-        foreach (WallEdgeSection section in a.edge.GetComponentsInChildren<WallEdgeSection>())
+        foreach ((WallEdge edge, int lo, int hi) in deleteRanges)
         {
-            if (section.index >= min && section.index <= max)
-                doomedSections.Add(section.transform);
+            if (edge == null)
+                continue;
+            foreach (WallEdgeSection section in edge.SectionsInOrder())
+                if (section.index >= lo && section.index <= hi)
+                    doomedSections.Add(section.transform);
         }
+    }
+
+    // Shortest hop path between two ground edges through shared nodes —
+    // breadth-first over the node graph's member lists, read-only.
+    static List<WallEdge> EdgePath(WallEdge from, WallEdge to)
+    {
+        var parent = new Dictionary<WallEdge, WallEdge> { [from] = from };
+        var queue = new Queue<WallEdge>();
+        queue.Enqueue(from);
+        int guard = 0;
+        while (queue.Count > 0 && guard++ < 512)
+        {
+            WallEdge cur = queue.Dequeue();
+            if (cur == to)
+            {
+                var path = new List<WallEdge>();
+                for (WallEdge walk = to; ; walk = parent[walk])
+                {
+                    path.Add(walk);
+                    if (walk == from)
+                        break;
+                }
+                path.Reverse();
+                return path;
+            }
+            foreach (WallNode node in new[] { cur.nodeA, cur.nodeB })
+            {
+                if (node == null)
+                    continue;
+                foreach (WallNode.Member m in node.members)
+                {
+                    if (m.edge == null || m.edge.IsCourse || parent.ContainsKey(m.edge))
+                        continue;
+                    parent[m.edge] = cur;
+                    queue.Enqueue(m.edge);
+                }
+            }
+        }
+        return null;
+    }
+
+    static WallNode SharedNode(WallEdge a, WallEdge b)
+    {
+        if (a.nodeA == b.nodeA || a.nodeA == b.nodeB)
+            return a.nodeA;
+        return a.nodeB;
+    }
+
+    // Everything the rubber-band caught: wall sections (courses too) by
+    // their screen-projected centers, and rooms by either slab's center
+    // — the red shells are the confirmation of exactly what release
+    // will take.
+    void MarkMarqueeDoomed()
+    {
+        doomedSections.Clear();
+        deleteRanges.Clear();
+        marqueeRooms.Clear();
+        Rect r = Rect.MinMaxRect(
+            Mathf.Min(marqueeStart.Value.x, marqueeEnd.Value.x),
+            Mathf.Min(marqueeStart.Value.y, marqueeEnd.Value.y),
+            Mathf.Max(marqueeStart.Value.x, marqueeEnd.Value.x),
+            Mathf.Max(marqueeStart.Value.y, marqueeEnd.Value.y));
+
+        foreach (WallEdge edge in WallEdge.All)
+        {
+            if (edge == null)
+                continue;
+            foreach (WallEdgeSection section in edge.SectionsInOrder())
+            {
+                Renderer rend = section.GetComponent<Renderer>();
+                Vector3 center = rend != null ? rend.bounds.center : section.transform.position;
+                Vector3 sp = cam.WorldToScreenPoint(center);
+                if (sp.z <= 0f || !r.Contains(new Vector2(sp.x, sp.y)))
+                    continue;
+                doomedSections.Add(section.transform);
+                deleteRanges.Add((edge, section.index, section.index));
+            }
+        }
+        foreach (WallRoom room in WallRoom.All)
+        {
+            if (room == null || room.broken)
+                continue;
+            foreach (Transform child in room.transform)
+            {
+                Renderer rend = child.GetComponent<Renderer>();
+                if (rend == null)
+                    continue;
+                Vector3 sp = cam.WorldToScreenPoint(rend.bounds.center);
+                if (sp.z <= 0f || !r.Contains(new Vector2(sp.x, sp.y)))
+                    continue;
+                marqueeRooms.Add(room);
+                foreach (Transform slab in room.transform)
+                    doomedSections.Add(slab);
+                break;
+            }
+        }
+    }
+
+    // The room whose slab (floor or roof deck) is directly under the
+    // cursor — the delete tool's un-room target.
+    bool TryGetRoomUnderCursor(Ray ray, out WallRoom room)
+    {
+        room = null;
+        RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (RaycastHit hit in hits)
+        {
+            if (hit.collider.isTrigger)
+                continue;
+            room = hit.collider.GetComponentInParent<WallRoom>();
+            return room != null;
+        }
+        return false;
     }
 
     // Deliberately precise (unlike build targeting) — deletion should only
@@ -1669,6 +3052,104 @@ public class GridPlacementSystem : MonoBehaviour
         return terrain.transform.position.y + terrain.SampleHeight(point) + 0.3f;
     }
 
+    // A point being placed sits on the EXTENSION of an existing straight
+    // wall's line: draw white from that wall's near end to the point, so
+    // "these line up" is visible instead of inferred. Curved edges are
+    // skipped — an arc's extension is ambiguous.
+    void AddExtensionAlignGuides(Vector3 probe)
+    {
+        const float Lateral = 0.15f;
+        const float MaxReach = 30f;
+        // (gap, from) per candidate; a graph split leaves collinear
+        // pieces that all "align", so only the nearest end per direction
+        // survives, and a probe sitting ON any aligned wall's own span
+        // is a snap situation, not an alignment hint.
+        var candidates = new List<(float gap, Vector3 from, float bearing)>();
+        foreach (WallEdge edge in WallEdge.All)
+        {
+            if (edge == null || edge.IsCourse)
+                continue;
+            Vector3 a = edge.A, b = edge.B;
+            Vector3 d = b - a;
+            d.y = 0f;
+            float len = d.magnitude;
+            if (len < 0.5f)
+                continue;
+            d /= len;
+            Vector3 bow = edge.control - (a + b) * 0.5f;
+            bow.y = 0f;
+            if (bow.sqrMagnitude > 0.01f)
+                continue;
+            Vector3 v = probe - a;
+            v.y = 0f;
+            float lateral = Mathf.Abs(d.x * v.z - d.z * v.x);
+            float along = Vector3.Dot(v, d);
+            if (lateral > Lateral)
+                continue;
+            if (along >= -0.25f && along <= len + 0.25f)
+                return;
+            bool beyondA = along < -0.25f && along > -MaxReach;
+            bool beyondB = along > len + 0.25f && along < len + MaxReach;
+            if (!beyondA && !beyondB)
+                continue;
+            Vector3 from = beyondA ? a : b;
+            Vector3 gapV = probe - from;
+            gapV.y = 0f;
+            candidates.Add((gapV.magnitude, from,
+                Mathf.Atan2(gapV.z, gapV.x) * Mathf.Rad2Deg));
+        }
+        candidates.Sort((x, y) => x.gap.CompareTo(y.gap));
+        var kept = new List<float>();
+        foreach ((float gap, Vector3 from, float bearing) in candidates)
+        {
+            bool duplicate = false;
+            foreach (float kb in kept)
+                if (Mathf.Abs(Mathf.DeltaAngle(kb, bearing)) < 3f)
+                {
+                    duplicate = true;
+                    break;
+                }
+            if (duplicate)
+                continue;
+            kept.Add(bearing);
+            alignLines.Add((from, probe));
+            if (alignLines.Count >= 6)
+                return;
+        }
+    }
+
+    void UpdateAlignGuides()
+    {
+        while (alignPool.Count < alignLines.Count)
+        {
+            LineRenderer line = CreateGuideLine();
+            line.gameObject.name = "AlignGuide";
+            if (alignMaterial == null)
+            {
+                Shader shader = Shader.Find("HDRP/Unlit");
+                alignMaterial = new Material(shader != null ? shader : Shader.Find("Sprites/Default"));
+                if (alignMaterial.HasProperty("_UnlitColor"))
+                    alignMaterial.SetColor("_UnlitColor", Color.white);
+                else
+                    alignMaterial.color = Color.white;
+            }
+            line.sharedMaterial = alignMaterial;
+            line.widthMultiplier = 0.04f;
+            alignPool.Add(line);
+        }
+        for (int i = 0; i < alignPool.Count; i++)
+        {
+            bool active = i < alignLines.Count;
+            alignPool[i].gameObject.SetActive(active);
+            if (!active)
+                continue;
+            Vector3 f = alignLines[i].from;
+            Vector3 g = alignLines[i].to;
+            alignPool[i].SetPosition(0, new Vector3(f.x, GuideY(f), f.z));
+            alignPool[i].SetPosition(1, new Vector3(g.x, GuideY(g), g.z));
+        }
+    }
+
     LineRenderer CreateGuideLine()
     {
         GameObject lineObj = new GameObject("DistanceGuide");
@@ -1696,8 +3177,28 @@ public class GridPlacementSystem : MonoBehaviour
     // scene art.
     void OnGUI()
     {
-        if (cam == null || (activeGuides.Count == 0 && !activeAngle.HasValue))
+        if (cam == null || (activeGuides.Count == 0 && dimGuides.Count == 0
+            && !activeAngle.HasValue && !marqueeStart.HasValue))
             return;
+
+        // The delete marquee: a translucent red band in screen space.
+        // Mouse coords are bottom-left origin, GUI is top-left — flip Y.
+        if (marqueeStart.HasValue && marqueeEnd.HasValue)
+        {
+            Vector2 a = marqueeStart.Value, b = marqueeEnd.Value;
+            float x0 = Mathf.Min(a.x, b.x), x1 = Mathf.Max(a.x, b.x);
+            float y0 = Screen.height - Mathf.Max(a.y, b.y);
+            float y1 = Screen.height - Mathf.Min(a.y, b.y);
+            Rect band = new Rect(x0, y0, x1 - x0, y1 - y0);
+            GUI.color = new Color(1f, 0.3f, 0.25f, 0.12f);
+            GUI.DrawTexture(band, Texture2D.whiteTexture);
+            GUI.color = new Color(1f, 0.3f, 0.25f, 0.8f);
+            GUI.DrawTexture(new Rect(band.x, band.y, band.width, 2f), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(band.x, band.yMax - 2f, band.width, 2f), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(band.x, band.y, 2f, band.height), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(band.xMax - 2f, band.y, 2f, band.height), Texture2D.whiteTexture);
+            GUI.color = Color.white;
+        }
 
         if (guideLabelStyle == null)
         {
@@ -1715,6 +3216,16 @@ public class GridPlacementSystem : MonoBehaviour
             if (screen.z <= 0f)
                 continue;
             DrawGuideLabel(screen, guide.distance.ToString("0.0") + "m");
+        }
+
+        // The active figure's own dimensions (rect side/width, circle
+        // radius) — same styling, riding the figure's midlines.
+        foreach ((Vector3 from, Vector3 to, float distance) dim in dimGuides)
+        {
+            Vector3 screen = cam.WorldToScreenPoint((dim.from + dim.to) * 0.5f);
+            if (screen.z <= 0f)
+                continue;
+            DrawGuideLabel(screen, dim.distance.ToString("0.0") + "m");
         }
 
         // The corner angle rides just outside its arc's midpoint.
@@ -1752,6 +3263,20 @@ public class GridPlacementSystem : MonoBehaviour
             ghost.SetActive(false);
     }
 
+    // Fits a shell ghost over a source mesh, inflated slightly ABOUT THE
+    // MESH'S OWN CENTER. Scaling the transform alone would also scale the
+    // vertices' absolute coordinates — meshes built in world space on an
+    // origin-pivoted object (room slabs, node posts) would drift by 2% of
+    // their distance from the origin, floating a rooftop overlay half a
+    // meter off the roof.
+    static void FitShell(Transform ghost, Transform src, Mesh mesh)
+    {
+        Vector3 center = src.TransformPoint(mesh != null ? mesh.bounds.center : Vector3.zero);
+        ghost.SetPositionAndRotation(
+            Vector3.LerpUnclamped(center, src.position, DeleteOverlayScale), src.rotation);
+        ghost.localScale = src.localScale * DeleteOverlayScale;
+    }
+
     // Shells each doomed section in a red pooled copy — position, rotation,
     // and scale are taken from the section itself, so the overlay reads as
     // the section turning red rather than a separate marker.
@@ -1764,9 +3289,9 @@ public class GridPlacementSystem : MonoBehaviour
             // Shell with the section's actual mesh so curved slices
             // highlight as curves, not as their bounding boxes.
             MeshFilter sectionFilter = sections[i].GetComponent<MeshFilter>();
-            SetGhostMesh(overlay, sectionFilter != null ? sectionFilter.sharedMesh : null);
-            overlay.transform.SetPositionAndRotation(sections[i].position, sections[i].rotation);
-            overlay.transform.localScale = sections[i].localScale * DeleteOverlayScale;
+            Mesh mesh = sectionFilter != null ? sectionFilter.sharedMesh : null;
+            SetGhostMesh(overlay, mesh);
+            FitShell(overlay.transform, sections[i], mesh);
         }
         for (int i = sections.Count; i < deletePool.Count; i++)
             deletePool[i].SetActive(false);

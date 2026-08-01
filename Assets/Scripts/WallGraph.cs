@@ -16,6 +16,9 @@ public static class WallGraph
         public float targetSectionLength;
         public float baseStep;
         public float fixedTopY;
+        // Elevated ground (a room slab top) the wall stands on; -inf
+        // rides the terrain.
+        public float baseY;
         public Material material;
     }
 
@@ -29,6 +32,14 @@ public static class WallGraph
         public float tSelf;
         public float tHost;
         public Vector3 point;
+    }
+
+    // One directed traversal of a ground edge: forward = nodeA toward
+    // nodeB. Face walks and room boundaries speak in these.
+    public struct DirEdge
+    {
+        public WallEdge edge;
+        public bool forward;
     }
 
     // Crossings this close to a proposed curve's end belong to the end's
@@ -155,6 +166,124 @@ public static class WallGraph
         return false;
     }
 
+    // Walks the boundary of one planar face: travel the directed edge,
+    // and at each node turn onto the member with the smallest clockwise
+    // angle from the arrival direction (keep-left), until the walk
+    // returns to where it started. Interior faces come back counter-
+    // clockwise (positive outline area); the outer walk comes back
+    // clockwise. Null on dead graphs or a walk that never closes.
+    public static List<DirEdge> TraceFace(WallEdge startEdge, bool startForward)
+    {
+        var result = new List<DirEdge>();
+        WallEdge e = startEdge;
+        bool fwd = startForward;
+        for (int step = 0; step < 512; step++)
+        {
+            result.Add(new DirEdge { edge = e, forward = fwd });
+            WallNode n = fwd ? e.nodeB : e.nodeA;
+            if (n == null)
+                return null;
+            bool arrivedAtStart = !fwd;
+            Vector3 back = -e.EndOutwardDir(arrivedAtStart);
+            float bIn = Mathf.Atan2(back.z, back.x) * Mathf.Rad2Deg;
+
+            WallNode.Member bestMember = default;
+            float bestDelta = float.MaxValue;
+            bool found = false;
+            foreach (WallNode.Member m in n.members)
+            {
+                if (m.edge == null)
+                    continue;
+                Vector3 inward = -m.edge.EndOutwardDir(m.atStart);
+                if (inward.sqrMagnitude < 0.01f)
+                    continue;
+                float bm = Mathf.Atan2(inward.z, inward.x) * Mathf.Rad2Deg;
+                float delta = Mathf.Repeat(bIn - bm, 360f);
+                // Turning straight back down the arrival edge is the last
+                // resort (a dead end's face wraps around the tip).
+                if (m.edge == e && m.atStart == arrivedAtStart)
+                    delta = 360f;
+                if (delta < bestDelta)
+                {
+                    bestDelta = delta;
+                    bestMember = m;
+                    found = true;
+                }
+            }
+            if (!found)
+                return null;
+            e = bestMember.edge;
+            fwd = bestMember.atStart;
+            if (e == startEdge && fwd == startForward)
+                return result;
+        }
+        return null;
+    }
+
+    // Whether any of `from` reaches any of `to` through ground edges —
+    // the room tool's enclosure test: a pending chain whose two ends
+    // attach to connected masonry closes a loop.
+    public static bool Connected(IEnumerable<WallNode> from, HashSet<WallNode> to)
+    {
+        var seen = new HashSet<WallNode>();
+        var queue = new Queue<WallNode>();
+        foreach (WallNode n in from)
+            if (n != null && seen.Add(n))
+                queue.Enqueue(n);
+        while (queue.Count > 0)
+        {
+            WallNode n = queue.Dequeue();
+            if (to.Contains(n))
+                return true;
+            foreach (WallNode.Member m in n.members)
+            {
+                if (m.edge == null)
+                    continue;
+                WallNode other = m.atStart ? m.edge.nodeB : m.edge.nodeA;
+                if (other != null && seen.Add(other))
+                    queue.Enqueue(other);
+            }
+        }
+        return false;
+    }
+
+    // Fraction of the proposed run lying ALONG existing masonry (same
+    // tolerances as the redraw refusal). The shape tools read this to
+    // REUSE a host wall as a figure side (~1.0) instead of redrawing it,
+    // and to refuse a side that only partially lines up.
+    public static float CoincidentCoverage(Vector3 s, Vector3 c, Vector3 e)
+    {
+        const float MaxDist = 0.15f;
+        const float MinParallel = 0.9986f; // cos 3°
+
+        Vector3[] mine = SampleCurve(s, c, e);
+        Bounds myBounds = CurveBounds(s, c, e, MaxDist + 0.1f);
+        var hosts = new List<WallEdge>();
+        foreach (WallEdge h in WallEdge.All)
+            if (!h.IsCourse && myBounds.Intersects(CurveBounds(h.A, h.control, h.B, MaxDist + 0.1f)))
+                hosts.Add(h);
+        if (hosts.Count == 0)
+            return 0f;
+
+        int close = 0;
+        for (int i = 0; i <= CurveSamples; i++)
+        {
+            Vector3 myTan = WallEdge.Tangent(s, c, e, (float)i / CurveSamples).normalized;
+            foreach (WallEdge h in hosts)
+            {
+                float tH = h.NearestT(mine[i], out float distSq);
+                if (distSq > MaxDist * MaxDist)
+                    continue;
+                Vector3 hTan = WallEdge.Tangent(h.A, h.control, h.B, tH).normalized;
+                if (Mathf.Abs(myTan.x * hTan.x + myTan.z * hTan.z) < MinParallel)
+                    continue;
+                close++;
+                break;
+            }
+        }
+        return (float)close / (CurveSamples + 1);
+    }
+
     // ------------------------------------------------------------------
     // Mutations
     // ------------------------------------------------------------------
@@ -215,7 +344,8 @@ public static class WallGraph
                 continue;
             SubCurve(s, c, e, t0, t1, out _, out Vector3 subC, out _);
             created.Add(WallEdge.Create(parent, n0, n1, subC, p.height, p.thickness,
-                p.baseWallHeight, p.material, p.targetSectionLength, p.baseStep, p.fixedTopY));
+                p.baseWallHeight, p.material, p.targetSectionLength, p.baseStep, p.fixedTopY,
+                p.baseY));
             touched.Add(n0);
             touched.Add(n1);
         }
@@ -239,6 +369,8 @@ public static class WallGraph
             below.nodeA.RebuildMesh();
         if (below.nodeB != null)
             below.nodeB.RebuildMesh();
+        // A roofless room whose wall just grew may have become level.
+        WallRoom.NotifyCourseLaid(below);
         Physics.SyncTransforms();
     }
 
@@ -250,10 +382,22 @@ public static class WallGraph
     // either way.
     public static void DeleteSections(Transform parent, WallEdge edge, int minIndex, int maxIndex)
     {
+        var doomed = new HashSet<int>();
+        for (int i = minIndex; i <= maxIndex; i++)
+            doomed.Add(i);
+        DeleteSections(parent, edge, doomed);
+    }
+
+    // The general form: any set of doomed indices, contiguous or not — a
+    // marquee can catch scattered sections of one edge, and the edge can
+    // only be surgered ONCE (the survivors are new edges with new
+    // indices), so all of an edge's doomed sections go in a single call.
+    public static void DeleteSections(Transform parent, WallEdge edge, ICollection<int> doomedIndices)
+    {
         var ranges = new List<(float lo, float hi)>();
         foreach (WallEdgeSection section in edge.SectionsInOrder())
         {
-            if (section.index >= minIndex && section.index <= maxIndex)
+            if (doomedIndices.Contains(section.index))
                 continue;
             if (ranges.Count > 0 && Mathf.Abs(ranges[ranges.Count - 1].hi - section.tStart) < 0.001f)
                 ranges[ranges.Count - 1] = (ranges[ranges.Count - 1].lo, section.tEnd);
@@ -285,6 +429,11 @@ public static class WallGraph
             return;
         }
 
+        // Deleting ground masonry breaches any room this edge bounded —
+        // the sub-edges cover less than the whole run, so the ring is
+        // open no matter which sections went.
+        WallRoom.NotifyBreach(edge);
+
         Vector3 s = edge.A, c = edge.control, e = edge.B;
         var slots2 = new List<StackSlot>();
         var touched = new HashSet<WallNode> { nodeA, nodeB };
@@ -301,7 +450,7 @@ public static class WallGraph
             SubCurve(s, c, e, lo, hi, out _, out Vector3 subC, out _);
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
-                edge.fixedTopY);
+                edge.fixedTopY, edge.baseY);
             slots2.Add(new StackSlot { below = sub, mapLo = lo, mapHi = hi, covLo = lo, covHi = hi });
             touched.Add(n0);
             touched.Add(n1);
@@ -361,11 +510,17 @@ public static class WallGraph
             SubCurve(s, c, e, t0, t1, out _, out Vector3 subC, out _);
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
-                edge.fixedTopY);
+                edge.fixedTopY, edge.baseY);
             slots.Add(new StackSlot { below = sub, mapLo = t0, mapHi = t1, covLo = t0, covHi = t1 });
             touched.Add(n0);
             touched.Add(n1);
         }
+        // The sub-edges cover the whole old run, so any room ring through
+        // this edge stays closed — it just re-points at the pieces.
+        var orderedSubs = new List<WallEdge>();
+        foreach (StackSlot slot in slots)
+            orderedSubs.Add(slot.below);
+        WallRoom.NotifySplit(edge, orderedSubs);
         RebuildStackOver(parent, edge, slots);
         Object.DestroyImmediate(edge.gameObject);
         foreach (WallNode n in touched)

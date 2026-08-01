@@ -36,6 +36,10 @@ public class WallEdge : MonoBehaviour
     // and only the bottom follows the terrain down. -Infinity (default)
     // means tops ride the ground instead (bottom + height per section).
     public float fixedTopY = float.NegativeInfinity;
+    // Elevated-ground walls: sections never drop below this — the base a
+    // wall stands on when built ON a room slab (roof deck or floor)
+    // instead of the terrain. -Infinity (default) rides the terrain.
+    public float baseY = float.NegativeInfinity;
     // Stacked course: this edge rides on stackBase's section tops.
     public WallEdge stackBase;
     // Coverage along the curve, in curve parameter — courses can be
@@ -70,7 +74,11 @@ public class WallEdge : MonoBehaviour
     {
         All.Remove(this);
         // Defensive cleanup for teardown paths that skip WallGraph: nodes
-        // silently drop this member (a node left empty dissolves).
+        // silently drop this member (a node left empty dissolves), and
+        // any room still ringing through this edge breaches. Graph ops
+        // that split (full coverage) re-point rooms BEFORE destroying, so
+        // this only fires for true deaths.
+        WallRoom.NotifyBreach(this);
         if (nodeA != null)
             nodeA.OnMemberGone(this);
         if (nodeB != null)
@@ -79,7 +87,8 @@ public class WallEdge : MonoBehaviour
 
     public static WallEdge Create(Transform parent, WallNode a, WallNode b, Vector3 control,
         float height, float thickness, float baseWallHeight, Material material,
-        float targetSectionLength, float baseStep, float fixedTopY = float.NegativeInfinity)
+        float targetSectionLength, float baseStep, float fixedTopY = float.NegativeInfinity,
+        float baseY = float.NegativeInfinity)
     {
         GameObject obj = new GameObject("WallEdge");
         obj.transform.SetParent(parent, false);
@@ -93,6 +102,7 @@ public class WallEdge : MonoBehaviour
         edge.targetSectionLength = targetSectionLength;
         edge.baseStep = baseStep;
         edge.fixedTopY = fixedTopY;
+        edge.baseY = baseY;
         edge.material = material;
         a.Attach(edge, true);
         b.Attach(edge, false);
@@ -136,7 +146,7 @@ public class WallEdge : MonoBehaviour
         List<SectionSpec> specs = stackBase != null
             ? stackBase.BuildCourseSpecs(height, baseWallHeight, tMin, tMax)
             : BuildSpecs(A, control, B, height, targetSectionLength, thickness, baseStep,
-                baseWallHeight, fixedTopY);
+                baseWallHeight, fixedTopY, baseY);
         foreach (SectionSpec spec in specs)
             CreateSection(spec);
         Physics.SyncTransforms();
@@ -181,7 +191,8 @@ public class WallEdge : MonoBehaviour
     // own everything past the caps.
     public static List<SectionSpec> BuildSpecs(Vector3 s, Vector3 c, Vector3 e,
         float height, float targetSectionLength, float thickness, float baseStep,
-        float baseWallHeight, float fixedTopY = float.NegativeInfinity)
+        float baseWallHeight, float fixedTopY = float.NegativeInfinity,
+        float baseY = float.NegativeInfinity)
     {
         var specs = new List<SectionSpec>();
         float[] arcTable = BuildArcTable(s, c, e);
@@ -198,7 +209,8 @@ public class WallEdge : MonoBehaviour
                 tStart = TAtArc(arcTable, totalArc * i / count),
                 tEnd = TAtArc(arcTable, totalArc * (i + 1) / count),
             };
-            spec.bottomY = SampleSliceGround(s, c, e, spec.tStart, spec.tEnd, thickness, baseStep);
+            spec.bottomY = Mathf.Max(
+                SampleSliceGround(s, c, e, spec.tStart, spec.tEnd, thickness, baseStep), baseY);
             FinishSpec(specs, s, c, e, spec, height, fixedTopY, thickness, baseWallHeight, arcTable);
         }
         return specs;

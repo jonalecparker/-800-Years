@@ -19,6 +19,28 @@ The wall system is a **node/edge graph** (`Docs/WallGraphRebuild.md` was the bri
 - `WallEdgeSection.bottomY/topY` is the source of truth. Never assume uniform section height or ground at y=0 (terrain exists; slice ground = min of sampled corners, quantized down by `baseStep`).
 - Bulge (0.5m) and foundation bases (0.5m) are deliberately **stepped** so separately-built structures align — don't make those continuous. Wall height is the exception: it scrolls **smoothly** (Ctrl+scroll, `heightScrollRate` 0.25m/notch, raw ±120 Windows deltas normalized), and alignment comes from snapping — a snapped ghost adopts the host's exact height. A **locked-top host matches by top elevation**, not stored height (`SnapHeightOf` = `fixedTopY` − ground at the snap), and `fixedTopY` survives splits.
 
+## Rooms, floors, roofs (2026-07-31)
+
+A room (`WallRoom`) is a **designated** enclosed face of the graph — a stored ring of `WallGraph.DirEdge`, never re-inferred. Same doctrine as the graph itself.
+
+- **Every new graph mutator must call the room hooks** — `WallRoom.NotifySplit` (splice sub-edges into rings, reversed when `!forward`), `NotifyBreach` (dissolve), `NotifyCourseLaid` (retry roofless rooms). A mutator that skips them leaves rings pointing at destroyed edges.
+- Roof requires all boundary stack-tops level within `LevelEps` and returns a **reason string** on failure — keep it that way; the log's honesty is the feature. Note the ring includes *reused* wall spans, so a room is only as level as the walls it borrowed.
+- The roof deck is flush (top AT the wall tops, footprint inset to inner faces). Coplanar surfaces are fine when they face opposite ways; same-facing coplanar z-fights — don't "fix" the inset by extending the deck to the outer faces.
+- `WallRoom.All` holds broken rooms until Unity's deferred `Destroy` runs — test `room.broken`, never registry counts, in the same frame.
+
+## Elevated ground (proto-storeys)
+
+- Room slabs are **build surfaces**: `WallEdge.baseY` (default −∞) raises a section's bottom, and slab hits are detected by collider name (`"RoomRoof"` → `roofY`, else `floorY`). Any new raycast that can hit a slab must decide deliberately whether it's ground.
+- **`EdgeParams` is a struct**: an object initializer that omits `baseY` gets **0, not −∞**. Set it explicitly everywhere, including tests.
+- Snaps are storey-filtered (`BaseMatches`) and adopt a host's storey (`AdoptSnapElevation`) — a gesture on a deck must never grab the masonry a storey below.
+- **The planar graph is height-blind**: an upper-storey wall crossing a ground wall in XZ still splits it. Known and deferred to the storeys/stairs design session — don't paper over it with special cases.
+
+## Placement state that expires
+
+- **`EffectiveWallHeight` is only meaningful on the hover/click frame** (it reads the live hover snap). Anything a gesture needs later — height, locked-top plane, storey — must be **captured at the anchor click** (`shapeTopY`, `roomChainTopY`, `anchorSnapHeight`). Recomputing mid-drag silently substitutes the HUD height; that bug shipped once and cost a half-step misalignment.
+- Ghost/overlay shells must scale about the **mesh bounds center** (`FitShell`), not the transform pivot — room slabs are world-space meshes on origin-pivoted objects, so pivot scaling translates them metres away.
+- `WallGraph.DeleteSections` surgers an edge **once** (survivors are new edges with new indices) — pass all of an edge's doomed indices in a single call via the set overload.
+
 ## Edge geometry
 
 - Section meshes are watertight only because neighbors evaluate the same curve at the same boundary parameter from one shared arc table. Section `tStart/tEnd` always lie in [0,1] now — the extended-arc machinery died with end extensions; edges cap flat exactly ON their node points.
