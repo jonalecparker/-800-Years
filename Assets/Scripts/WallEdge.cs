@@ -9,15 +9,13 @@ using UnityEngine;
 // no cut planes, no rebuild cascades. Both ends always cap flat exactly ON
 // their node's point; the node's post (WallNode) owns every joint.
 //
-// A stacked course is also a WallEdge: it shares its base edge's nodes and
-// curve, flags stackBase, and rides on the base's section tops instead of
-// the terrain. Courses never take part in the planar graph (no splits, no
-// crossings) — they cover a tMin..tMax span of their base and split
-// off-graph when deleted.
+// Height above the ground is baseY, not a separate kind of object: a wall
+// standing on another wall's top or on a room slab is an ordinary edge
+// with its own nodes, and the planar graph is filtered per base
+// (WallGraph.SameBase) so storeys never split or refuse one another.
 public class WallEdge : MonoBehaviour
 {
-    // Active edges, in no particular order. Courses are included and
-    // flagged by IsCourse.
+    // Active edges, in no particular order.
     public static readonly List<WallEdge> All = new List<WallEdge>();
 
     public WallNode nodeA;
@@ -28,7 +26,7 @@ public class WallEdge : MonoBehaviour
     public float height;
     public float thickness;
     // Texture-V anchor: one tile of stone per this much world height, so
-    // every wall and course shares aligned masonry lines.
+    // every wall shares aligned masonry lines.
     public float baseWallHeight = 3.5f;
     public float targetSectionLength = 1f;
     public float baseStep = 0.5f;
@@ -36,24 +34,27 @@ public class WallEdge : MonoBehaviour
     // and only the bottom follows the terrain down. -Infinity (default)
     // means tops ride the ground instead (bottom + height per section).
     public float fixedTopY = float.NegativeInfinity;
-    // Elevated-ground walls: sections never drop below this — the base a
-    // wall stands on when built ON a room slab (roof deck or floor)
-    // instead of the terrain. -Infinity (default) rides the terrain.
+    // Elevated walls: sections never drop below this — the base a wall
+    // stands on when built ON a room slab or another wall's top instead of
+    // the terrain. -Infinity (default) rides the terrain. Also the storey
+    // filter for every planar-graph query (WallGraph.SameBase).
     public float baseY = float.NegativeInfinity;
+    // How far BELOW baseY this wall's masonry actually starts. Purely
+    // geometric — baseY stays the storey (node identity and every planar
+    // query read it), while the skirt buries the joint. A wall standing on
+    // another wall's top needs it: an unlocked host's top STEPS with the
+    // terrain, so a flat bottom at one section's top leaves an open slot
+    // over every lower step. Buried stone costs nothing; daylight does.
+    public float skirt;
+    // Where the masonry actually starts — baseY less the buried skirt.
+    public float FloorY => float.IsNegativeInfinity(baseY) ? baseY : baseY - skirt;
     // Provenance: laid by the ROOM tool, not the wall tool. Stored, never
     // inferred from shape — a bailey ringed by curtain walls encloses a
     // face exactly like a hall does, and only this tells them apart when
     // the player asks to designate an enclosure after the fact. Surgery
     // copies it onto sub-edges: splitting a room wall leaves room walls.
     public bool roomBuilt;
-    // Stacked course: this edge rides on stackBase's section tops.
-    public WallEdge stackBase;
-    // Coverage along the curve, in curve parameter — courses can be
-    // partial after deletes. Ground edges always span 0..1.
-    public float tMin = 0f;
-    public float tMax = 1f;
 
-    public bool IsCourse => stackBase != null;
     public Vector3 A => nodeA != null ? nodeA.point : transform.position;
     public Vector3 B => nodeB != null ? nodeB.point : transform.position;
 
@@ -94,7 +95,7 @@ public class WallEdge : MonoBehaviour
     public static WallEdge Create(Transform parent, WallNode a, WallNode b, Vector3 control,
         float height, float thickness, float baseWallHeight, Material material,
         float targetSectionLength, float baseStep, float fixedTopY = float.NegativeInfinity,
-        float baseY = float.NegativeInfinity)
+        float baseY = float.NegativeInfinity, float skirt = 0f)
     {
         GameObject obj = new GameObject("WallEdge");
         obj.transform.SetParent(parent, false);
@@ -109,34 +110,10 @@ public class WallEdge : MonoBehaviour
         edge.baseStep = baseStep;
         edge.fixedTopY = fixedTopY;
         edge.baseY = baseY;
+        edge.skirt = skirt;
         edge.material = material;
         a.Attach(edge, true);
         b.Attach(edge, false);
-        edge.Rebuild();
-        return edge;
-    }
-
-    // A course shares its base's nodes and curve; only its vertical span
-    // and coverage differ. Courses are not node members — the node climbs
-    // stacks itself so its post rises with them.
-    public static WallEdge CreateCourse(Transform parent, WallEdge below, float courseHeight,
-        float courseBaseWallHeight, Material material, float tMin, float tMax)
-    {
-        GameObject obj = new GameObject("WallCourse");
-        obj.transform.SetParent(parent, false);
-        WallEdge edge = obj.AddComponent<WallEdge>();
-        edge.nodeA = below.nodeA;
-        edge.nodeB = below.nodeB;
-        edge.control = below.control;
-        edge.height = courseHeight;
-        edge.thickness = below.thickness;
-        edge.baseWallHeight = courseBaseWallHeight;
-        edge.targetSectionLength = below.targetSectionLength;
-        edge.baseStep = below.baseStep;
-        edge.stackBase = below;
-        edge.tMin = tMin;
-        edge.tMax = tMax;
-        edge.material = material;
         edge.Rebuild();
         return edge;
     }
@@ -149,10 +126,8 @@ public class WallEdge : MonoBehaviour
         foreach (WallEdgeSection section in GetComponentsInChildren<WallEdgeSection>())
             DestroyImmediate(section.gameObject);
 
-        List<SectionSpec> specs = stackBase != null
-            ? stackBase.BuildCourseSpecs(height, baseWallHeight, tMin, tMax)
-            : BuildSpecs(A, control, B, height, targetSectionLength, thickness, baseStep,
-                baseWallHeight, fixedTopY, baseY);
+        List<SectionSpec> specs = BuildSpecs(A, control, B, height, targetSectionLength,
+            thickness, baseStep, baseWallHeight, fixedTopY, FloorY);
         foreach (SectionSpec spec in specs)
             CreateSection(spec);
         Physics.SyncTransforms();
@@ -168,8 +143,8 @@ public class WallEdge : MonoBehaviour
         sectionObj.AddComponent<MeshRenderer>().sharedMaterial = material;
 
         // Box approximation of the (slightly curved) slice — used only for
-        // cursor raycasts (targeting, course hover, delete), never for
-        // occupancy inference.
+        // cursor raycasts (targeting, building on the top face, delete),
+        // never for occupancy inference.
         BoxCollider box = sectionObj.AddComponent<BoxCollider>();
         box.size = new Vector3(spec.arcLength, spec.topY - spec.bottomY, thickness);
 
@@ -220,60 +195,6 @@ public class WallEdge : MonoBehaviour
             FinishSpec(specs, s, c, e, spec, height, fixedTopY, thickness, baseWallHeight, arcTable);
         }
         return specs;
-    }
-
-    // Sections for a course laid on this edge, covering rangeMin..rangeMax
-    // of the curve: same slices as the sections below, each base sitting
-    // on the section top beneath it — courses align by construction and
-    // gaps below stay gaps above.
-    public List<SectionSpec> BuildCourseSpecs(float courseHeight, float courseBaseWallHeight,
-        float rangeMin = 0f, float rangeMax = 1f)
-    {
-        var specs = new List<SectionSpec>();
-        float[] arcTable = BuildArcTable(A, control, B);
-        foreach (WallEdgeSection below in SectionsInOrder())
-        {
-            float mid = (below.tStart + below.tEnd) * 0.5f;
-            if (mid < rangeMin - 0.001f || mid > rangeMax + 0.001f)
-                continue;
-            var spec = new SectionSpec
-            {
-                index = below.index,
-                tStart = below.tStart,
-                tEnd = below.tEnd,
-                bottomY = below.topY,
-            };
-            FinishSpec(specs, A, control, B, spec, courseHeight, float.NegativeInfinity,
-                thickness, courseBaseWallHeight, arcTable);
-        }
-        return specs;
-    }
-
-    // The spans of this edge's coverage not yet under a stacked course —
-    // where a new course can lie. Fully covered returns an empty list.
-    public List<(float lo, float hi)> UncoveredRanges()
-    {
-        var ranges = new List<(float lo, float hi)> { (tMin, tMax) };
-        foreach (WallEdge other in All)
-        {
-            if (other.stackBase != this)
-                continue;
-            var next = new List<(float lo, float hi)>();
-            foreach ((float lo, float hi) in ranges)
-            {
-                if (other.tMax <= lo + 0.001f || other.tMin >= hi - 0.001f)
-                {
-                    next.Add((lo, hi));
-                    continue;
-                }
-                if (other.tMin > lo + 0.01f)
-                    next.Add((lo, other.tMin));
-                if (other.tMax < hi - 0.01f)
-                    next.Add((other.tMax, hi));
-            }
-            ranges = next;
-        }
-        return ranges;
     }
 
     // Finishes a prepared spec (index, t-range, bottomY set): vertical
@@ -518,8 +439,8 @@ public class WallEdge : MonoBehaviour
         var triangles = new List<int>();
 
         // Texture V is anchored to world height so stone courses line up
-        // across sections and courses; taller walls show more courses
-        // rather than stretched ones.
+        // across sections and across storeys; taller walls show more
+        // courses rather than stretched ones.
         float vBottom = bottomY / baseWallHeight;
         float vTop = topY / baseWallHeight;
 

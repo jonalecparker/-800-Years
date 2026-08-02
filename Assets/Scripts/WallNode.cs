@@ -17,13 +17,19 @@ public class WallNode : MonoBehaviour
 {
     public static readonly List<WallNode> All = new List<WallNode>();
 
+    // Stored at y = 0: a node is an XZ point. Its elevation comes from
+    // baseY (and, below that, the terrain).
     public Vector3 point;
     public float radius;
+    // The base its members stand on — terrain (-inf) or the masonry/slab
+    // top of a storey. Part of the node's IDENTITY: a wall built on
+    // another wall's top ends directly above that wall's node and must NOT
+    // weld onto it, or one post would try to render two storeys of joint.
+    public float baseY = float.NegativeInfinity;
 
     // One edge end resting on this node. An edge appears once per end it
     // parks here (a loop edge would appear twice, but placement refuses
-    // those). Stacked courses are NOT members — the node climbs stacks
-    // itself when reading heights, so posts rise with the courses.
+    // those).
     public struct Member
     {
         public WallEdge edge;
@@ -51,10 +57,12 @@ public class WallNode : MonoBehaviour
             Destroy(ownedMesh);
     }
 
-    public static WallNode FindAt(Vector3 p)
+    public static WallNode FindAt(Vector3 p, float baseY)
     {
         foreach (WallNode node in All)
         {
+            if (!WallGraph.SameBase(node.baseY, baseY))
+                continue;
             float dx = node.point.x - p.x, dz = node.point.z - p.z;
             if (dx * dx + dz * dz < PointSq)
                 return node;
@@ -62,11 +70,12 @@ public class WallNode : MonoBehaviour
         return null;
     }
 
-    // The node at p, existing or new. Graph code is the only caller —
-    // nodes are never created as a side effect of geometry.
-    public static WallNode Create(Transform parent, Vector3 p, float radius, Material material)
+    // The node at p on the given base, existing or new. Graph code is the
+    // only caller — nodes are never created as a side effect of geometry.
+    public static WallNode Create(Transform parent, Vector3 p, float baseY, float radius,
+        Material material)
     {
-        WallNode node = FindAt(p);
+        WallNode node = FindAt(p, baseY);
         if (node != null)
             return node;
         GameObject obj = new GameObject("WallNode");
@@ -74,6 +83,7 @@ public class WallNode : MonoBehaviour
         obj.transform.position = new Vector3(p.x, 0f, p.z);
         node = obj.AddComponent<WallNode>();
         node.point = new Vector3(p.x, 0f, p.z);
+        node.baseY = baseY;
         node.radius = radius;
         node.material = material;
         return node;
@@ -104,8 +114,7 @@ public class WallNode : MonoBehaviour
     }
 
     // One member end at this node: the direction its body runs off in,
-    // and the vertical span of its masonry here (its end section, plus
-    // any stacked courses reaching this end — the post rises with them).
+    // and the vertical span of its masonry here (its end section).
     struct MemberEnd
     {
         public float bearing;
@@ -144,30 +153,6 @@ public class WallNode : MonoBehaviour
         if (!TryEndSpan(edge, atStart, out float bottom, out float top))
             return;
 
-        // Climb the course stack: each course that reaches this end lifts
-        // the post's top to its own.
-        WallEdge below = edge;
-        bool climbed = true;
-        while (climbed)
-        {
-            climbed = false;
-            foreach (WallEdge course in WallEdge.All)
-            {
-                if (course.stackBase != below)
-                    continue;
-                bool reaches = atStart
-                    ? course.tMin <= below.tMin + 0.02f
-                    : course.tMax >= below.tMax - 0.02f;
-                if (!reaches)
-                    continue;
-                if (TryEndSpan(course, atStart, out _, out float courseTop))
-                    top = Mathf.Max(top, courseTop);
-                below = course;
-                climbed = true;
-                break;
-            }
-        }
-
         ends.Add(new MemberEnd
         {
             bearing = Mathf.Atan2(inward.z, inward.x) * Mathf.Rad2Deg,
@@ -183,7 +168,7 @@ public class WallNode : MonoBehaviour
     {
         bottom = 0f;
         top = 0f;
-        float target = atStart ? edge.tMin : edge.tMax;
+        float target = atStart ? 0f : 1f;
         float bestD = float.MaxValue;
         foreach (WallEdgeSection section in edge.GetComponentsInChildren<WallEdgeSection>())
         {

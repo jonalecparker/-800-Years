@@ -160,18 +160,13 @@ public class WallRoom : MonoBehaviour
                 room.Break();
     }
 
-    // A course landed somewhere: a roofless room whose boundary just got
-    // taller may have become level — retry the roof. Roofed rooms keep
-    // their frozen roofY, so the new course rises past it as a parapet.
-    public static void NotifyCourseLaid(WallEdge below)
+    // Masonry landed somewhere: a room that refused a roof may have just
+    // become roofable — retry every roofless one. Roofed rooms keep their
+    // frozen roofY, so later walls rise past it as a parapet.
+    public static void RetryRoofless()
     {
-        while (below != null && below.stackBase != null)
-            below = below.stackBase;
-        if (below == null)
-            return;
         foreach (WallRoom room in All)
-            if (!room.broken && room.roofObj == null && room.ContainsEdge(below)
-                && room.TryBuildRoof() == null)
+            if (!room.broken && room.roofObj == null && room.TryBuildRoof() == null)
                 BuildLog.Add(room.roofNote.Length == 0
                     ? "Roof added — walls now level."
                     : $"Roof added{room.roofNote}.");
@@ -293,7 +288,7 @@ public class WallRoom : MonoBehaviour
             len[i] = Vector3.Distance(e.A, e.B);
             foreach (WallEdgeSection s in sections)
             {
-                float top = StackTopOver(e, (s.tStart + s.tEnd) * 0.5f, s.topY);
+                float top = s.topY;
                 if (top < lo[i])
                 {
                     lo[i] = top;
@@ -464,35 +459,6 @@ public class WallRoom : MonoBehaviour
         return octants[Mathf.RoundToInt(Mathf.Repeat(bearing, 360f) / 45f) % 8];
     }
 
-    // Top of the masonry stack over one span of a ground edge: climb the
-    // stacked courses covering that span and take the highest top.
-    static float StackTopOver(WallEdge ground, float mid, float baseTop)
-    {
-        float top = baseTop;
-        WallEdge cur = ground;
-        bool climbed = true;
-        while (climbed)
-        {
-            climbed = false;
-            foreach (WallEdge e in WallEdge.All)
-            {
-                if (e.stackBase != cur || mid < e.tMin - 0.001f || mid > e.tMax + 0.001f)
-                    continue;
-                foreach (WallEdgeSection s in e.SectionsInOrder())
-                {
-                    if (s.tStart - 0.001f <= mid && mid <= s.tEnd + 0.001f)
-                    {
-                        top = Mathf.Max(top, s.topY);
-                        break;
-                    }
-                }
-                cur = e;
-                climbed = true;
-                break;
-            }
-        }
-        return top;
-    }
 
     GameObject BuildSlab(string name, List<Vector3> poly, float y0, float y1, out Mesh mesh)
     {

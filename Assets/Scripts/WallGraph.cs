@@ -16,9 +16,14 @@ public static class WallGraph
         public float targetSectionLength;
         public float baseStep;
         public float fixedTopY;
-        // Elevated ground (a room slab top) the wall stands on; -inf
-        // rides the terrain.
+        // Elevated ground (a room slab or wall top) the wall stands on;
+        // -inf rides the terrain. This is the STOREY: node identity and
+        // every planar query filter on it.
         public float baseY;
+        // How far below baseY the masonry starts — buries a stacked wall
+        // into the stepped top carrying it. Geometry only; 0 is always a
+        // safe default (see WallEdge.skirt).
+        public float skirt;
         public Material material;
         // Stamped onto every edge the gesture creates: the room tool's
         // walls can be designated a room after the fact, the wall tool's
@@ -58,6 +63,20 @@ public static class WallGraph
     // there (the flank snap puts its point exactly on the centerline).
     const float CenterlineLand = 0.12f;
     const int CurveSamples = 48;
+    // Two things stand on the same base when both ride the terrain, or
+    // both sit on masonry/slab within this of each other. The planar
+    // graph is per-storey: crossings, the redraw refusal, centerline
+    // landings and node identity all apply WITHIN one base only, so a
+    // wall built on a wall top passes over the graph below without
+    // touching it.
+    public const float BaseTolerance = 0.25f;
+
+    public static bool SameBase(float a, float b)
+    {
+        if (float.IsNegativeInfinity(a) || float.IsNegativeInfinity(b))
+            return float.IsNegativeInfinity(a) && float.IsNegativeInfinity(b);
+        return Mathf.Abs(a - b) <= BaseTolerance;
+    }
 
     // ------------------------------------------------------------------
     // Queries (also used by previews)
@@ -67,7 +86,9 @@ public static class WallGraph
     // sorted along the proposed run. Every one becomes a shared node at
     // commit — both walls split, four edges meet, the node draws the
     // joint.
-    public static List<Crossing> FindCrossings(Vector3 s, Vector3 c, Vector3 e)
+    // Edges on another base are passed OVER, not crossed: an upper-storey
+    // wall running above a courtyard wall shares nothing with it.
+    public static List<Crossing> FindCrossings(Vector3 s, Vector3 c, Vector3 e, float baseY)
     {
         var crossings = new List<Crossing>();
         Vector3[] mine = SampleCurve(s, c, e);
@@ -75,7 +96,7 @@ public static class WallGraph
 
         foreach (WallEdge host in WallEdge.All)
         {
-            if (host.IsCourse)
+            if (!SameBase(host.baseY, baseY))
                 continue;
             if (!myBounds.Intersects(CurveBounds(host.A, host.control, host.B, 0.5f)))
                 continue;
@@ -127,7 +148,10 @@ public static class WallGraph
     // off a shared node, flush parallel runs, and crossings are all legal
     // (crossings split); this only guards the degenerate coincident case
     // that would z-fight and hide a duplicate edge inside another.
-    public static bool OverlapsExisting(Vector3 s, Vector3 c, Vector3 e)
+    // Only against masonry on the SAME base — drawing a wall along the top
+    // of another wall is the whole point of an upper storey, and reads as
+    // a coincident redraw in XZ.
+    public static bool OverlapsExisting(Vector3 s, Vector3 c, Vector3 e, float baseY)
     {
         const float MaxDist = 0.15f;
         const float MinParallel = 0.9986f; // cos 3°
@@ -138,7 +162,7 @@ public static class WallGraph
 
         foreach (WallEdge host in WallEdge.All)
         {
-            if (host.IsCourse)
+            if (!SameBase(host.baseY, baseY))
                 continue;
             if (!myBounds.Intersects(CurveBounds(host.A, host.control, host.B, MaxDist + 0.1f)))
                 continue;
@@ -182,7 +206,7 @@ public static class WallGraph
         float bestArea = float.MaxValue;
         foreach (WallEdge e in WallEdge.All)
         {
-            if (e == null || e.IsCourse)
+            if (e == null)
                 continue;
             for (int dir = 0; dir < 2; dir++)
             {
@@ -286,7 +310,7 @@ public static class WallGraph
     // tolerances as the redraw refusal). The shape tools read this to
     // REUSE a host wall as a figure side (~1.0) instead of redrawing it,
     // and to refuse a side that only partially lines up.
-    public static float CoincidentCoverage(Vector3 s, Vector3 c, Vector3 e)
+    public static float CoincidentCoverage(Vector3 s, Vector3 c, Vector3 e, float baseY)
     {
         const float MaxDist = 0.15f;
         const float MinParallel = 0.9986f; // cos 3°
@@ -295,7 +319,8 @@ public static class WallGraph
         Bounds myBounds = CurveBounds(s, c, e, MaxDist + 0.1f);
         var hosts = new List<WallEdge>();
         foreach (WallEdge h in WallEdge.All)
-            if (!h.IsCourse && myBounds.Intersects(CurveBounds(h.A, h.control, h.B, MaxDist + 0.1f)))
+            if (SameBase(h.baseY, baseY)
+                && myBounds.Intersects(CurveBounds(h.A, h.control, h.B, MaxDist + 0.1f)))
                 hosts.Add(h);
         if (hosts.Count == 0)
             return 0f;
@@ -334,7 +359,7 @@ public static class WallGraph
         var created = new List<WallEdge>();
         if (Flat(s, e) < 0.05f)
             return created;
-        if (OverlapsExisting(s, c, e))
+        if (OverlapsExisting(s, c, e, p.baseY))
             return created;
 
         WallNode start = ResolveEndNode(parent, s, p);
@@ -342,7 +367,7 @@ public static class WallGraph
         if (start == null || end == null || start == end)
             return created;
 
-        var crossings = FindCrossings(s, c, e);
+        var crossings = FindCrossings(s, c, e, p.baseY);
 
         // Split each crossed host once, at every crossing it carries.
         var chain = new List<(float t, WallNode node)> { (0f, start), (1f, end) };
@@ -380,7 +405,7 @@ public static class WallGraph
             SubCurve(s, c, e, t0, t1, out _, out Vector3 subC, out _);
             WallEdge made = WallEdge.Create(parent, n0, n1, subC, p.height, p.thickness,
                 p.baseWallHeight, p.material, p.targetSectionLength, p.baseStep, p.fixedTopY,
-                p.baseY);
+                p.baseY, p.skirt);
             made.roomBuilt = p.roomBuilt;
             created.Add(made);
             touched.Add(n0);
@@ -390,33 +415,20 @@ public static class WallGraph
             if (n != null)
                 n.RebuildMesh();
         Physics.SyncTransforms();
+        // A room that refused a roof may have just been completed or
+        // levelled by this run.
+        if (created.Count > 0)
+            WallRoom.RetryRoofless();
         return created;
     }
 
-    // Lays a course over every span of `below` not already covered by
-    // one, and lifts the end posts to match.
-    public static void CommitCourse(Transform parent, WallEdge below, float courseHeight,
-        float courseBaseWallHeight, Material material)
-    {
-        foreach ((float lo, float hi) in below.UncoveredRanges())
-            if (hi - lo > 0.01f)
-                WallEdge.CreateCourse(parent, below, courseHeight, courseBaseWallHeight,
-                    material, lo, hi);
-        if (below.nodeA != null)
-            below.nodeA.RebuildMesh();
-        if (below.nodeB != null)
-            below.nodeB.RebuildMesh();
-        // A roofless room whose wall just grew may have become level.
-        WallRoom.NotifyCourseLaid(below);
-        Physics.SyncTransforms();
-    }
-
-    // Deletes a run of sections from an edge. A ground edge splits into
+    // Deletes a run of sections from an edge. The edge splits into
     // sub-edges over the kept ranges — hole boundaries get new flat-capped
     // 1-valent nodes, end nodes are reused where a range touches them,
-    // and nodes left with no members dissolve. A course splits off-graph
-    // into partial courses. Stacked courses above follow the survivors
-    // either way.
+    // and nodes left with no members dissolve. Masonry standing on this
+    // edge is NOT followed: nothing stores what rests on what yet, so an
+    // upper wall over a deleted span is left hanging (deliberate — the
+    // support rules are a later design).
     public static void DeleteSections(Transform parent, WallEdge edge, int minIndex, int maxIndex)
     {
         var doomed = new HashSet<int>();
@@ -445,55 +457,33 @@ public static class WallGraph
         WallNode nodeA = edge.nodeA;
         WallNode nodeB = edge.nodeB;
 
-        if (edge.IsCourse)
-        {
-            // Courses split off-graph: same base, partial coverage. Their
-            // curve is the base's, so no reparametrization happens here.
-            var slots = new List<StackSlot>();
-            foreach ((float lo, float hi) in ranges)
-            {
-                WallEdge sub = WallEdge.CreateCourse(parent, edge.stackBase, edge.height,
-                    edge.baseWallHeight, edge.material, lo, hi);
-                slots.Add(new StackSlot { below = sub, mapLo = 0f, mapHi = 1f, covLo = lo, covHi = hi });
-            }
-            RebuildStackOver(parent, edge, slots);
-            Object.DestroyImmediate(edge.gameObject);
-            if (nodeA != null)
-                nodeA.RebuildMesh();
-            if (nodeB != null)
-                nodeB.RebuildMesh();
-            Physics.SyncTransforms();
-            return;
-        }
-
-        // Deleting ground masonry breaches any room this edge bounded —
+        // Deleting masonry breaches any room this edge bounded —
         // the sub-edges cover less than the whole run, so the ring is
         // open no matter which sections went.
         WallRoom.NotifyBreach(edge);
 
         Vector3 s = edge.A, c = edge.control, e = edge.B;
-        var slots2 = new List<StackSlot>();
         var touched = new HashSet<WallNode> { nodeA, nodeB };
         foreach ((float lo, float hi) in ranges)
         {
             WallNode n0 = lo < 0.001f
                 ? nodeA
-                : WallNode.Create(parent, WallEdge.Evaluate(s, c, e, lo), edge.thickness * 0.5f, edge.material);
+                : WallNode.Create(parent, WallEdge.Evaluate(s, c, e, lo), edge.baseY,
+                    edge.thickness * 0.5f, edge.material);
             WallNode n1 = hi > 0.999f
                 ? nodeB
-                : WallNode.Create(parent, WallEdge.Evaluate(s, c, e, hi), edge.thickness * 0.5f, edge.material);
+                : WallNode.Create(parent, WallEdge.Evaluate(s, c, e, hi), edge.baseY,
+                    edge.thickness * 0.5f, edge.material);
             if (n0 == n1)
                 continue;
             SubCurve(s, c, e, lo, hi, out _, out Vector3 subC, out _);
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
-                edge.fixedTopY, edge.baseY);
+                edge.fixedTopY, edge.baseY, edge.skirt);
             sub.roomBuilt = edge.roomBuilt;
-            slots2.Add(new StackSlot { below = sub, mapLo = lo, mapHi = hi, covLo = lo, covHi = hi });
             touched.Add(n0);
             touched.Add(n1);
         }
-        RebuildStackOver(parent, edge, slots2);
         Object.DestroyImmediate(edge.gameObject);
         foreach (WallNode n in touched)
             if (n != null)
@@ -505,12 +495,11 @@ public static class WallGraph
     // Internals
     // ------------------------------------------------------------------
 
-    // Splits one ground edge at several curve parameters in a single
-    // pass: nodes at the split points, exact sub-curves between them, the
-    // course stack remapped over the sub-edges, the original destroyed.
-    // Returns one node per requested t (an end node where the t lands on
-    // one). The end nodes never dissolve mid-split: sub-edges attach
-    // before the original detaches.
+    // Splits one edge at several curve parameters in a single pass: nodes
+    // at the split points, exact sub-curves between them, the original
+    // destroyed. Returns one node per requested t (an end node where the t
+    // lands on one). The end nodes never dissolve mid-split: sub-edges
+    // attach before the original detaches.
     public static List<WallNode> SplitEdgeAtMany(Transform parent, WallEdge edge, List<float> ts)
     {
         Vector3 s = edge.A, c = edge.control, e = edge.B;
@@ -529,7 +518,8 @@ public static class WallGraph
                 result.Add(edge.nodeB);
                 continue;
             }
-            WallNode node = WallNode.Create(parent, pt, edge.thickness * 0.5f, edge.material);
+            WallNode node = WallNode.Create(parent, pt, edge.baseY, edge.thickness * 0.5f,
+                edge.material);
             result.Add(node);
             bounds.Add((t, node));
         }
@@ -537,7 +527,7 @@ public static class WallGraph
             return result;
 
         bounds.Sort((x, y) => x.t.CompareTo(y.t));
-        var slots = new List<StackSlot>();
+        var orderedSubs = new List<WallEdge>();
         var touched = new HashSet<WallNode>();
         for (int i = 0; i + 1 < bounds.Count; i++)
         {
@@ -548,19 +538,15 @@ public static class WallGraph
             SubCurve(s, c, e, t0, t1, out _, out Vector3 subC, out _);
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
-                edge.fixedTopY, edge.baseY);
+                edge.fixedTopY, edge.baseY, edge.skirt);
             sub.roomBuilt = edge.roomBuilt;
-            slots.Add(new StackSlot { below = sub, mapLo = t0, mapHi = t1, covLo = t0, covHi = t1 });
+            orderedSubs.Add(sub);
             touched.Add(n0);
             touched.Add(n1);
         }
         // The sub-edges cover the whole old run, so any room ring through
         // this edge stays closed — it just re-points at the pieces.
-        var orderedSubs = new List<WallEdge>();
-        foreach (StackSlot slot in slots)
-            orderedSubs.Add(slot.below);
         WallRoom.NotifySplit(edge, orderedSubs);
-        RebuildStackOver(parent, edge, slots);
         Object.DestroyImmediate(edge.gameObject);
         foreach (WallNode n in touched)
             if (n != null)
@@ -574,13 +560,13 @@ public static class WallGraph
     // puts it exactly on the centerline), or a brand new free node.
     static WallNode ResolveEndNode(Transform parent, Vector3 point, EdgeParams p)
     {
-        WallNode node = WallNode.FindAt(point);
+        WallNode node = WallNode.FindAt(point, p.baseY);
         if (node != null)
             return node;
 
         foreach (WallEdge edge in new List<WallEdge>(WallEdge.All))
         {
-            if (edge == null || edge.IsCourse)
+            if (edge == null || !SameBase(edge.baseY, p.baseY))
                 continue;
             float t = edge.NearestT(point, out float distSq);
             if (distSq > CenterlineLand * CenterlineLand)
@@ -589,59 +575,7 @@ public static class WallGraph
             return nodes[0];
         }
 
-        return WallNode.Create(parent, point, p.thickness * 0.5f, p.material);
-    }
-
-    // One replacement piece under a course stack: `below` is the new
-    // supporting edge, mapLo/mapHi say how the old curve parameter maps
-    // into its own (t_old → (t_old − mapLo) / (mapHi − mapLo)), and
-    // covLo/covHi is the old-parameter span it actually covers.
-    struct StackSlot
-    {
-        public WallEdge below;
-        public float mapLo;
-        public float mapHi;
-        public float covLo;
-        public float covHi;
-    }
-
-    // Rebuilds the course stack of a dying edge over its replacement
-    // pieces, layer by layer: each course re-derives from whichever new
-    // supports its span overlaps, clipped to them, and courses above
-    // follow recursively. Spans over holes simply vanish — masonry never
-    // floats.
-    static void RebuildStackOver(Transform parent, WallEdge oldBelow, List<StackSlot> slots)
-    {
-        var courses = new List<WallEdge>();
-        foreach (WallEdge x in WallEdge.All)
-            if (x != null && x.stackBase == oldBelow)
-                courses.Add(x);
-
-        foreach (WallEdge course in courses)
-        {
-            var next = new List<StackSlot>();
-            foreach (StackSlot slot in slots)
-            {
-                float lo = Mathf.Max(course.tMin, slot.covLo);
-                float hi = Mathf.Min(course.tMax, slot.covHi);
-                if (hi - lo < 0.01f)
-                    continue;
-                float span = slot.mapHi - slot.mapLo;
-                WallEdge sub = WallEdge.CreateCourse(parent, slot.below, course.height,
-                    course.baseWallHeight, course.material,
-                    (lo - slot.mapLo) / span, (hi - slot.mapLo) / span);
-                next.Add(new StackSlot
-                {
-                    below = sub,
-                    mapLo = slot.mapLo,
-                    mapHi = slot.mapHi,
-                    covLo = lo,
-                    covHi = hi,
-                });
-            }
-            RebuildStackOver(parent, course, next);
-            Object.DestroyImmediate(course.gameObject);
-        }
+        return WallNode.Create(parent, point, p.baseY, p.thickness * 0.5f, p.material);
     }
 
     // Exact Bézier segment extraction: the quadratic's polar form gives

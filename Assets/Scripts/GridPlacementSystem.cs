@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
@@ -122,7 +122,13 @@ public class GridPlacementSystem : MonoBehaviour
     {
         if (float.IsNegativeInfinity(edge.fixedTopY))
             return edge.height;
-        return Mathf.Max(0.25f, edge.fixedTopY - SampleCellGroundY(at.x, at.z));
+        // Measured from the wall's OWN floor: a stacked wall stands on a
+        // storey, not on the terrain a storey below, and its skirt (the
+        // part buried in the masonry carrying it) is not height either.
+        float floor = float.IsNegativeInfinity(edge.baseY)
+            ? SampleCellGroundY(at.x, at.z)
+            : edge.baseY;
+        return Mathf.Max(0.25f, edge.fixedTopY - floor);
     }
 
     // How many sections the active preview will actually lay down —
@@ -186,12 +192,21 @@ public class GridPlacementSystem : MonoBehaviour
     private readonly List<Transform> doomedSections = new List<Transform>();
     private readonly List<WallEdge.SectionSpec> splineSpecs = new List<WallEdge.SectionSpec>();
     private readonly List<Mesh> previewMeshes = new List<Mesh>();
-    private (Vector3 start, Vector3 end, float bulge, float apexT, float height, float topY, float baseY, float trimStart, float trimEnd)? lastPreviewKey;
+    private (Vector3 start, Vector3 end, Vector3 control, float height, float topY, float baseY, float trimStart, float trimEnd)? lastPreviewKey;
     // The TRUE curve a release will commit — the preview may trim its
     // display back to a host's face, but the graph always gets the full
     // centerline-to-centerline gesture.
-    private (Vector3 s, Vector3 c, Vector3 e, float height, float topY, float baseY)? pendingCommit;
-    private (WallEdge edge, float height)? lastCourseKey;
+    // One entry for an ordinary gesture; one PER HOST for a ride that runs
+    // across several walls, since each committed edge takes the exact
+    // curve of the wall under it and the graph meets them at nodes.
+    private readonly List<(Vector3 s, Vector3 c, Vector3 e, float height, float topY, float baseY, float skirt)> pendingCommits
+        = new List<(Vector3, Vector3, Vector3, float, float, float, float)>();
+    // The host spans a ride currently covers, in order from the anchor.
+    private readonly List<(WallEdge host, float tA, float tB)> rideSpans
+        = new List<(WallEdge, float, float)>();
+    private (Vector3 start, Vector3 end, float height, float baseY, int spans, float lastT)? lastRideKey;
+    // Set while a ride is walking to a point it must hit exactly.
+    private bool rideExact;
     private bool previewBlocked;
     private List<WallGraph.Crossing> previewCrossings = new List<WallGraph.Crossing>();
     private EndSnap? hoverSnap;
@@ -309,6 +324,25 @@ public class GridPlacementSystem : MonoBehaviour
     // to the terrain. Captured per gesture at the anchor click.
     private float? hoverBaseY;
     private float? anchorBaseY;
+    // The wall whose TOP FACE the cursor is on, and the one the gesture
+    // anchored on. While a run stays on one host's top it RIDES that
+    // host's centerline: the drawn edge takes its curve from the wall
+    // below (WallGraph.SubCurve), so a storey over a curved wall follows
+    // it exactly instead of being eyeballed with the bulge wheel. Alt
+    // (free placement) skips the ride like every other snap.
+    private WallEdge hoverRideHost;
+    private WallEdge anchorRideHost;
+    // The storey the CURSOR RAY names, which is not always the storey the
+    // gesture builds on: pointing at a ground wall's side means the ground
+    // storey even though nothing elevated is being hovered. Snaps compare
+    // XZ only, so a wall and the wall stacked on it are a dead tie — the
+    // ray is the one thing that can tell them apart, and throwing it away
+    // made the hover flip between storeys on every stack.
+    private float? hoverSnapBase;
+    // The host the CURRENT preview is riding — the gesture's own host
+    // while the run stays on it, cleared the moment Alt frees the run so
+    // the ghost stops inheriting a curve it no longer follows.
+    private WallEdge previewRideHost;
     private float? roomChainBaseY;
     private float? shapeBaseY;
     // Shape gestures adopt a snapped anchor's height like walls do.
@@ -368,6 +402,7 @@ public class GridPlacementSystem : MonoBehaviour
         hoverSnapYaw = null;
         hoverSnapHeight = null;
         hoverBaseY = null;
+        hoverSnapBase = null;
         pendingNodeGhosts.Clear();
 
         if (Mode == ToolMode.Delete)
@@ -498,7 +533,17 @@ public class GridPlacementSystem : MonoBehaviour
         }
         else if (Shape == BuildShape.Curved)
         {
-            if (splineEnd.HasValue)
+            // Stacking inherits the host's curve exactly, so the bulge
+            // wheel is not offered — there is nothing left for it to bend.
+            if (anchorRideHost != null)
+            {
+                context = "Wall · Curved · stacking on a wall";
+                lines.Add("Move along the walls — it follows on past corners");
+                lines.Add("Alt — leave the wall below (free placement)");
+                lines.Add("Ctrl + scroll — wall height");
+                lines.Add("Esc — cancel the wall");
+            }
+            else if (splineEnd.HasValue)
             {
                 context = "Wall · Curved · bend";
                 lines.Add("Scroll — curve bulge");
@@ -521,12 +566,34 @@ public class GridPlacementSystem : MonoBehaviour
         }
         else if (splineStart.HasValue)
         {
-            context = "Wall · drag";
-            lines.Add("Shift — 5° direction steps");
-            lines.Add("C — tangent-tied connector (both ends snapped)");
-            lines.Add("Alt — free placement (no snapping or stepping)");
+            // Stacking has no free direction, so the keys that steer one
+            // (Shift, C) are deliberately absent — the run can only slide
+            // along the wall below.
+            if (anchorRideHost != null)
+            {
+                context = "Wall · stacking on a wall";
+                lines.Add("Drag along the walls — it follows on past corners");
+                lines.Add("Alt — leave the wall below (free placement)");
+                lines.Add("Ctrl + scroll — wall height");
+                lines.Add("Esc — cancel the drag");
+            }
+            else
+            {
+                context = "Wall · drag";
+                lines.Add("Shift — 5° direction steps");
+                lines.Add("C — tangent-tied connector (both ends snapped)");
+                lines.Add("Alt — free placement (no snapping or stepping)");
+                lines.Add("Ctrl + scroll — wall height");
+                lines.Add("Esc — cancel the drag");
+            }
+        }
+        else if (hoverRideHost != null)
+        {
+            // R is absent on purpose: the stub takes the host's bearing.
+            context = "Wall · on a wall top";
+            lines.Add("Drag along the walls — raise a storey over them");
+            lines.Add("Alt — leave the wall below (free placement)");
             lines.Add("Ctrl + scroll — wall height");
-            lines.Add("Esc — cancel the drag");
         }
         else
         {
@@ -561,6 +628,9 @@ public class GridPlacementSystem : MonoBehaviour
     void UpdateBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
         HandleHeightScroll(mouse, keyboard);
+        // Re-established every frame by whichever preview is actually
+        // riding — an unclaimed frame means the ghost is free.
+        previewRideHost = null;
 
         if (Shape == BuildShape.Curved)
             UpdateCurvedBuild(mouse, keyboard, ray, overUI);
@@ -574,9 +644,9 @@ public class GridPlacementSystem : MonoBehaviour
     // drag crosses is auto-split into a shared 4-way node (posts preview
     // gold at the crossing points). Holding Shift with both ends snapped
     // opts into the tangent-tied connector (TryTangentControl) — the wall
-    // auto-curves to tie in flush at both hosts. Hovering an existing
-    // wall's top face previews a course along it instead, and one click
-    // lays it; R turns the single-click stub's orientation.
+    // auto-curves to tie in flush at both hosts. An existing wall's top
+    // face is ground like any other: the gesture builds the storey above
+    // it. R turns the single-click stub's orientation.
     void UpdateStraightBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
         if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
@@ -590,25 +660,24 @@ public class GridPlacementSystem : MonoBehaviour
         bool freePlace = keyboard != null && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
         Vector3 point = default;
         Vector3 rawSurface = default;
-        WallEdgeSection courseTarget = null;
-        bool hasPoint = !overUI && TryGetCurveTarget(ray, freePlace, out point, out rawSurface, out courseTarget);
+        bool hasPoint = !overUI && TryGetCurveTarget(ray, freePlace, out point, out rawSurface);
 
         if (!splineStart.HasValue)
         {
-            if (hasPoint && courseTarget != null)
-            {
-                BuildCoursePreview(courseTarget.edge);
-                snapTint = true;
-                ShowSplineGhosts();
-                if (mouse.leftButton.wasPressedThisFrame)
-                    CommitCourse(courseTarget.edge);
-            }
-            else if (hasPoint)
+            if (hasPoint)
             {
                 snapTint = hoverSnapYaw.HasValue;
                 if (hoverSnap.HasValue && hoverSnap.Value.node != null)
                 {
                     ShowNodeEndHighlight(hoverSnap.Value.node);
+                }
+                else if (hoverRideHost != null)
+                {
+                    // On a wall top the stub is a piece of the wall below,
+                    // whatever else the point snapped to — a flank landing
+                    // up here still cannot leave the masonry carrying it.
+                    BuildRideStubPreview(hoverRideHost, point);
+                    ShowSplineGhosts();
                 }
                 else if (hoverSnap.HasValue)
                 {
@@ -617,7 +686,7 @@ public class GridPlacementSystem : MonoBehaviour
                 }
                 else
                 {
-                    BuildStubPreview(point, currentYRotation);
+                    BuildStubPreview(point, hoverSnapYaw ?? currentYRotation);
                     ShowSplineGhosts();
                 }
                 guideCenter = point;
@@ -629,6 +698,7 @@ public class GridPlacementSystem : MonoBehaviour
                     anchorSnapYaw = hoverSnapYaw;
                     anchorSnapHeight = hoverSnapHeight;
                     anchorBaseY = hoverBaseY;
+                    anchorRideHost = hoverRideHost;
                 }
             }
             else
@@ -644,6 +714,10 @@ public class GridPlacementSystem : MonoBehaviour
             bool snapAngle = keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
             bool tangentKey = keyboard != null && keyboard.cKey.isPressed;
             bool steppedAim = !freePlace && snapAngle;
+            // A property of the gesture, not of the frame: off-target
+            // frames (HUD, sky) keep showing the ridden curve instead of
+            // snapping back to a straight chord.
+            previewRideHost = !freePlace ? anchorRideHost : null;
             if (hasPoint)
             {
                 // The far end snaps to nodes first, so closing a loop
@@ -658,7 +732,20 @@ public class GridPlacementSystem : MonoBehaviour
                 EndSnap flankSnap = default;
                 bool flankInReach = !freePlace
                     && TryFlankSnap(rawSurface, splineStart, anchorBaseY, out flankSnap);
-                if (!freePlace && TryNodeSnap(rawSurface, splineStart, anchorBaseY, out EndSnap endSnap))
+                // Anchored on a wall top: the run is a SPAN of the masonry
+                // below, never a free direction. The end slides along that
+                // host's centerline whatever the cursor is over — and
+                // THROUGH its end nodes onto whatever carries on, so one
+                // drag can raise a storey over a whole tower or room.
+                // Shift, C and the bulge wheel have nothing to act on
+                // here; Alt is the way out.
+                if (anchorRideHost != null && !freePlace)
+                {
+                    splineEnd = RideDragEnd(anchorRideHost, splineStart.Value, rawSurface,
+                        out EndSnap? rideMet);
+                    dragEndSnap = rideMet;
+                }
+                else if (!freePlace && TryNodeSnap(rawSurface, splineStart, anchorBaseY, out EndSnap endSnap))
                 {
                     splineEnd = endSnap.point;
                     dragEndSnap = endSnap;
@@ -722,7 +809,14 @@ public class GridPlacementSystem : MonoBehaviour
                 dragApexT = 0.5f;
             }
             bool highlightOnly = false;
-            if (FlatDistance(anchor, end) >= 0.25f)
+            if (previewRideHost != null && rideSpans.Count > 0)
+            {
+                // A ride is one edge per host, so it draws its own way —
+                // there is no single chord to trim or bulge.
+                BuildRidePreview(anchor, end);
+                ShowPendingJointGhosts(anchor, end);
+            }
+            else if (FlatDistance(anchor, end) >= 0.25f)
             {
                 BuildSplinePreview(anchor, end, dragBulge, dragApexT,
                     TrimInto(anchorSnap, anchor, end), TrimInto(dragEndSnap, end, anchor));
@@ -734,6 +828,10 @@ public class GridPlacementSystem : MonoBehaviour
                 // highlight — releasing here commits nothing.
                 ShowNodeEndHighlight(anchorSnap.Value.node);
                 highlightOnly = true;
+            }
+            else if (previewRideHost != null)
+            {
+                BuildRideStubPreview(previewRideHost, anchor);
             }
             else if (anchorSnap.HasValue)
             {
@@ -781,6 +879,25 @@ public class GridPlacementSystem : MonoBehaviour
         BuildSplinePreview(center - halfChord, center + halfChord, 0f, 0.5f);
     }
 
+    // The stub on a wall top is a SPAN of that wall, so it cannot hang off
+    // the end: it slides INWARD to fit instead of straddling the cap.
+    // (A centred stub on a point pulled to the host's own end overhung by
+    // half its length — half a thickness of masonry in mid-air.) A host
+    // shorter than one stub is raised end to end.
+    void BuildRideStubPreview(WallEdge host, Vector3 point)
+    {
+        previewRideHost = host;
+        float[] table = WallEdge.BuildArcTable(host.A, host.control, host.B);
+        float total = table[table.Length - 1];
+        float span = Mathf.Min(StubLength, total);
+        float at = WallEdge.ArcAt(table, host.NearestT(point, out _));
+        float from = Mathf.Clamp(at - span * 0.5f, 0f, total - span);
+        WallGraph.SubCurve(host.A, host.control, host.B,
+            WallEdge.TAtArc(table, from), WallEdge.TAtArc(table, from + span),
+            out Vector3 s, out _, out Vector3 e);
+        BuildSplinePreview(new Vector3(s.x, 0f, s.z), new Vector3(e.x, 0f, e.z), 0f, 0.5f);
+    }
+
     // The ghost for a snapped hover: a stub chord LEAVING the snap point
     // along its outward direction, its buried half trimmed so the ghost
     // sits wholly outside the host — flush with the face, while the
@@ -803,8 +920,8 @@ public class GridPlacementSystem : MonoBehaviour
         previewBlocked = false;
         previewCrossings.Clear();
         lastPreviewKey = null;
-        pendingCommit = null;
-        lastCourseKey = null;
+        lastRideKey = null;
+        pendingCommits.Clear();
 
         int count = 0;
         foreach (WallNode.Member m in node.members)
@@ -954,9 +1071,9 @@ public class GridPlacementSystem : MonoBehaviour
     // Curved wall placement. Three clicks: start point, end point (both
     // snapping to nodes and wall flanks first; Alt places freely), then
     // bend — plain scroll steps the bulge while the cursor drags the apex
-    // along the chord — and a final click commits. Hovering an existing
-    // wall's top face previews a full course along it at the current
-    // height; one click lays it. Escape backs out at any stage.
+    // along the chord — and a final click commits. An existing wall's top
+    // face is ground like any other: the gesture builds the storey above
+    // it. Escape backs out at any stage.
     void UpdateCurvedBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
         if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
@@ -968,20 +1085,15 @@ public class GridPlacementSystem : MonoBehaviour
         bool freePlace = keyboard != null && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
         Vector3 point = default;
         Vector3 rawSurface = default;
-        WallEdgeSection courseTarget = null;
-        bool hasPoint = !overUI && TryGetCurveTarget(ray, freePlace, out point, out rawSurface, out courseTarget);
+        bool hasPoint = !overUI && TryGetCurveTarget(ray, freePlace, out point, out rawSurface);
+        // The ride outlives the frame here too: the bend phase keeps the
+        // host's curve rather than handing the wheel a curve to bend.
+        if (splineStart.HasValue && !freePlace)
+            previewRideHost = anchorRideHost;
 
         if (!splineStart.HasValue)
         {
-            if (hasPoint && courseTarget != null)
-            {
-                BuildCoursePreview(courseTarget.edge);
-                snapTint = true;
-                ShowSplineGhosts();
-                if (mouse.leftButton.wasPressedThisFrame)
-                    CommitCourse(courseTarget.edge);
-            }
-            else if (hasPoint)
+            if (hasPoint)
             {
                 snapTint = hoverSnapYaw.HasValue;
                 if (hoverSnap.HasValue && hoverSnap.Value.node != null)
@@ -1004,6 +1116,7 @@ public class GridPlacementSystem : MonoBehaviour
                     anchorSnapYaw = hoverSnapYaw;
                     anchorSnapHeight = hoverSnapHeight;
                     anchorBaseY = hoverBaseY;
+                    anchorRideHost = hoverRideHost;
                 }
             }
             else
@@ -1024,15 +1137,26 @@ public class GridPlacementSystem : MonoBehaviour
                 EndSnap? chordSnap = hoverSnap;
                 if (chordSnap.HasValue && chordSnap.Value.isFlank)
                     chordSnap = null;
-                if (!freePlace && !chordSnap.HasValue
+                // Same rule as the straight tool: a chord anchored on a
+                // wall top can only run along that wall.
+                if (anchorRideHost != null && !freePlace)
+                {
+                    point = RideDragEnd(anchorRideHost, splineStart.Value, rawSurface,
+                        out EndSnap? rideMet);
+                    chordSnap = rideMet;
+                }
+                else if (!freePlace && !chordSnap.HasValue
                     && TryFlankSnap(rawSurface, splineStart, anchorBaseY, out EndSnap chordFlank))
                 {
                     chordSnap = chordFlank;
                     point = chordFlank.point;
                 }
-                BuildSplinePreview(splineStart.Value, point, 0f, 0.5f,
-                    TrimInto(anchorSnap, splineStart.Value, point),
-                    TrimInto(chordSnap, point, splineStart.Value));
+                if (previewRideHost != null && rideSpans.Count > 0)
+                    BuildRidePreview(splineStart.Value, point);
+                else
+                    BuildSplinePreview(splineStart.Value, point, 0f, 0.5f,
+                        TrimInto(anchorSnap, splineStart.Value, point),
+                        TrimInto(chordSnap, point, splineStart.Value));
                 dragEndSnap = chordSnap;
                 ShowPendingJointGhosts(splineStart.Value, point);
                 snapTint = hoverSnapYaw.HasValue || (chordSnap.HasValue && chordSnap.Value.isFlank);
@@ -1077,9 +1201,14 @@ public class GridPlacementSystem : MonoBehaviour
                 curveApexT = Mathf.Clamp(t, 0.15f, 0.85f);
             }
 
-            BuildSplinePreview(splineStart.Value, splineEnd.Value, curveBulge, curveApexT,
-                TrimInto(anchorSnap, splineStart.Value, splineEnd.Value),
-                TrimInto(dragEndSnap, splineEnd.Value, splineStart.Value));
+            // A ride settled its shape in the chord phase — the bend keys
+            // have nothing to act on, so the spans just redraw.
+            if (previewRideHost != null && rideSpans.Count > 0)
+                BuildRidePreview(splineStart.Value, splineEnd.Value);
+            else
+                BuildSplinePreview(splineStart.Value, splineEnd.Value, curveBulge, curveApexT,
+                    TrimInto(anchorSnap, splineStart.Value, splineEnd.Value),
+                    TrimInto(dragEndSnap, splineEnd.Value, splineStart.Value));
             ShowPendingJointGhosts(splineStart.Value, splineEnd.Value);
             ShowSplineGhosts();
             guideCenter = (splineStart.Value + splineEnd.Value) * 0.5f;
@@ -1094,22 +1223,26 @@ public class GridPlacementSystem : MonoBehaviour
         }
     }
 
-    // Commits exactly what the ghost shows: the preview's own curve key,
+    // Commits exactly what the ghost shows: the preview's own curve keys,
     // handed to the graph — which resolves nodes, splits crossed hosts,
     // and chains the edges. Straight drags, curves, and stubs all share
-    // this one commit path.
+    // this one commit path; a ride across several walls arrives here as
+    // one entry per wall, committed in order so consecutive spans meet at
+    // a shared node.
     void CommitSpline()
     {
-        if (!previewBlocked && splineSpecs.Count > 0 && pendingCommit.HasValue)
+        if (!previewBlocked && splineSpecs.Count > 0 && pendingCommits.Count > 0)
         {
-            (Vector3 s, Vector3 c, Vector3 e, float height, float topY, float baseY) = pendingCommit.Value;
-            WallGraph.CommitEdge(splineParent, s, c, e, EdgeParamsNow(height, topY, baseY));
+            foreach ((Vector3 s, Vector3 c, Vector3 e, float height, float topY, float baseY,
+                float skirt) in pendingCommits)
+                WallGraph.CommitEdge(splineParent, s, c, e,
+                    EdgeParamsNow(height, topY, baseY, false, skirt));
         }
         CancelCurve();
     }
 
     WallGraph.EdgeParams EdgeParamsNow(float height, float topY,
-        float baseY = float.NegativeInfinity, bool roomBuilt = false)
+        float baseY = float.NegativeInfinity, bool roomBuilt = false, float skirt = 0f)
     {
         return new WallGraph.EdgeParams
         {
@@ -1120,6 +1253,7 @@ public class GridPlacementSystem : MonoBehaviour
             baseStep = baseStepSize,
             fixedTopY = topY,
             baseY = baseY,
+            skirt = skirt,
             material = wallMaterial,
             roomBuilt = roomBuilt,
         };
@@ -1132,6 +1266,8 @@ public class GridPlacementSystem : MonoBehaviour
     {
         point = default;
         deckY = null;
+        hoverRideHost = null;
+        hoverSnapBase = null;
         RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
         System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
         foreach (RaycastHit hit in hits)
@@ -1141,17 +1277,30 @@ public class GridPlacementSystem : MonoBehaviour
             point = new Vector3(hit.point.x, 0f, hit.point.z);
             WallRoom room = hit.collider.GetComponentInParent<WallRoom>();
             if (room != null)
+            {
                 deckY = hit.collider.gameObject.name == "RoomRoof" ? room.roofY : room.floorY;
+                hoverSnapBase = deckY;
+                return true;
+            }
+            // A wall's TOP FACE is elevated ground here too: the room and
+            // shape tools raise a storey over existing masonry exactly the
+            // way the wall tool does. Without this, only the wall tool saw
+            // wall tops and a room could still only be inset onto a deck.
+            WallEdgeSection section = hit.collider.GetComponent<WallEdgeSection>();
+            if (section != null && hit.normal.y > 0.7f && section.edge != null)
+            {
+                deckY = section.topY;
+                hoverRideHost = section.edge;
+                point = RideOnto(section.edge, point);
+            }
+            // The ray names the storey even on a side hit — see
+            // TryGetCurveTarget, same reason: a stack is a snap tie.
+            hoverSnapBase = deckY;
+            if (!deckY.HasValue && section != null && section.edge != null)
+                hoverSnapBase = section.edge.baseY;
             return true;
         }
         return false;
-    }
-
-    void CommitCourse(WallEdge below)
-    {
-        if (splineSpecs.Count > 0)
-            WallGraph.CommitCourse(splineParent, below, CurrentWallHeight, BaseHeight, wallMaterial);
-        CancelCurve();
     }
 
     void CancelCurve()
@@ -1161,8 +1310,8 @@ public class GridPlacementSystem : MonoBehaviour
         previewBlocked = false;
         previewCrossings.Clear();
         lastPreviewKey = null;
-        pendingCommit = null;
-        lastCourseKey = null;
+        lastRideKey = null;
+        pendingCommits.Clear();
         lastOffsetKey = null;
         splineStart = null;
         splineEnd = null;
@@ -1172,6 +1321,8 @@ public class GridPlacementSystem : MonoBehaviour
         anchorSnapYaw = null;
         anchorSnapHeight = null;
         anchorBaseY = null;
+        anchorRideHost = null;
+        rideSpans.Clear();
         heightOverride = false;
         dragEndSnap = null;
         pendingNodeGhosts.Clear();
@@ -1222,7 +1373,7 @@ public class GridPlacementSystem : MonoBehaviour
             // face-flush stub) instead of burying a ghost box in the host.
             Vector3 point = raw;
             EndSnap? attach = null;
-            if (canSnap && TryNodeSnap(raw, null, deckY, out EndSnap nodeSnap))
+            if (canSnap && TryNodeSnap(raw, null, hoverSnapBase, out EndSnap nodeSnap))
             {
                 attach = nodeSnap;
                 point = nodeSnap.point;
@@ -1230,7 +1381,7 @@ public class GridPlacementSystem : MonoBehaviour
                     hoverSnapHeight = SnapHeightOf(nodeSnap.edge, nodeSnap.point);
                 AdoptSnapElevation(nodeSnap);
             }
-            else if (canSnap && TryFlankSnap(raw, null, deckY, out EndSnap flankSnap))
+            else if (canSnap && TryFlankSnap(raw, null, hoverSnapBase, out EndSnap flankSnap))
             {
                 attach = flankSnap;
                 point = flankSnap.point;
@@ -1440,12 +1591,16 @@ public class GridPlacementSystem : MonoBehaviour
             {
                 Vector3 b;
                 EndSnap? sideSnap = null;
-                if (canSnap && TryNodeSnap(raw, anchor, shapeBaseY ?? deckY, out EndSnap sideNode))
+                // The gesture's own storey, captured at the anchor — not
+                // whatever the cursor is over now. A rect started on the
+                // ground stays a ground rect when its side runs past a
+                // second storey.
+                if (canSnap && TryNodeSnap(raw, anchor, shapeBaseY, out EndSnap sideNode))
                 {
                     b = sideNode.point;
                     sideSnap = sideNode;
                 }
-                else if (canSnap && TryFlankSnap(raw, anchor, shapeBaseY ?? deckY, out EndSnap sideFlank))
+                else if (canSnap && TryFlankSnap(raw, anchor, shapeBaseY, out EndSnap sideFlank))
                 {
                     b = sideFlank.point;
                     sideSnap = sideFlank;
@@ -1654,15 +1809,15 @@ public class GridPlacementSystem : MonoBehaviour
             // ghost, no commit — the masonry is already there and the
             // face closes through it. A partial overlap refuses the
             // figure (it would leave a gap or a buried duplicate).
-            float coverage = WallGraph.CoincidentCoverage(s, c, e);
+            float shapeBase = shapeBaseY ?? float.NegativeInfinity;
+            float coverage = WallGraph.CoincidentCoverage(s, c, e, shapeBase);
             if (coverage >= ReuseCoverage)
                 continue;
             if (coverage > 0.05f)
                 shapeBlocked = true;
             shapeSpecs.AddRange(WallEdge.BuildSpecs(s, c, e, height,
-                gridSize, gridSize, baseStepSize, BaseHeight, topY,
-                shapeBaseY ?? float.NegativeInfinity));
-            foreach (WallGraph.Crossing x in WallGraph.FindCrossings(s, c, e))
+                gridSize, gridSize, baseStepSize, BaseHeight, topY, shapeBase));
+            foreach (WallGraph.Crossing x in WallGraph.FindCrossings(s, c, e, shapeBase))
                 shapeCrossings.Add(x.point);
         }
         foreach (WallEdge.SectionSpec spec in shapeSpecs)
@@ -1696,7 +1851,7 @@ public class GridPlacementSystem : MonoBehaviour
         {
             // Re-derived rather than read from preview state, so the
             // commit can't disagree with a stale ghost.
-            if (WallGraph.CoincidentCoverage(s, c, e) >= ReuseCoverage)
+            if (WallGraph.CoincidentCoverage(s, c, e, p.baseY) >= ReuseCoverage)
             {
                 reused++;
                 continue;
@@ -1775,7 +1930,7 @@ public class GridPlacementSystem : MonoBehaviour
             }
             Vector3 point = raw;
             EndSnap? attach = null;
-            if (canSnap && TryNodeSnap(raw, null, deckY, out EndSnap nodeSnap))
+            if (canSnap && TryNodeSnap(raw, null, hoverSnapBase, out EndSnap nodeSnap))
             {
                 attach = nodeSnap;
                 point = nodeSnap.point;
@@ -1783,7 +1938,7 @@ public class GridPlacementSystem : MonoBehaviour
                     hoverSnapHeight = SnapHeightOf(nodeSnap.edge, nodeSnap.point);
                 AdoptSnapElevation(nodeSnap);
             }
-            else if (canSnap && TryFlankSnap(raw, null, deckY, out EndSnap flankSnap))
+            else if (canSnap && TryFlankSnap(raw, null, hoverSnapBase, out EndSnap flankSnap))
             {
                 attach = flankSnap;
                 point = flankSnap.point;
@@ -1841,7 +1996,7 @@ public class GridPlacementSystem : MonoBehaviour
             bool steppedAim = !freePlace && snapAngle;
             EndSnap flankSnap = default;
             bool flankInReach = canSnap
-                && TryFlankSnap(raw, last, roomChainBaseY ?? deckY, out flankSnap);
+                && TryFlankSnap(raw, last, roomChainBaseY, out flankSnap);
             float landingReach = 0f;
             if (roomChain.Count >= 3 && FlatDistance(raw, roomChain[0]) < endpointSnapRadius)
             {
@@ -1849,7 +2004,7 @@ public class GridPlacementSystem : MonoBehaviour
                 end = roomChain[0];
                 closingToStart = true;
             }
-            else if (canSnap && TryNodeSnap(raw, last, roomChainBaseY ?? deckY, out EndSnap nodeSnap))
+            else if (canSnap && TryNodeSnap(raw, last, roomChainBaseY, out EndSnap nodeSnap))
             {
                 end = nodeSnap.point;
                 endAttach = nodeSnap;
@@ -1899,13 +2054,14 @@ public class GridPlacementSystem : MonoBehaviour
                     if (run.sqrMagnitude > 0.000001f)
                         probe = end + run.normalized * landingReach;
                 }
-                var crossings = WallGraph.FindCrossings(last, (last + probe) * 0.5f, probe);
+                var crossings = WallGraph.FindCrossings(last, (last + probe) * 0.5f, probe,
+                    roomChainBaseY ?? float.NegativeInfinity);
                 if (crossings.Count > 0)
                 {
                     WallGraph.Crossing x = crossings[0];
                     end = new Vector3(x.point.x, 0f, x.point.z);
                     endAttach = x.reuseNode != null
-                        ? MakeNodeSnap(x.reuseNode)
+                        ? MakeNodeSnap(x.reuseNode, roomChainBaseY)
                         : FlankSnapAt(x.edge, end, last);
                 }
             }
@@ -2098,12 +2254,17 @@ public class GridPlacementSystem : MonoBehaviour
             da = a + dir * trimStart;
             db = b - dir * trimEnd;
         }
+        // Same burial a stacked wall gets, so the ghost shows the joint the
+        // commit will actually build.
+        float liveBase = roomChainBaseY ?? float.NegativeInfinity;
+        float liveTop = roomChainTopY;
+        StackFit(null, a, b, roomChainHeight, liveBase, out float liveSkirt, ref liveTop);
         roomLiveSpecs.AddRange(WallEdge.BuildSpecs(da, (da + db) * 0.5f, db, roomChainHeight,
-            gridSize, gridSize, baseStepSize, BaseHeight, roomChainTopY,
-            roomChainBaseY ?? float.NegativeInfinity));
+            gridSize, gridSize, baseStepSize, BaseHeight, liveTop, liveBase - liveSkirt));
         foreach (WallEdge.SectionSpec spec in roomLiveSpecs)
             roomLiveMeshes.Add(spec.mesh);
-        roomLiveBlocked = WallGraph.OverlapsExisting(a, mid, b);
+        roomLiveBlocked = WallGraph.OverlapsExisting(a, mid, b,
+            roomChainBaseY ?? float.NegativeInfinity);
     }
 
     // A click fixed the live segment: its specs and meshes move to the
@@ -2159,9 +2320,13 @@ public class GridPlacementSystem : MonoBehaviour
         {
             Vector3 a = roomChain[i];
             Vector3 b = roomChain[i + 1];
+            // Each segment asks its own support question: a chain can run
+            // off one wall's top and onto another's.
+            float segBase = roomChainBaseY ?? float.NegativeInfinity;
+            float segTop = roomChainTopY;
+            StackFit(null, a, b, roomChainHeight, segBase, out float segSkirt, ref segTop);
             List<WallEdge> created = WallGraph.CommitEdge(splineParent, a, (a + b) * 0.5f, b,
-                EdgeParamsNow(roomChainHeight, roomChainTopY,
-                    roomChainBaseY ?? float.NegativeInfinity, true));
+                EdgeParamsNow(roomChainHeight, segTop, segBase, true, segSkirt));
             if (created.Count > 0)
                 lastEdge = created[created.Count - 1];
         }
@@ -2207,16 +2372,17 @@ public class GridPlacementSystem : MonoBehaviour
         HideGhosts();
     }
 
-    // Resolves the cursor for both build shapes. Wall top faces are
-    // course-stacking targets, nodes chain, a wall's flank grabs the
+    // Resolves the cursor for both build shapes. Room slabs AND wall top
+    // faces are elevated ground, nodes chain, a wall's flank grabs the
     // point onto its centerline (a T-split at commit), terrain resolves
     // to the exact point under the cursor, and Alt returns the raw
     // surface point.
-    bool TryGetCurveTarget(Ray ray, bool freePlace, out Vector3 point, out Vector3 rawSurface, out WallEdgeSection courseTarget)
+    bool TryGetCurveTarget(Ray ray, bool freePlace, out Vector3 point, out Vector3 rawSurface)
     {
         point = default;
         rawSurface = default;
-        courseTarget = null;
+        hoverRideHost = null;
+        hoverSnapBase = null;
 
         RaycastHit first = default;
         bool hasHit = false;
@@ -2235,10 +2401,13 @@ public class GridPlacementSystem : MonoBehaviour
 
         rawSurface = new Vector3(first.point.x, 0f, first.point.z);
 
-        // A room slab is elevated ground: build ON it, exactly at the
-        // cursor. Snaps below stay live but filter to this deck's own
+        // Elevated ground: build ON it, exactly at the cursor. Two kinds —
+        // a room slab, and the TOP FACE of a wall (which is how a storey
+        // gets built directly over the one below, rather than inset onto
+        // a deck). Snaps below stay live but filter to that base's own
         // walls — the masonry a storey down never grabs the gesture.
         WallRoom slabRoom = first.collider.GetComponentInParent<WallRoom>();
+        WallEdgeSection hitSection = first.collider.GetComponent<WallEdgeSection>();
         float? deckY = null;
         if (slabRoom != null)
         {
@@ -2246,25 +2415,37 @@ public class GridPlacementSystem : MonoBehaviour
                 ? slabRoom.roofY : slabRoom.floorY;
             hoverBaseY = deckY;
         }
+        else if (hitSection != null && first.normal.y > 0.7f)
+        {
+            deckY = hitSection.topY;
+            hoverBaseY = deckY;
+            hoverRideHost = hitSection.edge;
+        }
+        // Aiming at a wall's SIDE names that wall's storey even though the
+        // gesture isn't standing on anything — the point stays on the
+        // terrain (or on whatever deck the wall itself rises from), but the
+        // snap search now knows which of a stack's co-located walls the
+        // cursor meant. A snapped elevated wall still carries its storey in
+        // through AdoptSnapElevation, exactly as before.
+        hoverSnapBase = deckY;
+        if (!deckY.HasValue && hitSection != null && hitSection.edge != null)
+            hoverSnapBase = hitSection.edge.baseY;
 
         if (freePlace)
         {
+            // Alt keeps the storey but drops the wall below as a guide —
+            // it is the one way to put masonry somewhere other than
+            // directly over the wall it stands on.
             point = rawSurface;
+            hoverRideHost = null;
             return true;
         }
 
-        WallEdgeSection section = first.collider.GetComponent<WallEdgeSection>();
-        if (section != null && first.normal.y > 0.7f)
-        {
-            courseTarget = section;
-            point = rawSurface;
-            return true;
-        }
 
         // Node snapping: existing joints outrank everything nearby — the
         // point locks EXACTLY onto the node, so chains and closed loops
         // meet where the network already is.
-        if (TryNodeSnap(rawSurface, null, deckY, out EndSnap nodeSnap))
+        if (TryNodeSnap(rawSurface, null, hoverSnapBase, out EndSnap nodeSnap))
         {
             hoverSnap = nodeSnap;
             hoverSnapYaw = nodeSnap.stubYaw;
@@ -2272,6 +2453,7 @@ public class GridPlacementSystem : MonoBehaviour
                 hoverSnapHeight = SnapHeightOf(nodeSnap.edge, nodeSnap.point);
             AdoptSnapElevation(nodeSnap);
             point = nodeSnap.point;
+            AdoptRideHostUnder(point, slabRoom != null);
             return true;
         }
 
@@ -2280,7 +2462,7 @@ public class GridPlacementSystem : MonoBehaviour
         // host) and the wall draws away from the face on the cursor's
         // side, at any angle. A parallel run beside a wall is the Offset
         // tool's job.
-        if (TryFlankSnap(rawSurface, null, deckY, out EndSnap flankSnap))
+        if (TryFlankSnap(rawSurface, null, hoverSnapBase, out EndSnap flankSnap))
         {
             hoverSnap = flankSnap;
             hoverSnapYaw = flankSnap.stubYaw;
@@ -2288,6 +2470,31 @@ public class GridPlacementSystem : MonoBehaviour
                 hoverSnapHeight = SnapHeightOf(flankSnap.edge, flankSnap.point);
             AdoptSnapElevation(flankSnap);
             point = flankSnap.point;
+            AdoptRideHostUnder(point, slabRoom != null);
+            return true;
+        }
+
+        // Riding a wall top: nothing on THIS storey claimed the point, so
+        // it locks onto the host's centerline — masonry built up here sits
+        // centred on the masonry below instead of wherever the cursor
+        // happened to fall across a metre of stone. Off-centre work on a
+        // wall top is what Alt is for.
+        if (hoverRideHost != null)
+        {
+            point = RideOnto(hoverRideHost, rawSurface);
+            // Standing on a wall is a snap like any other, so it matches
+            // that wall's height too. Grazing a wall's SIDE already did;
+            // without this, crossing its top edge with the cursor flipped
+            // the ghost between the host's height and the dialed one.
+            // Ctrl+scroll still overrides, as everywhere else.
+            hoverSnapHeight = hoverSnapHeight ?? SnapHeightOf(hoverRideHost, point);
+            // The stub takes the host's own bearing, so the hover reads as
+            // "this sits squarely on that wall" instead of pointing off at
+            // whatever angle R was left on.
+            float t = hoverRideHost.NearestT(point, out _);
+            Vector3 dir = WallEdge.Tangent(hoverRideHost.A, hoverRideHost.control,
+                hoverRideHost.B, t).normalized;
+            hoverSnapYaw = Mathf.Atan2(-dir.z, dir.x) * Mathf.Rad2Deg;
             return true;
         }
 
@@ -2297,16 +2504,30 @@ public class GridPlacementSystem : MonoBehaviour
         return true;
     }
 
-    // Whether an edge belongs to the storey being hovered: no filter on
-    // ground hovers (null — any wall grabs, and the gesture adopts its
-    // elevation), but a deck hover only offers walls standing ON that
-    // deck — the masonry a storey down keeps its distance.
+    // Whether an edge belongs to a given storey. `null` is the TERRAIN
+    // storey, not a wildcard: snaps compare XZ alone, so a wall and the
+    // wall stacked on it are at zero distance from each other and an
+    // unfiltered search picks between them on float noise — the hover
+    // flickering between the wall you aimed at and the storey above it.
+    // Same rule as WallGraph's planar queries (SameBase), which
+    // TrySteppedLanding already fed `atBase ?? -inf`.
     static bool BaseMatches(WallEdge edge, float? atBase)
     {
-        if (!atBase.HasValue)
-            return true;
-        return !float.IsNegativeInfinity(edge.baseY)
-            && Mathf.Abs(edge.baseY - atBase.Value) <= 0.25f;
+        return WallGraph.SameBase(edge.baseY, atBase ?? float.NegativeInfinity);
+    }
+
+    // A snapped point can be standing on a wall too. Continuing a storey
+    // from the END of an upper wall snaps to that wall's node — and the
+    // node sits ON the masonry below, so the run inherits the same lock a
+    // bare wall-top hover gets. Without this, a second storey shorter than
+    // the wall under it handed back free direction at its own end, which
+    // is exactly where a player goes to extend it. Room decks are exempt:
+    // building on a deck is free-form by design.
+    void AdoptRideHostUnder(Vector3 point, bool onSlab)
+    {
+        if (hoverRideHost != null || onSlab || !hoverBaseY.HasValue)
+            return;
+        hoverRideHost = RideHostUnder(point, hoverBaseY.Value);
     }
 
     // A snap onto an elevated wall carries its storey with it: the
@@ -2335,7 +2556,10 @@ public class GridPlacementSystem : MonoBehaviour
         foreach (WallNode node in WallNode.All)
         {
             EndSnap baseSnap = MakeNodeSnap(node, atBase);
-            if (atBase.HasValue && baseSnap.edge == null)
+            // No member on this storey means the node isn't on it — an
+            // upper wall's ends sit directly above the lower wall's nodes,
+            // so without this they'd all answer every search.
+            if (baseSnap.edge == null)
                 continue;
 
             void Consider(Vector3 candidate)
@@ -2502,7 +2726,7 @@ public class GridPlacementSystem : MonoBehaviour
         bool found = false;
         foreach (WallEdge edge in WallEdge.All)
         {
-            if (edge.IsCourse || !BaseMatches(edge, atBase))
+            if (!BaseMatches(edge, atBase))
                 continue;
             float halfThick = edge.thickness * 0.5f;
             float grabRange = halfThick + endpointSnapRadius;
@@ -2563,7 +2787,8 @@ public class GridPlacementSystem : MonoBehaviour
             return false;
         Vector3 probe = steppedEnd + run.normalized * SteppedLandingReach;
         foreach (WallGraph.Crossing x in
-            WallGraph.FindCrossings(from, (from + probe) * 0.5f, probe))
+            WallGraph.FindCrossings(from, (from + probe) * 0.5f, probe,
+                atBase ?? float.NegativeInfinity))
         {
             if (x.reuseNode != null)
             {
@@ -2574,7 +2799,7 @@ public class GridPlacementSystem : MonoBehaviour
                 snap = nodeSnap;
                 return true;
             }
-            if (x.edge == null || x.edge.IsCourse || !BaseMatches(x.edge, atBase))
+            if (x.edge == null || !BaseMatches(x.edge, atBase))
                 continue;
             point = new Vector3(x.point.x, 0f, x.point.z);
             snap = FlankSnapAt(x.edge, point, from);
@@ -2611,6 +2836,287 @@ public class GridPlacementSystem : MonoBehaviour
         return s + chord * apexT + normal * (bulge * 2f);
     }
 
+    // The point a wall top hands the cursor: ON the host's centerline, so
+    // new masonry sits centred over the old instead of wherever the cursor
+    // fell across a metre of stone — and pulled to the host's OWN ENDS
+    // when it comes near them, so a run laid along a wall top covers
+    // exactly the wall below rather than stopping short of its cap.
+    Vector3 RideOnto(WallEdge host, Vector3 raw)
+    {
+        float t = host.NearestT(raw, out _);
+        Vector3 on = WallEdge.Evaluate(host.A, host.control, host.B, t);
+        on = new Vector3(on.x, 0f, on.z);
+        Vector3 a = new Vector3(host.A.x, 0f, host.A.z);
+        Vector3 b = new Vector3(host.B.x, 0f, host.B.z);
+        if (FlatDistance(on, a) <= endpointSnapRadius)
+            return a;
+        if (FlatDistance(on, b) <= endpointSnapRadius)
+            return b;
+        return on;
+    }
+
+    // A ride follows the masonry THROUGH its nodes: past the end of the
+    // wall it starts on, the run continues onto whatever carries on from
+    // that node, one span per host. A circle is eight arcs and a room is
+    // four walls — stopping dead at every node meant eight drags to raise
+    // a storey over a tower. Each span still becomes its own edge with its
+    // host's exact curve; they meet at nodes standing over the nodes
+    // below, which is what the graph wants anyway. Fills rideSpans and
+    // returns the point the run ends at.
+    // Where a ride's far end lands: masonry already standing on this
+    // storey wins when the run reaches it — two upper walls built from
+    // opposite ends have to close on ONE node, and a node sits on the
+    // centerline the run is already locked to, so honouring it costs the
+    // lock nothing. A node that isn't actually on the ride is ignored
+    // (the chain would end somewhere else, and it says so).
+    Vector3 RideDragEnd(WallEdge host, Vector3 start, Vector3 raw, out EndSnap? met)
+    {
+        met = null;
+        if (TryNodeSnap(raw, start, anchorBaseY, out EndSnap node))
+        {
+            Vector3 landed = RideChainEnd(host, start, node.point, true);
+            if (FlatDistance(landed, node.point) <= 0.15f)
+            {
+                met = node;
+                return landed;
+            }
+        }
+        return RideChainEnd(host, start, raw, false);
+    }
+
+    Vector3 RideChainEnd(WallEdge host, Vector3 start, Vector3 cursor, bool exact)
+    {
+        float tStart = host.NearestT(start, out _);
+        rideExact = exact;
+        Vector3 end = Walk(host, host.NearestT(cursor, out _) >= tStart, tStart, cursor);
+        // Anchored ON a node, the run may want the wall on the OTHER side
+        // of it — the anchor host's own span is then zero-length and the
+        // masonry the player is dragging over belongs to its neighbour.
+        if (rideSpans.Count == 0)
+        {
+            bool atA = tStart <= 0.0001f, atB = tStart >= 0.9999f;
+            WallNode node = atA ? host.nodeA : atB ? host.nodeB : null;
+            WallEdge back = StraightestContinuation(node, host, atB);
+            if (back != null)
+            {
+                bool towardB = back.nodeA == node;
+                end = Walk(back, towardB, towardB ? 0f : 1f, cursor);
+            }
+        }
+        return end;
+    }
+
+    // One walk from a starting host and sense, filling rideSpans.
+    Vector3 Walk(WallEdge first, bool towardB, float from, Vector3 cursor)
+    {
+        rideSpans.Clear();
+        WallEdge cur = first;
+        Vector3 end = WallEdge.Evaluate(first.A, first.control, first.B, from);
+        end = new Vector3(end.x, 0f, end.z);
+        var visited = new HashSet<WallEdge>();
+        while (cur != null && visited.Add(cur) && rideSpans.Count < 64)
+        {
+            float t = cur.NearestT(cursor, out _);
+            float far = towardB ? 1f : 0f;
+            // Within a snap of this host's far end, take the whole of it:
+            // a run laid along a wall top covers the wall, not almost all
+            // of it. Past the end, take the whole of it and keep walking.
+            Vector3 farPoint = towardB ? cur.B : cur.A;
+            bool consumed = towardB ? t >= 1f - 0.0001f : t <= 0.0001f;
+            // rideExact: the end is a node the run has to close on, so it
+            // must not be pulled past it onto the host's own cap.
+            if (!consumed && !rideExact && FlatDistance(
+                    WallEdge.Evaluate(cur.A, cur.control, cur.B, t), farPoint) <= endpointSnapRadius)
+            {
+                t = far;
+                consumed = true;
+            }
+            if (Mathf.Abs(t - from) > 0.001f)
+            {
+                rideSpans.Add((cur, Mathf.Min(from, t), Mathf.Max(from, t)));
+                Vector3 p = WallEdge.Evaluate(cur.A, cur.control, cur.B, t);
+                end = new Vector3(p.x, 0f, p.z);
+            }
+            if (!consumed)
+                break;
+            // Straightest continuation out of the far node, on the same
+            // storey — a T upstairs picks the run that carries on, not the
+            // branch. Nothing there (a free end) simply ends the run.
+            WallNode node = towardB ? cur.nodeB : cur.nodeA;
+            WallEdge next = StraightestContinuation(node, cur, towardB);
+            if (next == null)
+                break;
+            towardB = next.nodeA == node;
+            from = towardB ? 0f : 1f;
+            cur = next;
+        }
+        return end;
+    }
+
+    // The member leaving `node` that carries on most nearly straight from
+    // `arriving` (which reaches the node at its B end when towardB).
+    WallEdge StraightestContinuation(WallNode node, WallEdge arriving, bool towardB)
+    {
+        if (node == null)
+            return null;
+        Vector3 travel = arriving.EndOutwardDir(!towardB);
+        WallEdge best = null;
+        float bestDot = 0.2f;                       // never turn back on itself
+        foreach (WallNode.Member m in node.members)
+        {
+            if (m.edge == null || m.edge == arriving)
+                continue;
+            if (!WallGraph.SameBase(m.edge.baseY, arriving.baseY))
+                continue;
+            float dot = Vector3.Dot(travel, -m.edge.EndOutwardDir(m.atStart));
+            if (dot > bestDot)
+            {
+                bestDot = dot;
+                best = m.edge;
+            }
+        }
+        return best;
+    }
+
+    // The ghost for a ride: one preview edge per host span, each taking
+    // its host's exact curve and its own stack fit (adjacent hosts can sit
+    // at different heights). Shares splineSpecs and pendingCommits with
+    // the single-span path, so release commits what is drawn.
+    void BuildRidePreview(Vector3 start, Vector3 end)
+    {
+        float height = EffectiveWallHeight;
+        float baseFloor = (anchorBaseY ?? hoverBaseY) ?? float.NegativeInfinity;
+        var key = (start, end, height, baseFloor, rideSpans.Count,
+            rideSpans.Count > 0 ? rideSpans[rideSpans.Count - 1].tB : 0f);
+        if (lastRideKey.HasValue && lastRideKey.Value == key)
+            return;
+        lastRideKey = key;
+        // The single-span cache has nothing to say about this shape.
+        lastPreviewKey = null;
+
+        ClearPreviewMeshes();
+        splineSpecs.Clear();
+        pendingCommits.Clear();
+        previewBlocked = false;
+        previewCrossings = new List<WallGraph.Crossing>();
+        foreach ((WallEdge host, float tA, float tB) in rideSpans)
+        {
+            WallGraph.SubCurve(host.A, host.control, host.B, tA, tB,
+                out Vector3 s, out Vector3 c, out Vector3 e);
+            s = new Vector3(s.x, 0f, s.z);
+            e = new Vector3(e.x, 0f, e.z);
+            float topY = float.NegativeInfinity;
+            StackFit(host, s, e, height, baseFloor, out float skirt, ref topY);
+            splineSpecs.AddRange(WallEdge.BuildSpecs(s, c, e, height, gridSize, gridSize,
+                baseStepSize, BaseHeight, topY, baseFloor - skirt));
+            pendingCommits.Add((s, c, e, height, topY, baseFloor, skirt));
+            previewBlocked |= WallGraph.OverlapsExisting(s, c, e, baseFloor);
+            previewCrossings.AddRange(WallGraph.FindCrossings(s, c, e, baseFloor));
+        }
+        foreach (WallEdge.SectionSpec spec in splineSpecs)
+            previewMeshes.Add(spec.mesh);
+    }
+
+    // The wall a point at this elevation is STANDING ON: an edge of some
+    // other storey whose top reaches this base directly under the point.
+    // Nothing stores what rests on what (structural rules are deliberately
+    // deferred), so support is a geometric question — asked only in the
+    // two places the answer changes a gesture: a snapped anchor that is
+    // really standing on a wall, and how deep a stacked run's bottom goes.
+    WallEdge RideHostUnder(Vector3 point, float baseY)
+    {
+        if (float.IsNegativeInfinity(baseY))
+            return null;
+        WallEdge best = null;
+        float bestSq = float.MaxValue;
+        foreach (WallEdge edge in WallEdge.All)
+        {
+            // Same storey means neighbour, not support.
+            if (edge == null || WallGraph.SameBase(edge.baseY, baseY))
+                continue;
+            float half = edge.thickness * 0.5f;
+            edge.NearestT(point, out float distSq);
+            if (distSq > half * half || distSq >= bestSq)
+                continue;
+            // Against the whole TOP RANGE, not the top at this parameter:
+            // an unlocked wall's top steps down a slope, and a storey laid
+            // over it takes its base from wherever the gesture started.
+            TopRange(edge, 0f, 1f, out float low, out float high);
+            if (baseY < low - WallGraph.BaseTolerance || baseY > high + WallGraph.BaseTolerance)
+                continue;
+            bestSq = distSq;
+            best = edge;
+        }
+        return best;
+    }
+
+    // Lowest and highest section top over a slice of an edge.
+    static void TopRange(WallEdge edge, float tA, float tB, out float low, out float high)
+    {
+        low = float.MaxValue;
+        high = float.MinValue;
+        foreach (WallEdgeSection section in edge.SectionsInOrder())
+        {
+            if (section.tEnd < tA - 0.0001f || section.tStart > tB + 0.0001f)
+                continue;
+            low = Mathf.Min(low, section.topY);
+            high = Mathf.Max(high, section.topY);
+        }
+    }
+
+    // Bottom and top for a run laid on a wall top. An unlocked wall's top
+    // STEPS with the terrain, so a stacked run with a flat bottom at the
+    // top under the cursor shows daylight over every lower step. The run
+    // keeps the top its height dialed and grows a SKIRT down to the lowest
+    // top it covers: the joint is buried in masonry instead of open. baseY
+    // itself never moves — it is the storey, and the graph reads it.
+    void StackFit(WallEdge known, Vector3 s, Vector3 e, float height,
+        float baseY, out float skirt, ref float topY)
+    {
+        skirt = 0f;
+        if (float.IsNegativeInfinity(baseY))
+            return;
+        WallEdge host = known ?? RideHostUnder(s, baseY) ?? RideHostUnder(e, baseY);
+        if (host == null)
+            return;
+        float tA = host.NearestT(s, out _);
+        float tB = host.NearestT(e, out _);
+        if (tA > tB)
+            (tA, tB) = (tB, tA);
+        TopRange(host, tA, tB, out float lowest, out float highest);
+        if (lowest > highest)
+            return;
+        if (baseY - lowest <= 0.001f && highest - baseY <= 0.001f)
+            return;                                 // level host: nothing to fit
+        skirt = Mathf.Max(0f, baseY - lowest);
+        // The top is pinned to CLEAR the highest stone the run covers by
+        // the dialed height. Measuring from the hovered section instead
+        // would bury the run in its own host wherever that host stands
+        // higher — anchor low on a slope and the wall vanishes into the
+        // rise. On a level host the two are the same number.
+        if (float.IsNegativeInfinity(topY))
+            topY = Mathf.Max(baseY, highest) + height;
+    }
+
+    // The control point a run gets from the wall it is riding: both ends
+    // must sit on the SAME host's top, and the sub-curve between their two
+    // parameters is exact (WallGraph.SubCurve), so a storey laid over a
+    // curved wall traces it rather than approximating it. False whenever
+    // the gesture left that host — the bulge wheel takes over again.
+    bool TryRideControl(Vector3 start, Vector3 end, out Vector3 control)
+    {
+        control = default;
+        WallEdge host = previewRideHost;
+        if (host == null)
+            return false;
+        float tA = host.NearestT(start, out _);
+        float tB = host.NearestT(end, out _);
+        if (Mathf.Abs(tB - tA) < 0.001f)
+            return false;
+        WallGraph.SubCurve(host.A, host.control, host.B, tA, tB, out _, out control, out _);
+        return true;
+    }
+
     // The absolute top a locked-top wall anchored at this point gets: the
     // anchor cell's stepped ground plus the current wall height.
     // -Infinity (lock off) leaves tops riding the terrain per section.
@@ -2634,16 +3140,29 @@ public class GridPlacementSystem : MonoBehaviour
         float? baseY = anchorBaseY ?? hoverBaseY;
         float topY = baseY.HasValue ? float.NegativeInfinity : LockedTopFor(start);
         float baseFloor = baseY ?? float.NegativeInfinity;
-        var key = (start, end, bulge, apexT, height, topY, baseFloor, trimStart, trimEnd);
+        // Standing on a wall: bury the bottom into its stepped top rather
+        // than leave a slot. The GRAPH still gets baseFloor — the storey —
+        // while only the masonry starts lower.
+        StackFit(previewRideHost, start, end, height, baseFloor,
+            out float skirt, ref topY);
+        // A run anchored on a wall top INHERITS that wall's curve exactly
+        // (polar-form subdivision) and nothing overrides it — not the
+        // bulge wheel, not Shift. Masonry raised over a wall follows the
+        // wall. Straight hosts are unaffected: a sub-curve of a straight
+        // edge is straight.
+        Vector3 control = TryRideControl(start, end, out Vector3 ridden)
+            ? ridden
+            : ControlPointFor(start, end, bulge, apexT);
+        var key = (start, end, control, height, topY, baseFloor - skirt, trimStart, trimEnd);
         if (lastPreviewKey.HasValue && lastPreviewKey.Value == key)
             return;
         lastPreviewKey = key;
-        lastCourseKey = null;
+        lastRideKey = null;
 
         ClearPreviewMeshes();
         splineSpecs.Clear();
-        Vector3 control = ControlPointFor(start, end, bulge, apexT);
-        pendingCommit = (start, control, end, height, topY, baseFloor);
+        pendingCommits.Clear();
+        pendingCommits.Add((start, control, end, height, topY, baseFloor, skirt));
 
         Vector3 ds = start, dc = control, de = end;
         if (trimStart > 0.001f || trimEnd > 0.001f)
@@ -2664,36 +3183,15 @@ public class GridPlacementSystem : MonoBehaviour
             WallGraph.SubCurve(start, control, end, tA, tB, out ds, out dc, out de);
         }
         splineSpecs.AddRange(WallEdge.BuildSpecs(ds, dc, de,
-            height, gridSize, gridSize, baseStepSize, BaseHeight, topY, baseFloor));
+            height, gridSize, gridSize, baseStepSize, BaseHeight, topY, baseFloor - skirt));
         foreach (WallEdge.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
 
         // The graph verdicts the whole gesture: refused only for a
         // near-exact redraw along an existing wall; crossings are legal
         // and become shared nodes (shown as gold posts).
-        previewBlocked = WallGraph.OverlapsExisting(start, control, end);
-        previewCrossings = WallGraph.FindCrossings(start, control, end);
-    }
-
-    void BuildCoursePreview(WallEdge edge)
-    {
-        var key = (edge, CurrentWallHeight);
-        if (lastCourseKey.HasValue && lastCourseKey.Value == key)
-            return;
-        lastCourseKey = key;
-        lastPreviewKey = null;
-        pendingCommit = null;
-
-        ClearPreviewMeshes();
-        splineSpecs.Clear();
-        previewBlocked = false;
-        previewCrossings.Clear();
-        // Only the spans not already under a course — a second course
-        // never doubles into the first.
-        foreach ((float lo, float hi) in edge.UncoveredRanges())
-            splineSpecs.AddRange(edge.BuildCourseSpecs(CurrentWallHeight, BaseHeight, lo, hi));
-        foreach (WallEdge.SectionSpec spec in splineSpecs)
-            previewMeshes.Add(spec.mesh);
+        previewBlocked = WallGraph.OverlapsExisting(start, control, end, baseFloor);
+        previewCrossings = WallGraph.FindCrossings(start, control, end, baseFloor);
     }
 
     void ClearPreviewMeshes()
@@ -2751,8 +3249,8 @@ public class GridPlacementSystem : MonoBehaviour
         previewBlocked = false;
         previewCrossings.Clear();
         lastPreviewKey = null;
-        pendingCommit = null;
-        lastCourseKey = null;
+        lastRideKey = null;
+        pendingCommits.Clear();
 
         float ground = hoverBaseY ?? SampleCellGroundY(point.x, point.z);
         float height = EffectiveWallHeight;
@@ -2892,8 +3390,8 @@ public class GridPlacementSystem : MonoBehaviour
             return;
         lastOffsetKey = key;
         lastPreviewKey = null;
-        pendingCommit = null;
-        lastCourseKey = null;
+        lastRideKey = null;
+        pendingCommits.Clear();
 
         ClearPreviewMeshes();
         splineSpecs.Clear();
@@ -2901,8 +3399,8 @@ public class GridPlacementSystem : MonoBehaviour
             CurrentWallHeight, gridSize, gridSize, baseStepSize, BaseHeight, topY, srcBase));
         foreach (WallEdge.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
-        previewBlocked = WallGraph.OverlapsExisting(s, c, e);
-        previewCrossings = WallGraph.FindCrossings(s, c, e);
+        previewBlocked = WallGraph.OverlapsExisting(s, c, e, srcBase);
+        previewCrossings = WallGraph.FindCrossings(s, c, e, srcBase);
     }
 
     // Shells the hovered wall in preview color so the offset tool shows
@@ -2914,8 +3412,8 @@ public class GridPlacementSystem : MonoBehaviour
         previewBlocked = false;
         previewCrossings.Clear();
         lastPreviewKey = null;
-        pendingCommit = null;
-        lastCourseKey = null;
+        lastRideKey = null;
+        pendingCommits.Clear();
         lastOffsetKey = null;
 
         int count = 0;
@@ -3066,9 +3564,8 @@ public class GridPlacementSystem : MonoBehaviour
     // anchor section to the section under the cursor: walking the node
     // graph, the first and last edges contribute the span from the
     // touched section to the connecting joint, everything between dies
-    // whole. Courses live off-graph, so a course paint stays on its own
-    // edge. No path (separate wall, or the cursor skipped too far) keeps
-    // the previous preview.
+    // whole. No path (a separate wall, another storey, or the cursor
+    // skipped too far) keeps the previous preview.
     void MarkPathDoomed(WallEdgeSection a, WallEdgeSection b)
     {
         if (a.edge == b.edge)
@@ -3078,8 +3575,6 @@ public class GridPlacementSystem : MonoBehaviour
             RebuildDoomedFromRanges();
             return;
         }
-        if (a.edge.IsCourse || b.edge.IsCourse)
-            return;
         List<WallEdge> path = EdgePath(a.edge, b.edge);
         if (path == null)
             return;
@@ -3156,7 +3651,7 @@ public class GridPlacementSystem : MonoBehaviour
                     continue;
                 foreach (WallNode.Member m in node.members)
                 {
-                    if (m.edge == null || m.edge.IsCourse || parent.ContainsKey(m.edge))
+                    if (m.edge == null || parent.ContainsKey(m.edge))
                         continue;
                     parent[m.edge] = cur;
                     queue.Enqueue(m.edge);
@@ -3173,7 +3668,7 @@ public class GridPlacementSystem : MonoBehaviour
         return a.nodeB;
     }
 
-    // Everything the rubber-band caught: wall sections (courses too) by
+    // Everything the rubber-band caught: wall sections at any storey by
     // their screen-projected centers, and rooms by either slab's center
     // — the red shells are the confirmation of exactly what release
     // will take.
@@ -3296,9 +3791,12 @@ public class GridPlacementSystem : MonoBehaviour
             var bestFace = new Vector3[4];
             var bestDist = new float[] { float.MaxValue, float.MaxValue, float.MaxValue, float.MaxValue };
             var found = new bool[4];
+            // Only masonry on the gesture's own storey — a ground wall
+            // measured against a wall two storeys up is noise.
+            float? guideBase = anchorBaseY ?? hoverBaseY;
             foreach (WallEdge edge in WallEdge.All)
             {
-                if (edge.IsCourse)
+                if (!BaseMatches(edge, guideBase))
                     continue;
                 Vector3 face = edge.ClosestFacePoint(center, out float dist);
                 if (dist > guideRange || dist < 0.05f)
@@ -3395,9 +3893,10 @@ public class GridPlacementSystem : MonoBehaviour
         // survives, and a probe sitting ON any aligned wall's own span
         // is a snap situation, not an alignment hint.
         var candidates = new List<(float gap, Vector3 from, float bearing)>();
+        float? alignBase = anchorBaseY ?? hoverBaseY;
         foreach (WallEdge edge in WallEdge.All)
         {
-            if (edge == null || edge.IsCourse)
+            if (edge == null || !BaseMatches(edge, alignBase))
                 continue;
             Vector3 a = edge.A, b = edge.B;
             Vector3 d = b - a;
