@@ -18,6 +18,20 @@ public class WallRoom : MonoBehaviour
     public static readonly List<WallRoom> All = new List<WallRoom>();
 
     public readonly List<WallGraph.DirEdge> boundary = new List<WallGraph.DirEdge>();
+
+    // A hole in the roof deck, and the stair that needs it. STORED, like
+    // the ring: cut at exactly two moments (a stair commits, or a roof is
+    // finally built over stairs that already stand) and never re-derived
+    // after. Same doctrine as everything else here — a slab that
+    // recomputed its own holes would be inferring structure, and would go
+    // looking for it on every split and breach.
+    public struct Well
+    {
+        public WallStair owner;
+        public List<Vector3> poly;
+    }
+    public readonly List<Well> wells = new List<Well>();
+
     public float floorY;
     public float roofY = float.NegativeInfinity;
     // Set by TryBuildRoof: empty when the whole crown was one level, else
@@ -33,6 +47,9 @@ public class WallRoom : MonoBehaviour
     // The face outline sampled once at designation (flattened, CCW). Both
     // slabs are cut from this polygon; boundary splits don't change it.
     List<Vector3> outline;
+    // The roof's own footprint, kept so a well can be cut into it later
+    // without re-deriving the plane or the inset.
+    List<Vector3> deckOutline;
     GameObject floorObj;
     GameObject roofObj;
     Mesh floorMesh;
@@ -43,6 +60,19 @@ public class WallRoom : MonoBehaviour
     const float LevelEps = 0.05f;
     const int EdgeSamples = 8;
     const float InteriorSampleStep = 2f;
+    // How much head a climber needs before the deck: the well opens from
+    // the tread that first comes within this of the roof, so you are
+    // through the hole before you would have hit it.
+    const float Headroom = 2f;
+    // A stair butts flush against the wall's inner face, which is exactly
+    // where the deck's edge sits — so the well's natural footprint touches
+    // the deck boundary instead of sitting inside it, and a keyhole bridge
+    // needs a hole that is strictly interior. The well is drawn a lip
+    // narrower than the treads to guarantee that. The cost is a lip of
+    // deck lying over the outer few centimetres of the landing, which is
+    // coplanar with it; keep this small enough to read as a joint line.
+    const float WellLip = 0.05f;
+    const int WellSamplesPerSpan = 6;
 
     void OnEnable() { All.Add(this); }
     void OnDisable() { All.Remove(this); }
@@ -78,6 +108,7 @@ public class WallRoom : MonoBehaviour
         room.boundary.AddRange(ring);
         room.outline = outline;
         room.BuildFloor();
+        room.RaiseSills();
         string roofFail = room.TryBuildRoof();
         BuildLog.Add(roofFail == null
             ? $"Room designated — {ring.Count} walls, roofed{room.roofNote}."
@@ -193,6 +224,66 @@ public class WallRoom : MonoBehaviour
         return false;
     }
 
+    // The highest room floor this wall bounds, or -Infinity if it bounds
+    // none. A doorway through it has to open from that level: the floor is
+    // ONE flat slab at the room's highest interior ground (see BuildFloor),
+    // so on a slope it stands above the ground outside the downhill wall,
+    // and a doorway cut from that ground opens into the side of the slab.
+    // Highest, not lowest, because a wall between two rooms must clear
+    // both — a doorway into a floor is worse than a step down onto one.
+    public static float FloorServing(WallEdge edge)
+    {
+        float best = float.NegativeInfinity;
+        foreach (WallRoom room in All)
+            if (!room.broken && room.ContainsEdge(edge))
+                best = Mathf.Max(best, room.floorY);
+        return best;
+    }
+
+    // A doorway cut BEFORE this room was designated has its sill on the
+    // ground outside, which this floor would then stand across. Raising it
+    // here is the same rule the wells follow: the fact is written at both
+    // of the two moments it can become true, and never re-derived after.
+    //
+    // Deliberately one-way. Deleting the room does not drop the sills back
+    // down — nothing in the graph un-does itself, and a threshold left
+    // standing is visible and removable (fill the doorway in and re-cut
+    // it), where a sill silently sinking into a slab would not be.
+    void RaiseSills()
+    {
+        foreach (WallGraph.DirEdge d in boundary)
+        {
+            WallEdge e = d.edge;
+            if (e == null || e.openings.Count == 0)
+                continue;
+            bool changed = false;
+            for (int i = 0; i < e.openings.Count; i++)
+            {
+                WallEdge.Opening o = e.openings[i];
+                if (o.sill >= floorY - 0.01f)
+                    continue;
+                o.sill = floorY;
+                e.openings[i] = o;
+                changed = true;
+            }
+            if (!changed)
+                continue;
+            e.Rebuild();
+            // Whether the doorway survived the lift. On a steep enough
+            // slope the floor stands above this wall entirely and the
+            // opening is walled up — worth saying, since the player
+            // watches a door they cut disappear.
+            bool survived = false;
+            foreach (WallEdgeSection s in e.SectionsInOrder())
+                if (s.openingIndex >= 0 && s.bottomY > floorY + 0.01f)
+                    survived = true;
+            BuildLog.Add(survived
+                ? $"Doorway sill raised to the new floor at {floorY:0.0}m."
+                : $"A doorway was walled up — this floor sits at {floorY:0.0}m,"
+                    + " above that stretch of wall entirely.");
+        }
+    }
+
     // ------------------------------------------------------------------
     // Slabs
     // ------------------------------------------------------------------
@@ -220,7 +311,12 @@ public class WallRoom : MonoBehaviour
             if (d.edge == null)
                 continue;
             foreach (WallEdgeSection s in d.edge.SectionsInOrder())
-                wallBase = Mathf.Max(wallBase, s.bottomY);
+                // A lintel's bottom is the doorway's head, metres above
+                // the ground the wall stands on. Counted here it reads as
+                // "these walls start high up", and the room concludes it
+                // is an upper storey and gives itself no floor.
+                if (s.openingIndex < 0)
+                    wallBase = Mathf.Max(wallBase, s.bottomY);
         }
 
         floorY = baseStep > 0f ? Mathf.Ceil(maxGround / baseStep) * baseStep : maxGround;
@@ -392,8 +488,174 @@ public class WallRoom : MonoBehaviour
         roofNote = tallest < 0 ? ""
             : $" at {plane:0.0}m — the {CompassFrom(hiPos[tallest])} wall stands"
                 + $" {highest - plane:0.0}m higher";
-        roofObj = BuildSlab("RoomRoof", deck, roofY - RoofThickness, roofY, out roofMesh);
+        deckOutline = deck;
+        // Stairs that already stand get their wells now. A roof arriving
+        // over a finished stair and a stair arriving under a finished roof
+        // are the same fact reached from opposite directions; both have to
+        // work, so both ends ask.
+        wells.Clear();
+        int opened = 0;
+        foreach (WallStair stair in WallStair.All)
+            if (AddWell(stair))
+                opened++;
+        if (opened > 0)
+            roofNote += $" — {opened} stair well{(opened == 1 ? "" : "s")}";
+        BuildRoofSlab();
         return null;
+    }
+
+    // ------------------------------------------------------------------
+    // Stair wells
+    // ------------------------------------------------------------------
+
+    // A stair was committed: every roofed room its climb breaks through
+    // opens a well for it.
+    public static void NotifyStairBuilt(WallStair stair)
+    {
+        foreach (WallRoom room in All)
+        {
+            if (room.broken || room.roofObj == null)
+                continue;
+            if (!room.AddWell(stair))
+                continue;
+            room.BuildRoofSlab();
+            BuildLog.Add("Stair well opened in the roof above.");
+        }
+    }
+
+    // A stair was deleted: its wells close and the deck heals.
+    public static void NotifyStairGone(WallStair stair)
+    {
+        foreach (WallRoom room in All)
+        {
+            if (room.broken || room.roofObj == null)
+                continue;
+            if (room.wells.RemoveAll(w => w.owner == stair) > 0)
+                room.BuildRoofSlab();
+        }
+    }
+
+    // Records the hole this stair needs in this deck, if it needs one.
+    bool AddWell(WallStair stair)
+    {
+        if (stair == null || deckOutline == null)
+            return false;
+        foreach (Well w in wells)
+            if (w.owner == stair)
+                return false;
+        List<Vector3> poly = WellFootprint(stair);
+        if (poly == null)
+            return false;
+        // Only a hole that is actually over this room's deck. A stair up
+        // the OUTSIDE of the same wall traces the same masonry and would
+        // otherwise punch a hole in a roof it never touches.
+        bool overlaps = false;
+        foreach (Vector3 p in poly)
+            if (PointInPolygon(p, deckOutline))
+            {
+                overlaps = true;
+                break;
+            }
+        if (!overlaps)
+            return false;
+        wells.Add(new Well { owner = stair, poly = poly });
+        return true;
+    }
+
+    // The plan footprint the climb needs open: from the tread that first
+    // comes within Headroom of the deck, through the landing at the top.
+    // The landing matters as much as the climb — it finishes flush AT the
+    // roof plane, so left uncut it would be coplanar with the deck it is
+    // supposed to arrive on.
+    List<Vector3> WellFootprint(WallStair stair)
+    {
+        if (stair.spans.Count == 0)
+            return null;
+        float rise = stair.topY - stair.bottomY;
+        if (rise < 0.05f)
+            return null;
+        // Standing on this deck, or never reaching it: no hole either way.
+        if (stair.bottomY >= roofY - 0.01f || stair.topY <= roofY - Headroom + 0.01f)
+            return null;
+
+        float runArc = stair.runArc > 0.01f ? stair.runArc : stair.TotalArc;
+        float from = Mathf.Clamp(runArc * (roofY - Headroom - stair.bottomY) / rise,
+            0f, runArc);
+        return StripFootprint(stair, from, stair.TotalArc,
+            stair.width * 0.5f - WellLip);
+    }
+
+    // The stair's own curve, walked between two arc positions and given a
+    // width: the run's plan shape, corners and all, rather than a box
+    // around it. A stair that turns a corner gets a hole that turns too.
+    static List<Vector3> StripFootprint(WallStair stair, float from, float to, float half)
+    {
+        var left = new List<Vector3>();
+        var right = new List<Vector3>();
+        foreach (WallStair.Span sp in stair.spans)
+        {
+            float lo = Mathf.Max(from, sp.arcStart);
+            float hi = Mathf.Min(to, sp.arcEnd);
+            if (hi - lo < 0.01f)
+                continue;
+            float[] table = WallEdge.BuildArcTable(sp.s, sp.c, sp.e);
+            for (int i = 0; i <= WellSamplesPerSpan; i++)
+            {
+                float arc = Mathf.Lerp(lo, hi, (float)i / WellSamplesPerSpan) - sp.arcStart;
+                float t = WallEdge.TAtArc(table, arc);
+                Vector3 p = WallEdge.Evaluate(sp.s, sp.c, sp.e, t);
+                Vector3 d = WallEdge.Tangent(sp.s, sp.c, sp.e, t);
+                d.y = 0f;
+                if (d.sqrMagnitude < 1e-8f)
+                    continue;
+                d.Normalize();
+                Vector3 side = new Vector3(-d.z, 0f, d.x) * half;
+                left.Add(new Vector3(p.x + side.x, 0f, p.z + side.z));
+                right.Add(new Vector3(p.x - side.x, 0f, p.z - side.z));
+            }
+        }
+        if (left.Count < 2)
+            return null;
+        right.Reverse();
+        var poly = new List<Vector3>(left);
+        poly.AddRange(right);
+        poly = Dedupe(poly);
+        if (poly.Count < 3 || Mathf.Abs(SignedArea(poly)) < 0.05f)
+            return null;
+        if (SignedArea(poly) < 0f)
+            poly.Reverse();
+        return poly;
+    }
+
+    // Span joints repeat a point, and ear clipping treats a repeat as a
+    // zero-area ear it can never remove.
+    static List<Vector3> Dedupe(List<Vector3> poly)
+    {
+        var result = new List<Vector3>(poly.Count);
+        foreach (Vector3 p in poly)
+            if (result.Count == 0 || (result[result.Count - 1] - p).sqrMagnitude > 4e-4f)
+                result.Add(p);
+        while (result.Count > 1 && (result[0] - result[result.Count - 1]).sqrMagnitude <= 4e-4f)
+            result.RemoveAt(result.Count - 1);
+        return result;
+    }
+
+    void BuildRoofSlab()
+    {
+        // Immediate, not deferred: a well is cut in the middle of a commit
+        // and the old deck's collider would otherwise stay in the ray's
+        // way for the rest of the frame — the same reason WallStair
+        // rebuilds its treads immediately.
+        if (roofObj != null)
+            DestroyImmediate(roofObj);
+        if (roofMesh != null)
+            DestroyImmediate(roofMesh);
+        var holes = new List<List<Vector3>>();
+        foreach (Well w in wells)
+            if (w.owner != null && w.poly != null)
+                holes.Add(w.poly);
+        roofObj = BuildSlab("RoomRoof", deckOutline, holes, roofY - RoofThickness,
+            roofY, out roofMesh);
     }
 
     // Does this node carry masonry the room's ring doesn't own — i.e.
@@ -462,7 +724,13 @@ public class WallRoom : MonoBehaviour
 
     GameObject BuildSlab(string name, List<Vector3> poly, float y0, float y1, out Mesh mesh)
     {
-        mesh = BuildSlabMesh(poly, y0, y1, baseWallHeight);
+        return BuildSlab(name, poly, null, y0, y1, out mesh);
+    }
+
+    GameObject BuildSlab(string name, List<Vector3> poly, List<List<Vector3>> holes,
+        float y0, float y1, out Mesh mesh)
+    {
+        mesh = BuildSlabMesh(poly, holes, y0, y1, baseWallHeight);
         mesh.name = name;
         GameObject obj = new GameObject(name);
         obj.transform.SetParent(transform, false);
@@ -557,22 +825,36 @@ public class WallRoom : MonoBehaviour
         return inside;
     }
 
-    // The slab: triangulated caps (top faces up, bottom down) and an
-    // outward side band. Cap UVs are world-planar and side V is
-    // world-height anchored, matching the walls' masonry scale.
-    static Mesh BuildSlabMesh(List<Vector3> poly, float y0, float y1, float baseWallHeight)
+    // The slab: triangulated caps (top faces up, bottom down), an outward
+    // side band, and an inward band around every hole. Cap UVs are
+    // world-planar and side V is world-height anchored, matching the
+    // walls' masonry scale.
+    //
+    // Holes are cut by BRIDGING them into the outline — the keyhole trick
+    // — so the caps stay one simple polygon and the existing ear clipper
+    // needs no notion of holes at all. A hole's rim band is the same code
+    // as the outer band walked backwards, which turns it to face into the
+    // well.
+    static Mesh BuildSlabMesh(List<Vector3> poly, List<List<Vector3>> holes,
+        float y0, float y1, float baseWallHeight)
     {
         var vertices = new List<Vector3>();
         var uvs = new List<Vector2>();
         var triangles = new List<int>();
-        List<int> capTris = Triangulate(poly);
+
+        List<Vector3> cap = poly;
+        if (holes != null)
+            foreach (List<Vector3> hole in holes)
+                if (hole != null && hole.Count >= 3)
+                    cap = BridgeHole(cap, hole);
+        List<int> capTris = Triangulate(cap);
 
         for (int side = 0; side < 2; side++)
         {
             bool isTop = side == 0;
             float y = isTop ? y1 : y0;
             int baseIndex = vertices.Count;
-            foreach (Vector3 p in poly)
+            foreach (Vector3 p in cap)
             {
                 vertices.Add(new Vector3(p.x, y, p.z));
                 uvs.Add(new Vector2(p.x / baseWallHeight, p.z / baseWallHeight));
@@ -594,11 +876,34 @@ public class WallRoom : MonoBehaviour
             }
         }
 
+        AddBand(vertices, uvs, triangles, poly, y0, y1, baseWallHeight);
+        if (holes != null)
+            foreach (List<Vector3> hole in holes)
+            {
+                if (hole == null || hole.Count < 3)
+                    continue;
+                var inward = new List<Vector3>(hole);
+                inward.Reverse();
+                AddBand(vertices, uvs, triangles, inward, y0, y1, baseWallHeight);
+            }
+
+        Mesh mesh = new Mesh { name = "RoomSlab" };
+        mesh.SetVertices(vertices);
+        mesh.SetUVs(0, uvs);
+        mesh.SetTriangles(triangles, 0);
+        mesh.RecalculateNormals();
+        mesh.RecalculateBounds();
+        return mesh;
+    }
+
+    static void AddBand(List<Vector3> vertices, List<Vector2> uvs, List<int> triangles,
+        List<Vector3> ring, float y0, float y1, float baseWallHeight)
+    {
         float u = 0f;
-        for (int i = 0; i < poly.Count; i++)
+        for (int i = 0; i < ring.Count; i++)
         {
-            Vector3 a = poly[i];
-            Vector3 b = poly[(i + 1) % poly.Count];
+            Vector3 a = ring[i];
+            Vector3 b = ring[(i + 1) % ring.Count];
             float len = Vector3.Distance(a, b);
             int q = vertices.Count;
             vertices.Add(new Vector3(a.x, y0, a.z));
@@ -613,14 +918,74 @@ public class WallRoom : MonoBehaviour
             triangles.Add(q + 1); triangles.Add(q + 3); triangles.Add(q + 2);
             u += len;
         }
+    }
 
-        Mesh mesh = new Mesh { name = "RoomSlab" };
-        mesh.SetVertices(vertices);
-        mesh.SetUVs(0, uvs);
-        mesh.SetTriangles(triangles, 0);
-        mesh.RecalculateNormals();
-        mesh.RecalculateBounds();
-        return mesh;
+    // Splices a hole into the outline through the shortest bridge that
+    // crosses nothing. The hole is walked BACKWARDS so it winds against
+    // the outline, which is what makes the seam close and the interior
+    // read as removed; the bridge vertices appear twice, giving two
+    // zero-width edges the ear clipper walks straight past.
+    static List<Vector3> BridgeHole(List<Vector3> outer, List<Vector3> hole)
+    {
+        int n = outer.Count, m = hole.Count;
+        if (n < 3 || m < 3)
+            return outer;
+        int bi = -1, bj = -1;
+        float best = float.MaxValue;
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < m; j++)
+            {
+                float d = (outer[i] - hole[j]).sqrMagnitude;
+                if (d >= best || !BridgeClear(outer, hole, i, j))
+                    continue;
+                best = d;
+                bi = i;
+                bj = j;
+            }
+        // No clear bridge means the hole isn't cleanly inside the deck —
+        // leave the slab whole rather than tear it open along a bad seam.
+        if (bi < 0)
+            return outer;
+
+        var merged = new List<Vector3>(n + m + 2);
+        for (int i = 0; i <= bi; i++)
+            merged.Add(outer[i]);
+        for (int k = 0; k <= m; k++)
+            merged.Add(hole[((bj - k) % m + m) % m]);
+        merged.Add(outer[bi]);
+        for (int i = bi + 1; i < n; i++)
+            merged.Add(outer[i]);
+        return merged;
+    }
+
+    static bool BridgeClear(List<Vector3> outer, List<Vector3> hole, int i, int j)
+    {
+        Vector3 a = outer[i], b = hole[j];
+        int n = outer.Count, m = hole.Count;
+        for (int k = 0; k < n; k++)
+            if (k != i && (k + 1) % n != i
+                && SegmentsCross(a, b, outer[k], outer[(k + 1) % n]))
+                return false;
+        for (int k = 0; k < m; k++)
+            if (k != j && (k + 1) % m != j
+                && SegmentsCross(a, b, hole[k], hole[(k + 1) % m]))
+                return false;
+        return true;
+    }
+
+    // Proper crossing only: segments that merely touch at an endpoint are
+    // not in the way, or no bridge would ever be clear.
+    static bool SegmentsCross(Vector3 p1, Vector3 p2, Vector3 p3, Vector3 p4)
+    {
+        float d1 = Side(p3, p4, p1), d2 = Side(p3, p4, p2);
+        float d3 = Side(p1, p2, p3), d4 = Side(p1, p2, p4);
+        return ((d1 > 1e-6f && d2 < -1e-6f) || (d1 < -1e-6f && d2 > 1e-6f))
+            && ((d3 > 1e-6f && d4 < -1e-6f) || (d3 < -1e-6f && d4 > 1e-6f));
+    }
+
+    static float Side(Vector3 a, Vector3 b, Vector3 p)
+    {
+        return (b.x - a.x) * (p.z - a.z) - (b.z - a.z) * (p.x - a.x);
     }
 
     // Ear clipping over a CCW polygon. Collinear runs (the outline is
@@ -652,7 +1017,15 @@ public class WallRoom : MonoBehaviour
                 {
                     if (j == i0 || j == i1 || j == i2)
                         continue;
-                    if (PointInTriangle(poly[j], a, b, c))
+                    // A bridged hole repeats its two seam vertices, and a
+                    // repeat sits exactly ON the ear it duplicates — count
+                    // it and no ear near the seam is ever clippable, which
+                    // drops the whole cap to the fan fallback and fills
+                    // the well back in.
+                    Vector3 q = poly[j];
+                    if (Coincident(q, a) || Coincident(q, b) || Coincident(q, c))
+                        continue;
+                    if (PointInTriangle(q, a, b, c))
                     {
                         contains = true;
                         break;
@@ -679,6 +1052,11 @@ public class WallRoom : MonoBehaviour
             tris.Add(idx[0]); tris.Add(idx[1]); tris.Add(idx[2]);
         }
         return tris;
+    }
+
+    static bool Coincident(Vector3 a, Vector3 b)
+    {
+        return (a - b).sqrMagnitude < 1e-6f;
     }
 
     static bool PointInTriangle(Vector3 p, Vector3 a, Vector3 b, Vector3 c)

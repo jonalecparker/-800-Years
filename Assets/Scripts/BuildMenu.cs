@@ -32,6 +32,8 @@ public class BuildMenu : MonoBehaviour
     private string openCategory;
     private Image deleteButtonImage;
     private Image roomButtonImage;
+    private Image stairButtonImage;
+    private Image doorButtonImage;
     // The Room tool's job buttons, shown in the item row while it's in
     // hand — tinted from the placement system's actual state like every
     // other control here.
@@ -124,6 +126,8 @@ public class BuildMenu : MonoBehaviour
         // Gesture helpers (Curved, Offset, Circle, Rectangle) live as
         // checkboxes in the options panel instead.
         roomButtonImage = CreateButton(categoryRow, "Room", ToggleRoomMode).GetComponent<Image>();
+        stairButtonImage = CreateButton(categoryRow, "Stairs", ToggleStairMode).GetComponent<Image>();
+        doorButtonImage = CreateButton(categoryRow, "Doors", ToggleDoorMode).GetComponent<Image>();
         deleteButtonImage = CreateButton(categoryRow, "Delete", ToggleDeleteMode).GetComponent<Image>();
 
         // Small readouts tucked above the bar's right end: the wall height
@@ -426,8 +430,12 @@ public class BuildMenu : MonoBehaviour
         dragCountPanel.SetActive(count > 0);
 
         // Height only means anything while placing walls (building or
-        // offsetting), so the readout follows the tool.
-        bool building = placementSystem.Mode != GridPlacementSystem.ToolMode.Delete;
+        // offsetting), so the readout follows the tool. A stair takes its
+        // climb from the wall it's against and a doorway takes its head
+        // from a constant, so the dial says nothing in either.
+        bool building = placementSystem.Mode != GridPlacementSystem.ToolMode.Delete
+            && placementSystem.Mode != GridPlacementSystem.ToolMode.Stair
+            && placementSystem.Mode != GridPlacementSystem.ToolMode.Door;
         heightPanel.SetActive(building);
         if (building)
         {
@@ -478,6 +486,10 @@ public class BuildMenu : MonoBehaviour
             if (image != null)
                 image.color = roomTool && placementSystem.RoomTask == task
                     ? selectedColor : buttonColor;
+        stairButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Stair
+            ? selectedColor : buttonColor;
+        doorButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Door
+            ? selectedColor : buttonColor;
         deleteButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Delete
             ? deleteActiveColor : buttonColor;
     }
@@ -524,6 +536,37 @@ public class BuildMenu : MonoBehaviour
                 placementSystem.SetRoomTask(task);
         });
         roomTaskButtons.Add((button.GetComponent<Image>(), task));
+    }
+
+    // Stairs: no gesture and no sub-jobs, so the item row stays shut —
+    // point at a wall's side face and click.
+    void ToggleStairMode()
+    {
+        if (placementSystem == null)
+            return;
+
+        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Stair;
+        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Stair : GridPlacementSystem.ToolMode.Build);
+        if (entering)
+        {
+            itemRow.gameObject.SetActive(false);
+            openCategory = null;
+        }
+    }
+
+    // Doors: same shape of tool as stairs — no gesture, no sub-jobs.
+    void ToggleDoorMode()
+    {
+        if (placementSystem == null)
+            return;
+
+        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Door;
+        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Door : GridPlacementSystem.ToolMode.Build);
+        if (entering)
+        {
+            itemRow.gameObject.SetActive(false);
+            openCategory = null;
+        }
     }
 
     void ToggleDeleteMode()

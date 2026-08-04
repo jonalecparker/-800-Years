@@ -481,6 +481,7 @@ public static class WallGraph
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
                 edge.fixedTopY, edge.baseY, edge.skirt);
             sub.roomBuilt = edge.roomBuilt;
+            WallEdge.CarryOpenings(edge, sub, lo, hi);
             touched.Add(n0);
             touched.Add(n1);
         }
@@ -540,6 +541,7 @@ public static class WallGraph
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
                 edge.fixedTopY, edge.baseY, edge.skirt);
             sub.roomBuilt = edge.roomBuilt;
+            WallEdge.CarryOpenings(edge, sub, t0, t1);
             orderedSubs.Add(sub);
             touched.Add(n0);
             touched.Add(n1);

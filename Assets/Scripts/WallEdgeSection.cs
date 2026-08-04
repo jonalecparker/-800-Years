@@ -13,6 +13,10 @@ public class WallEdgeSection : MonoBehaviour
     public float tEnd;
     public float bottomY;
     public float topY;
+    // The lintel over a doorway carries that opening's index; -1 for
+    // ordinary masonry. Clicking the lintel is how a doorway is filled
+    // back in, so the section has to know it is one.
+    public int openingIndex = -1;
     [HideInInspector] public Mesh ownedMesh;
 
     void OnDestroy()

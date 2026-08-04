@@ -55,6 +55,37 @@ public class WallEdge : MonoBehaviour
     // copies it onto sub-edges: splitting a room wall leaves room walls.
     public bool roomBuilt;
 
+    // A doorway through this wall. STORED ON THE EDGE, not as a rider:
+    // an opening is a hole in this masonry and nothing else's, so it
+    // belongs to the same data the sections are derived from and the
+    // doctrine holds unchanged — an edge's geometry still depends on
+    // nothing but its own fields. A rider could only cut a hole by making
+    // the wall ask what is standing near it, which is the inference this
+    // graph exists to avoid.
+    //
+    // `t` is the curve parameter of the opening's CENTRE, which survives
+    // subdivision linearly (SubCurve is exact polar-form, so a sub-curve's
+    // parameter maps to the parent's by a straight lerp). `width` and
+    // `head` are metres, and are unchanged by a split because the geometry
+    // is.
+    //
+    // `sill` is an ABSOLUTE world height (-Infinity = stand on the wall's
+    // own footing, the safe default). It exists because a room's floor is
+    // one level slab at its highest interior ground, so on a slope the
+    // floor can stand well above the ground outside the downhill wall — a
+    // doorway cut from that ground opens into the side of the slab. The
+    // doorway opens from the FLOOR it serves instead, and the masonry
+    // below it becomes a threshold block.
+    [System.Serializable]
+    public struct Opening
+    {
+        public float t;
+        public float width;
+        public float head;
+        public float sill;
+    }
+    public List<Opening> openings = new List<Opening>();
+
     public Vector3 A => nodeA != null ? nodeA.point : transform.position;
     public Vector3 B => nodeB != null ? nodeB.point : transform.position;
 
@@ -73,6 +104,9 @@ public class WallEdge : MonoBehaviour
         public float bottomY;
         public float topY;
         public Mesh mesh;
+        // >= 0 when this section is the LINTEL over that opening — the
+        // masonry a click removes to fill the doorway back in.
+        public int openingIndex;
     }
 
     void OnEnable() { All.Add(this); }
@@ -127,7 +161,7 @@ public class WallEdge : MonoBehaviour
             DestroyImmediate(section.gameObject);
 
         List<SectionSpec> specs = BuildSpecs(A, control, B, height, targetSectionLength,
-            thickness, baseStep, baseWallHeight, fixedTopY, FloorY);
+            thickness, baseStep, baseWallHeight, fixedTopY, FloorY, openings);
         foreach (SectionSpec spec in specs)
             CreateSection(spec);
         Physics.SyncTransforms();
@@ -155,7 +189,38 @@ public class WallEdge : MonoBehaviour
         section.tEnd = spec.tEnd;
         section.bottomY = spec.bottomY;
         section.topY = spec.topY;
+        section.openingIndex = spec.openingIndex;
         section.ownedMesh = spec.mesh;
+    }
+
+    // The openings of `from` that survive whole inside its [t0, t1] piece,
+    // remapped onto `to`. An opening the split runs THROUGH doesn't
+    // survive: half a doorway on each side of a new node is not what
+    // anyone drew, and the masonry there is being re-formed anyway.
+    public static void CarryOpenings(WallEdge from, WallEdge to, float t0, float t1)
+    {
+        if (from.openings.Count == 0 || t1 - t0 < 0.001f)
+            return;
+        float[] table = BuildArcTable(from.A, from.control, from.B);
+        float a0 = ArcAt(table, t0);
+        float a1 = ArcAt(table, t1);
+        bool any = false;
+        foreach (Opening o in from.openings)
+        {
+            float mid = ArcAt(table, o.t);
+            if (mid - o.width * 0.5f < a0 + 0.05f || mid + o.width * 0.5f > a1 - 0.05f)
+                continue;
+            to.openings.Add(new Opening
+            {
+                t = (o.t - t0) / (t1 - t0),
+                width = o.width,
+                head = o.head,
+                sill = o.sill,
+            });
+            any = true;
+        }
+        if (any)
+            to.Rebuild();
     }
 
     public List<WallEdgeSection> SectionsInOrder()
@@ -173,7 +238,7 @@ public class WallEdge : MonoBehaviour
     public static List<SectionSpec> BuildSpecs(Vector3 s, Vector3 c, Vector3 e,
         float height, float targetSectionLength, float thickness, float baseStep,
         float baseWallHeight, float fixedTopY = float.NegativeInfinity,
-        float baseY = float.NegativeInfinity)
+        float baseY = float.NegativeInfinity, List<Opening> openings = null)
     {
         var specs = new List<SectionSpec>();
         float[] arcTable = BuildArcTable(s, c, e);
@@ -181,20 +246,183 @@ public class WallEdge : MonoBehaviour
         if (totalArc < 0.02f)
             return specs;
 
-        int count = Mathf.Max(1, Mathf.RoundToInt(totalArc / Mathf.Max(0.1f, targetSectionLength)));
-        for (int i = 0; i < count; i++)
+        // The wall's OWN section grid, settled BEFORE any doorway is cut
+        // into it: how many cells, and what each one stands on, come from
+        // this edge's arc and the terrain under it and nothing else. A
+        // doorway then cuts INTO the grid instead of re-dividing the wall.
+        //
+        // It used to re-divide. An opening split the arc into solid runs
+        // and each run was shared out evenly, so EVERY boundary on the
+        // wall moved and every section re-sampled a different footprint —
+        // and a section's footing is the LOWEST ground under it snapped
+        // down to the base step, so a longer section sits lower. Cutting a
+        // door into a short partition therefore dropped the masonry beside
+        // it half a step: the wall sank where the door went in. Stone at
+        // one end of a wall has no business moving because a hole was cut
+        // at the other.
+        int cells = Mathf.Max(1,
+            Mathf.RoundToInt(totalArc / Mathf.Max(0.1f, targetSectionLength)));
+        var cellGround = new float[cells];
+        for (int i = 0; i < cells; i++)
+            cellGround[i] = Mathf.Max(baseY, SampleSliceGround(s, c, e,
+                TAtArc(arcTable, totalArc * i / cells),
+                TAtArc(arcTable, totalArc * (i + 1) / cells), thickness, baseStep));
+
+        int index = 0;
+        foreach (Run run in Runs(arcTable, totalArc, openings))
         {
-            var spec = new SectionSpec
+            if (run.opening < 0)
             {
-                index = i,
-                tStart = TAtArc(arcTable, totalArc * i / count),
-                tEnd = TAtArc(arcTable, totalArc * (i + 1) / count),
+                // Solid masonry follows the grid, clipped to this run. A
+                // cell a doorway clips keeps its own footing, so the jamb
+                // beside a door stands exactly where it stood before it.
+                List<float> cuts = SolidCuts(run.lo, run.hi, totalArc, cells);
+                for (int i = 0; i + 1 < cuts.Count; i++)
+                {
+                    var solid = new SectionSpec
+                    {
+                        index = index++,
+                        openingIndex = -1,
+                        tStart = TAtArc(arcTable, cuts[i]),
+                        tEnd = TAtArc(arcTable, cuts[i + 1]),
+                        bottomY = cellGround[CellAt((cuts[i] + cuts[i + 1]) * 0.5f, totalArc, cells)],
+                    };
+                    FinishSpec(specs, s, c, e, solid, height, fixedTopY, thickness,
+                        baseWallHeight, arcTable);
+                }
+                continue;
+            }
+
+            // An opening is ONE section, so its ends are exactly the
+            // doorway's ends — and it can span a step in the ground. It
+            // reaches DOWN to the lowest cell it covers and UP to the
+            // highest: the threshold has to meet the ground, the lintel
+            // has to meet the wall. One figure for both is what left the
+            // masonry over a door half a step below the masonry next to
+            // it. Buried stone costs nothing; a notch in the wall top does
+            // — the same trade the skirt makes.
+            int firstCell = CellAt(run.lo, totalArc, cells);
+            int lastCell = CellAt(run.hi - 0.001f, totalArc, cells);
+            float lowGround = float.MaxValue, highGround = float.MinValue;
+            for (int k = firstCell; k <= lastCell; k++)
+            {
+                lowGround = Mathf.Min(lowGround, cellGround[k]);
+                highGround = Mathf.Max(highGround, cellGround[k]);
+            }
+            float wallTop = float.IsNegativeInfinity(fixedTopY) ? highGround + height : fixedTopY;
+            // Clamped to the wall's own top, because a sill can be handed
+            // a floor that stands ABOVE this wall entirely (a room on a
+            // steep slope). Then the threshold fills the whole opening and
+            // the lintel is dropped for having no room left: the doorway
+            // is walled up, which is the honest answer — a hole into the
+            // middle of a slab is not.
+            float sillY = Mathf.Clamp(Mathf.Max(lowGround, run.sill), lowGround, wallTop);
+            var opening = new SectionSpec
+            {
+                openingIndex = run.opening,
+                tStart = TAtArc(arcTable, run.lo),
+                tEnd = TAtArc(arcTable, run.hi),
             };
-            spec.bottomY = Mathf.Max(
-                SampleSliceGround(s, c, e, spec.tStart, spec.tEnd, thickness, baseStep), baseY);
-            FinishSpec(specs, s, c, e, spec, height, fixedTopY, thickness, baseWallHeight, arcTable);
+            // A THRESHOLD: the masonry under a doorway whose sill stands
+            // above the wall's own footing. Same trick as the lintel,
+            // upside down — an ordinary section with its TOP lowered.
+            if (sillY - lowGround > 0.05f)
+            {
+                SectionSpec block = opening;
+                block.index = index++;
+                block.bottomY = lowGround;
+                block.topY = sillY;
+                if (BuildSpecFrame(ref block, s, c, e, thickness, baseWallHeight, arcTable))
+                    specs.Add(block);
+            }
+            // A LINTEL is an ordinary section with its bottom raised to
+            // the opening's head. Its top still comes from the wall, so
+            // the masonry over the door lines up with the masonry beside
+            // it; the jambs are the neighbouring sections' end caps, which
+            // every section already has — a doorway needs no new mesh code
+            // at all. A head taller than the wall leaves nothing to build,
+            // and BuildSpecFrame drops it: a full-height gateway, not an
+            // error.
+            opening.index = index++;
+            opening.topY = wallTop;
+            opening.bottomY = sillY + run.head;
+            if (BuildSpecFrame(ref opening, s, c, e, thickness, baseWallHeight, arcTable))
+                specs.Add(opening);
         }
         return specs;
+    }
+
+    // Which grid cell an arc position falls in.
+    static int CellAt(float arc, float totalArc, int cells)
+        => Mathf.Clamp(Mathf.FloorToInt(arc / totalArc * cells), 0, cells - 1);
+
+    // The grid boundaries falling inside a solid run, with the run's own
+    // ends. A boundary landing within MinCell of one of those ends is
+    // DROPPED rather than left to make a sliver beside a doorway: the
+    // neighbouring section keeps the off-cut and takes the footing of
+    // whichever cell its middle lands in. A sliver would be dropped by
+    // BuildSpecFrame for being degenerate, and a dropped section is a gap.
+    const float MinCell = 0.2f;
+
+    static List<float> SolidCuts(float lo, float hi, float totalArc, int cells)
+    {
+        // Never more than half a cell, so a fine grid keeps its boundaries
+        // instead of merging every cell a doorway touches.
+        float minCell = Mathf.Min(MinCell, totalArc / cells * 0.5f);
+        var cuts = new List<float> { lo };
+        int last = CellAt(hi - 0.001f, totalArc, cells);
+        for (int k = CellAt(lo, totalArc, cells) + 1; k <= last; k++)
+        {
+            float b = totalArc * k / cells;
+            if (b - cuts[cuts.Count - 1] >= minCell && hi - b >= minCell)
+                cuts.Add(b);
+        }
+        cuts.Add(hi);
+        return cuts;
+    }
+
+    struct Run
+    {
+        public float lo;
+        public float hi;
+        public float head;
+        public float sill;
+        public int opening;
+    }
+
+    // The wall's arc split into solid runs and openings, in order. Cutting
+    // the section boundaries at the doorway's edges is what makes a
+    // doorway possible without touching the sweep: everything downstream
+    // just builds sections between the boundaries it's handed.
+    static IEnumerable<Run> Runs(float[] arcTable, float totalArc, List<Opening> openings)
+    {
+        var doors = new List<(float lo, float hi, float head, float sill, int index)>();
+        if (openings != null)
+            for (int i = 0; i < openings.Count; i++)
+            {
+                Opening o = openings[i];
+                float mid = ArcAt(arcTable, Mathf.Clamp01(o.t));
+                float lo = Mathf.Max(0f, mid - o.width * 0.5f);
+                float hi = Mathf.Min(totalArc, mid + o.width * 0.5f);
+                if (hi - lo > 0.05f)
+                    doors.Add((lo, hi, o.head, o.sill, i));
+            }
+        doors.Sort((x, y) => x.lo.CompareTo(y.lo));
+
+        float at = 0f;
+        foreach ((float lo, float hi, float head, float sill, int index) in doors)
+        {
+            if (lo < at)
+                continue;
+            if (lo - at > 0.05f)
+                yield return new Run { lo = at, hi = lo, head = 0f,
+                                       sill = float.NegativeInfinity, opening = -1 };
+            yield return new Run { lo = lo, hi = hi, head = head, sill = sill, opening = index };
+            at = hi;
+        }
+        if (totalArc - at > 0.05f || at == 0f)
+            yield return new Run { lo = at, hi = totalArc, head = 0f,
+                                   sill = float.NegativeInfinity, opening = -1 };
     }
 
     // Finishes a prepared spec (index, t-range, bottomY set): vertical
@@ -205,11 +433,23 @@ public class WallEdge : MonoBehaviour
         float[] arcTable)
     {
         spec.topY = float.IsNegativeInfinity(fixedTopY) ? spec.bottomY + height : fixedTopY;
+        if (BuildSpecFrame(ref spec, s, c, e, thickness, baseWallHeight, arcTable))
+            specs.Add(spec);
+    }
+
+    // The frame-and-mesh half of finishing a spec, once its t-range and
+    // FULL vertical span are already decided. Split out so WallStair can
+    // borrow the sweep: a stair is this same section machinery with tops
+    // that step instead of following one height, and it has no business
+    // knowing how a wall picks its topY. False = degenerate, skip it.
+    public static bool BuildSpecFrame(ref SectionSpec spec, Vector3 s, Vector3 c, Vector3 e,
+        float thickness, float baseWallHeight, float[] arcTable)
+    {
         if (spec.topY - spec.bottomY < 0.1f)
-            return;
+            return false;
         spec.arcLength = ArcAt(arcTable, spec.tEnd) - ArcAt(arcTable, spec.tStart);
         if (spec.arcLength < 0.03f)
-            return;
+            return false;
 
         float tMid = (spec.tStart + spec.tEnd) * 0.5f;
         Vector3 mid = Evaluate(s, c, e, tMid);
@@ -218,13 +458,15 @@ public class WallEdge : MonoBehaviour
         spec.position = new Vector3(mid.x, (spec.bottomY + spec.topY) * 0.5f, mid.z);
         spec.mesh = BuildSectionMesh(s, c, e, spec, arcTable, thickness, baseWallHeight,
             spec.position, spec.yaw);
-        specs.Add(spec);
+        return true;
     }
 
     // Lowest ground under the slice footprint (both faces sampled along
     // it), snapped down to the base step so neighbouring sections share
     // bases on gentle slopes and real drops read as uniform steps.
-    static float SampleSliceGround(Vector3 s, Vector3 c, Vector3 e,
+    // Public because a stair's wedge steps its ground exactly like a wall
+    // does (WallStair).
+    public static float SampleSliceGround(Vector3 s, Vector3 c, Vector3 e,
         float t0, float t1, float thickness, float baseStep)
     {
         Terrain terrain = Terrain.activeTerrain;

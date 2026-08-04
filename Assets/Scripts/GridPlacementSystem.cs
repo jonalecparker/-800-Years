@@ -44,6 +44,18 @@ public class GridPlacementSystem : MonoBehaviour
     // endpoint, so walls chain into networks. Hold Alt to place freely.
     public float endpointSnapRadius = 0.75f;
 
+    [Header("Stairs")]
+    // Fixed for now rather than scrolled: the wheel already carries four
+    // meanings and any new use has to join the arbitration, which isn't
+    // worth it to dial a width.
+    public float stairWidth = 1.2f;
+
+    [Header("Doors")]
+    // Fixed for the same reason a stair's width is: dialing them would
+    // need a fifth meaning for the scroll wheel.
+    public float doorWidth = 1.1f;
+    public float doorHead = 2.1f;
+
     [Header("Preview")]
     public Color previewColor = new Color(0.3f, 0.9f, 1f, 1f);
     public Color deletePreviewColor = new Color(1f, 0.3f, 0.25f, 1f);
@@ -67,7 +79,7 @@ public class GridPlacementSystem : MonoBehaviour
     // instead of the top riding the ground section by section.
     public bool lockTopHeight;
 
-    public enum ToolMode { Build, Delete, Offset, Room }
+    public enum ToolMode { Build, Delete, Offset, Room, Stair, Door }
     public ToolMode Mode { get; private set; } = ToolMode.Build;
 
     // The Room tool's two jobs, picked in the menu. Build chains walls
@@ -348,6 +360,65 @@ public class GridPlacementSystem : MonoBehaviour
     // Shape gestures adopt a snapped anchor's height like walls do.
     private float? shapeSnapHeight;
 
+    // ---- Stair tool ------------------------------------------------
+    // The stair tool has no gesture: point at a wall's side face and the
+    // ghost is already there, because the wall answers every question
+    // (where it starts, where it lands, how long it is, which curve).
+    private readonly List<WallEdge.SectionSpec> stairSpecs = new List<WallEdge.SectionSpec>();
+    private readonly List<Mesh> stairMeshes = new List<Mesh>();
+    // The wall under the cursor last frame — changing walls re-arms the
+    // camera's say over the climb direction.
+    private WallEdge stairHost;
+    // Which way the ghost climbs, and whether the player has taken that
+    // decision off the camera by pressing R. Without the latch, orbiting
+    // the camera would silently undo an R press.
+    private bool stairForward = true;
+    private bool stairHeld;
+    private (WallEdge host, int section, float t, bool forward, float side)? lastStairKey;
+    // Where the run came to rest, so the second sizing pass can read the
+    // wall top it actually lands on rather than the one under the cursor.
+    private (WallEdge edge, float t)? stairLanding;
+    // Not enough masonry to carry the climb: the ghost draws where it
+    // would go and runs red, and the HUD says how much more wall it wants.
+    private bool stairBlocked;
+    private float stairShortfall;
+    // The run is climbing TO a doorway's sill rather than to a wall top,
+    // so the cursor end is its top and the chain gets flipped.
+    private bool stairToDoor;
+
+    // Everything the commit needs, captured while the ghost is drawn.
+    private struct PendingStair
+    {
+        public List<WallStair.Span> spans;
+        public float bottomY;
+        public float topY;
+        public float runArc;
+        public float baseFrom;
+    }
+    private PendingStair? pendingStair;
+
+    // ---- Door tool -------------------------------------------------
+    // Same shape of gesture as the stair, for the same reason: the wall
+    // decides everything except where along it you want the hole.
+    private Mesh doorGhostMesh;
+    private WallEdge doorHost;
+    private float doorT;
+    private bool doorBlocked;
+    private string doorRefusal;
+    // Where the opening starts, and how far that is above the ground
+    // outside — a doorway serving a raised floor needs steps up to it.
+    private float doorSill;
+    private float doorStep;
+    // Masonry that must remain either side of an opening, so a doorway
+    // can't eat a wall's end and leave a node holding a sliver.
+    const float DoorJamb = 0.3f;
+    // Below this, a raised sill is a doorstep you step over, not a climb.
+    // Wall footings quantize DOWN to the base step and a room's floor
+    // quantizes UP, so nearly every doorway has half a step under it even
+    // on level ground — offering a flight of stairs for that would be
+    // noise. Three risers is the smallest thing worth building steps for.
+    const float DoorStepsNeeded = WallStair.TargetRise * 3f;
+
     const int CircleSegments = 8;
     const float MinCircleRadius = 1.5f;
     const float MinRectSide = 1f;
@@ -409,6 +480,13 @@ public class GridPlacementSystem : MonoBehaviour
             UpdateDelete(mouse, keyboard, ray, overUI);
         else if (Mode == ToolMode.Offset)
             UpdateOffset(mouse, keyboard, ray, overUI);
+        // Stairs have no gesture either — same reason as Designate below,
+        // an armed Circle or Rectangle has nothing to do with them.
+        else if (Mode == ToolMode.Stair)
+            UpdateStair(mouse, keyboard, ray, overUI);
+        // Nor does the door tool: point at a wall, the opening is there.
+        else if (Mode == ToolMode.Door)
+            UpdateDoor(mouse, ray, overUI);
         // Designating has no gesture, so it outranks the shape helpers —
         // an armed Circle or Rectangle has nothing to do with it.
         else if (Mode == ToolMode.Room && RoomTask == RoomAction.Designate)
@@ -430,6 +508,10 @@ public class GridPlacementSystem : MonoBehaviour
         UpdateAlignGuides();
         UpdateAngleGuide();
         UpdateNodeGhostVisuals();
+        // A view control, not a build modifier — hence no ModifierHints
+        // entry and no scroll-wheel claim. It walks only the committed
+        // subtree, so the ghosts above stay visible.
+        CutawayView.Tick(keyboard, splineParent);
     }
 
     // Both tools share the left mouse button, so switching abandons any
@@ -449,6 +531,8 @@ public class GridPlacementSystem : MonoBehaviour
         CancelShape();
         CancelRoomChain();
         CancelDelete();
+        CancelStair();
+        CancelDoor();
     }
 
     // What the keyboard means RIGHT NOW, for the HUD's modifier panel.
@@ -475,6 +559,41 @@ public class GridPlacementSystem : MonoBehaviour
             lines.Add("Ctrl + scroll — wall height");
             if (offsetSource != null)
                 lines.Add("Esc — release the source wall");
+        }
+        else if (Mode == ToolMode.Stair)
+        {
+            // No Ctrl+scroll: a stair's height is the wall it's against,
+            // and its length follows from that — neither is dialable, so
+            // neither is listed.
+            if (stairHost == null)
+                context = "Stair · point at a wall";
+            else if (stairBlocked)
+                context = $"Stair · needs {stairShortfall:0.0}m more wall";
+            else if (stairToDoor)
+                context = "Stair · up to the doorway";
+            else
+                context = "Stair";
+            lines.Add("Point at a wall's side — the stair fits it");
+            lines.Add("Point at a raised doorway — steps up to its sill");
+            if (stairHost != null)
+                lines.Add("R — climb the other way");
+            lines.Add("Click — place it");
+        }
+        else if (Mode == ToolMode.Door)
+        {
+            // Nothing is dialable here either: the wall gives the doorway
+            // its floor and its thickness, and width and head are fixed.
+            if (doorHost == null)
+                context = "Door · point at a wall";
+            else if (doorBlocked)
+                context = "Door · won't fit here";
+            else if (doorStep >= DoorStepsNeeded)
+                context = $"Door · sill {doorStep:0.0}m up, on the floor inside";
+            else
+                context = "Door";
+            lines.Add("Point at a wall's side — the doorway sits there");
+            lines.Add("Click — cut it through");
+            lines.Add("Delete tool, click a doorway's stone — fill it in");
         }
         else if (Mode == ToolMode.Room && RoomTask == RoomAction.Designate)
         {
@@ -642,9 +761,10 @@ public class GridPlacementSystem : MonoBehaviour
     // commit — the commit is a graph edit, so snapped ends join their
     // nodes, a far end on a wall face T-splits the host, and any wall the
     // drag crosses is auto-split into a shared 4-way node (posts preview
-    // gold at the crossing points). Holding Shift with both ends snapped
-    // opts into the tangent-tied connector (TryTangentControl) — the wall
-    // auto-curves to tie in flush at both hosts. An existing wall's top
+    // gold at the crossing points). Holding C with both ends snapped opts
+    // into the tangent-tied connector (TryTangentControl) — the wall
+    // auto-curves to tie in flush at both hosts; Shift means angle
+    // stepping here as it does everywhere. An existing wall's top
     // face is ground like any other: the gesture builds the storey above
     // it. R turns the single-click stub's orientation.
     void UpdateStraightBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
@@ -1287,7 +1407,8 @@ public class GridPlacementSystem : MonoBehaviour
             // way the wall tool does. Without this, only the wall tool saw
             // wall tops and a room could still only be inset onto a deck.
             WallEdgeSection section = hit.collider.GetComponent<WallEdgeSection>();
-            if (section != null && hit.normal.y > 0.7f && section.edge != null)
+            if (section != null && hit.normal.y > 0.7f && section.edge != null
+                && !CutawayView.IsCutSurface(hit.point))
             {
                 deckY = section.topY;
                 hoverRideHost = section.edge;
@@ -2194,6 +2315,529 @@ public class GridPlacementSystem : MonoBehaviour
             alignLines.Add((poly[i], poly[(i + 1) % poly.Count]));
     }
 
+    // ------------------------------------------------------------------
+    // Stairs
+    // ------------------------------------------------------------------
+
+    // The stair tool has NO GESTURE: point at a wall's side face and the
+    // ghost is already there. The wall answers every question — where the
+    // run starts (the hovered section's bottom), where it lands (that same
+    // section's top), which face (the cursor's side), which curve (the
+    // host's own sub-curve, offset), and which storey (the host's baseY).
+    // Length is DERIVED from the climb (WallStair.RunFor), which is why
+    // this tool has no refusal: a stair can't be too steep or too shallow
+    // when the player never chooses its length. R flips the climb, and
+    // latches the decision away from the camera. See Docs/Stairs.md.
+    void UpdateStair(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
+    {
+        bool flipPressed = keyboard != null && keyboard.rKey.wasPressedThisFrame;
+
+        if (overUI || !TryGetWallSideHit(ray, out WallEdgeSection sec, out Vector3 hit))
+        {
+            // Off a wall the camera gets its say back — the latch belongs
+            // to the stair you were looking at, not to the tool.
+            stairHost = null;
+            stairHeld = false;
+            CancelStair();
+            return;
+        }
+
+        // A different wall is a different stair: re-arm the camera.
+        if (sec.edge != stairHost)
+        {
+            stairHost = sec.edge;
+            stairHeld = false;
+        }
+        if (flipPressed)
+        {
+            stairForward = !stairForward;
+            stairHeld = true;
+        }
+
+        BuildStairPreview(sec, hit);
+        ShowStairGhosts();
+
+        if (mouse.leftButton.wasPressedThisFrame && pendingStair.HasValue)
+            CommitStair();
+    }
+
+    // The wall a stair or a doorway would go on: the first thing under the
+    // cursor, and only if it's a wall section hit on its SIDE. A top-face
+    // hit is the ride gesture's territory (a stair crosses a wall-walk, it
+    // doesn't run along it; a door through a wall's top is nothing), and
+    // first-hit-only keeps the pick honest — you get the wall you can see,
+    // never one behind it.
+    bool TryGetWallSideHit(Ray ray, out WallEdgeSection section, out Vector3 point)
+    {
+        section = null;
+        point = default;
+        RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (RaycastHit hit in hits)
+        {
+            if (hit.collider.isTrigger)
+                continue;
+            section = hit.collider.GetComponent<WallEdgeSection>();
+            bool topFace = hit.normal.y > 0.7f && !CutawayView.IsCutSurface(hit.point);
+            if (section == null || section.edge == null || topFace)
+            {
+                section = null;
+                return false;
+            }
+            point = new Vector3(hit.point.x, 0f, hit.point.z);
+            return true;
+        }
+        return false;
+    }
+
+    // Lays the run along the masonry and rebuilds the tread meshes when
+    // anything about it actually changed. The cursor marks the stair's
+    // BOTTOM and it climbs away, THROUGH the wall's nodes: a circle is
+    // eight edges and a wall with tees is several, so a run confined to
+    // one edge pins itself to whichever node it started from and the only
+    // thing left free to move is its length. Same answer the wall tool's
+    // ride gives, for the same reason.
+    void BuildStairPreview(WallEdgeSection sec, Vector3 hit)
+    {
+        WallEdge host = sec.edge;
+        float bottomY = MasonryFloorAt(sec);
+        float tCursor = host.NearestT(hit, out _);
+
+        // Pointing at a DOORWAY's own masonry asks for steps up TO it: the
+        // run climbs to that doorway's sill instead of the wall top, and
+        // arrives there rather than setting off from there. A raised sill
+        // is the only thing that needs this — a doorway sitting on the
+        // ground is already reachable.
+        stairToDoor = TryDoorTarget(sec, bottomY, out float doorSillY, out float doorCentreArc);
+        float target = stairToDoor ? doorSillY : sec.topY;
+
+        bool forward = stairHeld ? stairForward : CameraClimbForward(host, tCursor);
+        // Keep the unlatched direction in sync, so the first R press flips
+        // away from what's actually on screen rather than from a stale bool.
+        stairForward = forward;
+
+        // Which side of the CLIMB the cursor is on. SideOf answers for the
+        // host's own A→B, so it flips when the run climbs the other way.
+        float sideOfTravel = forward ? host.SideOf(hit) : -host.SideOf(hit);
+        // A run arriving at a doorway starts its walk at the doorway's far
+        // EDGE, not at the cursor: the landing is the platform outside the
+        // door, and one measured from the door's centre would leave half
+        // the opening hanging over the drop.
+        if (stairToDoor)
+        {
+            float[] tbl = WallEdge.BuildArcTable(host.A, host.control, host.B);
+            float span = tbl[tbl.Length - 1];
+            float half = doorWidth * 0.5f;
+            tCursor = WallEdge.TAtArc(tbl, Mathf.Clamp(
+                forward ? doorCentreArc - half : doorCentreArc + half, 0f, span));
+        }
+        var key = (host, sec.index, Mathf.Round(tCursor * 500f) / 500f, forward, sideOfTravel);
+        if (lastStairKey.HasValue && lastStairKey.Value.Equals(key))
+            return;
+        lastStairKey = key;
+
+        // Sizing settles two things at once, and each can move the other.
+        //  - the LANDING: the run is sized off the wall under the cursor,
+        //    but it must finish flush on the wall where it actually ends,
+        //    which may be a step higher or lower.
+        //  - the MITER: welding the corners shortens an inside run and
+        //    lengthens an outside one (0.9m at an octagon's corner), so
+        //    the walked distance is not the finished distance. Left
+        //    uncorrected the pitch drifts ±20%, which would quietly break
+        //    the reason this tool needs no refusal — that the length is
+        //    derived from the climb and so can't be wrong.
+        // Level walls with no corners settle on the first pass.
+        float topY = target;
+        List<WallStair.Span> spans = null;
+        float climb = 0f, reach = 0f, got = 0f, scale = 1f, covered = 0f;
+        for (int pass = 0; pass < 4; pass++)
+        {
+            climb = WallStair.RunFor(topY - bottomY);
+            reach = climb + WallStair.LandingRun;
+            spans = StairSpansFrom(host, tCursor, forward, sideOfTravel,
+                reach * scale, climb * scale, out covered);
+            if (spans.Count == 0)
+                break;
+            got = spans[spans.Count - 1].arcEnd;
+
+            // A doorway's sill is a fixed target — there is no wall top to
+            // finish flush with, so only the reach is left to settle.
+            float landed = stairToDoor ? float.NegativeInfinity : TopAtLanding();
+            bool topSettled = float.IsNegativeInfinity(landed) || Mathf.Abs(landed - topY) < 0.01f;
+            bool runSettled = Mathf.Abs(got - reach) < 0.05f;
+            // Out of wall: no amount of scaling conjures more, so stop
+            // rather than spin.
+            if (covered < reach * scale - 0.05f)
+                break;
+            if (topSettled && runSettled)
+                break;
+            if (!topSettled)
+                topY = landed;
+            if (!runSettled && got > 0.01f)
+                scale *= reach / got;
+        }
+
+        ClearStairMeshes();
+        stairSpecs.Clear();
+        // Arriving at a doorway means the cursor end is the TOP, so the
+        // chain is flipped: the climb ends up first and the landing last,
+        // which is the order BuildStepSpecs already expects. The landing is
+        // then the platform at the door, so it keeps its full length and
+        // any shortfall falls on the climb — which is flagged anyway.
+        if (stairToDoor && spans != null && spans.Count > 0)
+            spans = WallStair.ReverseSpans(spans);
+        // The climb is required; the landing takes what's left over. So a
+        // wall long enough to climb is never refused for being too short
+        // to stand on at the top — it just gives a shorter landing.
+        float runArc = stairToDoor
+            ? Mathf.Min(climb, Mathf.Max(0f, got - WallStair.LandingRun))
+            : Mathf.Min(climb, got);
+        // Short of masonry, the ghost still draws where it would go and
+        // runs red — a refusal is visible in place, never a vanishing act.
+        // The question is asked of the FINISHED run, after the weld.
+        stairBlocked = spans == null || spans.Count == 0 || got < climb - 0.05f;
+        stairShortfall = Mathf.Max(0f, climb - got);
+        if (spans != null && spans.Count > 0)
+        {
+            stairSpecs.AddRange(WallStair.BuildStepSpecs(spans, bottomY, topY,
+                runArc, host.baseY, stairWidth, baseStepSize, BaseHeight));
+            foreach (WallEdge.SectionSpec spec in stairSpecs)
+                stairMeshes.Add(spec.mesh);
+        }
+        pendingStair = !stairBlocked && stairSpecs.Count > 0
+            ? new PendingStair { spans = spans, bottomY = bottomY, topY = topY,
+                                 runArc = runArc, baseFrom = host.baseY }
+            : null;
+    }
+
+    // The doorway this cursor is asking for steps up to: the section under
+    // the cursor belongs to an opening, and that opening's sill stands
+    // clear of the ground the wall is founded on. A doorway sitting ON the
+    // ground needs nothing, and says so by refusing to be a target.
+    bool TryDoorTarget(WallEdgeSection sec, float groundY, out float sillY, out float centreArc)
+    {
+        sillY = 0f;
+        centreArc = 0f;
+        if (sec.openingIndex < 0 || sec.edge == null
+            || sec.openingIndex >= sec.edge.openings.Count)
+            return false;
+        WallEdge.Opening o = sec.edge.openings[sec.openingIndex];
+        if (o.sill - groundY < DoorStepsNeeded)
+            return false;
+        sillY = o.sill;
+        float[] table = WallEdge.BuildArcTable(sec.edge.A, sec.edge.control, sec.edge.B);
+        centreArc = WallEdge.ArcAt(table, Mathf.Clamp01(o.t));
+        return true;
+    }
+
+    // Walks the masonry from (host, t) in the climb direction, taking
+    // `run` metres of arc and offsetting each piece onto the cursor's
+    // face. Every piece is the host's OWN sub-curve, so a stair around a
+    // circular room traces it. `covered` reports how much wall was
+    // actually there.
+    List<WallStair.Span> StairSpansFrom(WallEdge host, float tCursor, bool forward,
+        float sideOfTravel, float run, float markArc, out float covered)
+    {
+        var curves = new List<(Vector3 s, Vector3 c, Vector3 e)>();
+        var visited = new HashSet<WallEdge>();
+        WallEdge cur = host;
+        bool towardB = forward;
+        float from = tCursor;
+        float left = run;
+        covered = 0f;
+        stairLanding = null;
+
+        while (cur != null && left > 0.01f && visited.Add(cur) && curves.Count < 64)
+        {
+            float[] table = WallEdge.BuildArcTable(cur.A, cur.control, cur.B);
+            float total = table[table.Length - 1];
+            float atFrom = WallEdge.ArcAt(table, from);
+            float avail = towardB ? total - atFrom : atFrom;
+            float take = Mathf.Min(avail, left);
+            if (take > 0.01f)
+            {
+                // Where the CLIMB ends, which is the wall the run must
+                // finish flush with. The walk carries on past it for the
+                // landing, and the landing may well cross onto a wall at a
+                // different height — sizing the stair off that one would
+                // aim the treads at a floor the player isn't going to.
+                if (!stairLanding.HasValue && covered + take >= markArc - 0.01f)
+                {
+                    float atMark = towardB ? atFrom + (markArc - covered)
+                                           : atFrom - (markArc - covered);
+                    stairLanding = (cur, WallEdge.TAtArc(table, atMark));
+                }
+                float tTo = WallEdge.TAtArc(table, towardB ? atFrom + take : atFrom - take);
+                // Directed bottom→top; SubCurve handles a descending range.
+                WallGraph.SubCurve(cur.A, cur.control, cur.B, from, tTo,
+                    out Vector3 s, out Vector3 c, out Vector3 e);
+                // sideOfTravel is left/right of the CLIMB, not of any one
+                // edge's A→B, and OffsetCurve's +d is left-of-travel too.
+                // Every span travels bottom→top, so one signed distance
+                // holds the whole chain on a single face — an edge whose
+                // own orientation happens to be reversed can't flip the
+                // stair through the wall.
+                float signed = sideOfTravel * (cur.thickness + stairWidth) * 0.5f;
+                WallEdge.OffsetCurve(new Vector3(s.x, 0f, s.z), new Vector3(c.x, 0f, c.z),
+                    new Vector3(e.x, 0f, e.z), signed,
+                    out Vector3 s2, out Vector3 c2, out Vector3 e2);
+                curves.Add((s2, c2, e2));
+                covered += take;
+                left -= take;
+            }
+            if (left <= 0.01f)
+                break;
+            // Straightest continuation on the same storey — a tee picks
+            // the run that carries on, not the branch (WallGraph doctrine,
+            // shared with the ride).
+            WallNode node = towardB ? cur.nodeB : cur.nodeA;
+            WallEdge next = StraightestContinuation(node, cur, towardB);
+            if (next == null)
+                break;
+            towardB = next.nodeA == node;
+            from = towardB ? 0f : 1f;
+            cur = next;
+        }
+        // Meet at the corners before the arc bookkeeping is taken, so the
+        // treads distribute over the run the stair actually has.
+        WallStair.WeldOffsetJoints(curves, (host.thickness + stairWidth) * 0.5f);
+        return WallStair.ChainSpans(curves);
+    }
+
+    // The wall top where the run just landed — pass two of the sizing.
+    // -Infinity when the landing sits on nothing recognisable.
+    float TopAtLanding()
+    {
+        if (!stairLanding.HasValue)
+            return float.NegativeInfinity;
+        (WallEdge edge, float t) = stairLanding.Value;
+        if (edge == null)
+            return float.NegativeInfinity;
+        foreach (WallEdgeSection s in edge.SectionsInOrder())
+            if (t >= s.tStart - 0.0001f && t <= s.tEnd + 0.0001f)
+                return s.topY;
+        return float.NegativeInfinity;
+    }
+
+    // Which way the stair climbs when the player hasn't said: away from
+    // the camera along the wall, so it runs up and into the view rather
+    // than down out of it.
+    bool CameraClimbForward(WallEdge host, float t)
+    {
+        Vector3 tan = WallEdge.Tangent(host.A, host.control, host.B, t);
+        tan.y = 0f;
+        Vector3 fwd = cam.transform.forward;
+        fwd.y = 0f;
+        if (tan.sqrMagnitude < 0.0001f || fwd.sqrMagnitude < 0.0001f)
+            return true;
+        return Vector3.Dot(tan.normalized, fwd.normalized) >= 0f;
+    }
+
+    void ShowStairGhosts()
+    {
+        Color tint = stairBlocked ? deletePreviewColor : previewColor;
+        for (int i = 0; i < stairSpecs.Count; i++)
+        {
+            WallEdge.SectionSpec spec = stairSpecs[i];
+            GameObject ghost = GetPooled(ghostPool, i, previewColor, "PlacementPreview");
+            ghost.SetActive(true);
+            SetGhostMesh(ghost, spec.mesh);
+            SetGhostTint(ghost, tint);
+            ghost.transform.SetPositionAndRotation(spec.position, Quaternion.Euler(0f, spec.yaw, 0f));
+            ghost.transform.localScale = Vector3.one;
+        }
+        for (int i = stairSpecs.Count; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    void CommitStair()
+    {
+        PendingStair p = pendingStair.Value;
+        WallStair stair = WallStair.Create(splineParent, p.spans, p.bottomY, p.topY,
+            p.runArc, p.baseFrom, stairWidth, BaseHeight, baseStepSize, wallMaterial);
+        float landing = stair.TotalArc - stair.runArc;
+        BuildLog.Add($"Stair — {stair.StepCount} steps, {stair.Rise:0.0}m rise,"
+            + $" {landing:0.0}m landing.");
+        // A stair that arrives at a roofed deck opens its own way through.
+        WallRoom.NotifyStairBuilt(stair);
+        CancelStair();
+    }
+
+    void CancelStair()
+    {
+        ClearStairMeshes();
+        stairSpecs.Clear();
+        pendingStair = null;
+        lastStairKey = null;
+        stairLanding = null;
+        stairBlocked = false;
+        stairShortfall = 0f;
+        stairToDoor = false;
+        HideGhosts();
+    }
+
+    void ClearStairMeshes()
+    {
+        foreach (Mesh mesh in stairMeshes)
+            Destroy(mesh);
+        stairMeshes.Clear();
+    }
+
+    // ------------------------------------------------------------------
+    // Doors
+    // ------------------------------------------------------------------
+
+    // Like the stair tool, the door tool has NO GESTURE: point at a wall's
+    // side face and the opening is already there. The wall answers
+    // everything but where along it you want the hole — which face you
+    // approach from doesn't matter, since a doorway goes all the way
+    // through.
+    void UpdateDoor(Mouse mouse, Ray ray, bool overUI)
+    {
+        if (overUI || !TryGetWallSideHit(ray, out WallEdgeSection sec, out Vector3 hit))
+        {
+            CancelDoor();
+            return;
+        }
+
+        doorHost = sec.edge;
+        doorT = doorHost.NearestT(hit, out _);
+        // The doorway opens from the floor it serves, not from the ground
+        // it happens to stand on. Without this a room's slab stands across
+        // the opening — the floor is one level plane at the room's highest
+        // interior ground, so on a slope it is metres above the downhill
+        // wall's footing.
+        float ground = MasonryFloorAt(sec);
+        doorSill = Mathf.Max(ground, WallRoom.FloorServing(doorHost));
+        doorStep = doorSill - ground;
+        doorRefusal = DoorRefusal(doorHost, doorT, sec);
+        doorBlocked = doorRefusal != null;
+        ShowDoorGhost(sec);
+
+        if (mouse.leftButton.wasPressedThisFrame)
+        {
+            if (doorBlocked)
+            {
+                BuildLog.Add(doorRefusal);
+                return;
+            }
+            doorHost.openings.Add(new WallEdge.Opening
+            {
+                t = doorT,
+                width = doorWidth,
+                head = doorHead,
+                sill = doorSill,
+            });
+            doorHost.Rebuild();
+            BuildLog.Add($"Doorway — {doorWidth:0.0}m wide, {doorHead:0.0}m head."
+                + (doorStep >= DoorStepsNeeded
+                    ? $" Its sill is {doorStep:0.0}m above the ground outside —"
+                        + " point the stair tool at the stone under it to build up."
+                    : ""));
+            // The rebuild destroyed the section the ghost was measured
+            // against, so the next frame re-reads the wall from scratch.
+            CancelDoor();
+        }
+    }
+
+    // The ground this masonry stands on at the cursor. A LINTEL's own
+    // bottom is a doorway's head, metres up — a stair anchored there would
+    // begin in mid-air, and a door ghost would float. Both ask the nearest
+    // solid section on the same wall instead.
+    static float MasonryFloorAt(WallEdgeSection sec)
+    {
+        if (sec.openingIndex < 0 || sec.edge == null)
+            return sec.bottomY;
+        float mid = (sec.tStart + sec.tEnd) * 0.5f;
+        float best = sec.bottomY;
+        float bestD = float.MaxValue;
+        foreach (WallEdgeSection s in sec.edge.SectionsInOrder())
+        {
+            if (s.openingIndex >= 0)
+                continue;
+            float d = Mathf.Abs((s.tStart + s.tEnd) * 0.5f - mid);
+            if (d < bestD)
+            {
+                bestD = d;
+                best = s.bottomY;
+            }
+        }
+        return best;
+    }
+
+    // Why this doorway can't go here, or null. Stated rather than silently
+    // refused — same rule as the stair's shortfall.
+    string DoorRefusal(WallEdge host, float t, WallEdgeSection sec)
+    {
+        float[] table = WallEdge.BuildArcTable(host.A, host.control, host.B);
+        float total = table[table.Length - 1];
+        float mid = WallEdge.ArcAt(table, t);
+        // A doorway whose sill sits so high the wall has no head left over
+        // it isn't a doorway. Say which floor did it.
+        if (sec.topY - doorSill < 0.6f)
+            return $"The floor inside stands at {doorSill:0.0}m, leaving no wall"
+                + " above it for a doorway.";
+        if (total < doorWidth + DoorJamb * 2f)
+            return $"Wall too short for a doorway — it needs {doorWidth + DoorJamb * 2f:0.0}m.";
+        if (mid - doorWidth * 0.5f < DoorJamb || mid + doorWidth * 0.5f > total - DoorJamb)
+            return $"Too close to the wall's end — leave {DoorJamb:0.0}m of jamb.";
+        foreach (WallEdge.Opening o in host.openings)
+        {
+            float other = WallEdge.ArcAt(table, o.t);
+            if (Mathf.Abs(other - mid) < (o.width + doorWidth) * 0.5f + DoorJamb)
+                return "That would run into the doorway already there.";
+        }
+        return null;
+    }
+
+    // A box standing in the wall where the masonry would go: the opening
+    // is a subtraction, so the honest ghost is the volume being removed.
+    void ShowDoorGhost(WallEdgeSection sec)
+    {
+        WallEdge host = doorHost;
+        Vector3 p = WallEdge.Evaluate(host.A, host.control, host.B, doorT);
+        Vector3 dir = WallEdge.Tangent(host.A, host.control, host.B, doorT).normalized;
+        float floor = Mathf.Max(doorSill, host.FloorY);
+        float head = Mathf.Max(0.1f, Mathf.Min(doorHead, sec.topY - floor));
+
+        if (doorGhostMesh == null)
+            doorGhostMesh = BuildBoxMesh();
+        GameObject ghost = GetPooled(ghostPool, 0, previewColor, "PlacementPreview");
+        ghost.SetActive(true);
+        SetGhostMesh(ghost, doorGhostMesh);
+        SetGhostTint(ghost, doorBlocked ? deletePreviewColor : previewColor);
+        ghost.transform.SetPositionAndRotation(
+            new Vector3(p.x, floor + head * 0.5f, p.z),
+            Quaternion.Euler(0f, Mathf.Atan2(-dir.z, dir.x) * Mathf.Rad2Deg, 0f));
+        // A shade thicker than the wall so the ghost reads as passing all
+        // the way through rather than sitting inside the masonry.
+        ghost.transform.localScale = new Vector3(doorWidth, head, host.thickness + 0.06f);
+        for (int i = 1; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    static Mesh BuildBoxMesh()
+    {
+        GameObject probe = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        Mesh mesh = Object.Instantiate(probe.GetComponent<MeshFilter>().sharedMesh);
+        mesh.name = "DoorGhost";
+        // Deactivated before it is destroyed: Destroy is deferred, and a
+        // stray cube sitting at the world origin for a frame is exactly
+        // the sort of thing that reads as a bug.
+        probe.SetActive(false);
+        Destroy(probe);
+        return mesh;
+    }
+
+    void CancelDoor()
+    {
+        doorHost = null;
+        doorBlocked = false;
+        doorRefusal = null;
+        doorStep = 0f;
+        HideGhosts();
+    }
+
     // The chain's angle reference at its growing tip: the previous
     // segment's run (pointing back along it, so 180 reads as a straight
     // continuation), or the snapped start's masonry for the first
@@ -2415,7 +3059,11 @@ public class GridPlacementSystem : MonoBehaviour
                 ? slabRoom.roofY : slabRoom.floorY;
             hoverBaseY = deckY;
         }
-        else if (hitSection != null && first.normal.y > 0.7f)
+        // A cut-open wall's cross-section is not a wall top: it has the
+        // same upward normal, but stacking on it would build at the wall's
+        // real top, metres above the surface being pointed at.
+        else if (hitSection != null && first.normal.y > 0.7f
+                 && !CutawayView.IsCutSurface(first.point))
         {
             deckY = hitSection.topY;
             hoverBaseY = deckY;
@@ -3487,9 +4135,42 @@ public class GridPlacementSystem : MonoBehaviour
             if (!overUI && TryGetSectionUnderCursor(ray, out WallEdgeSection hovered))
             {
                 doomedSections.Add(hovered.transform);
-                deleteRanges.Add((hovered.edge, hovered.index, hovered.index));
+                // A LINTEL is the masonry over a doorway, and deleting it
+                // means filling the doorway in — the opening goes and the
+                // wall closes. Deleting it as a section would leave a
+                // hole in the wall exactly where a hole already is, which
+                // is the one thing the click can't have meant.
+                if (hovered.openingIndex >= 0 && hovered.edge != null)
+                {
+                    if (mouse.leftButton.wasPressedThisFrame)
+                    {
+                        WallEdge host = hovered.edge;
+                        host.openings.RemoveAt(hovered.openingIndex);
+                        host.Rebuild();
+                        BuildLog.Add("Doorway filled in.");
+                        doomedSections.Clear();
+                    }
+                }
+                else
+                {
+                    deleteRanges.Add((hovered.edge, hovered.index, hovered.index));
+                    if (mouse.leftButton.wasPressedThisFrame)
+                        deleteAnchor = hovered;
+                }
+            }
+            // A stair dies whole — no per-tread surgery. Sections exist
+            // because a wall is long and a breach is local; a stair is one
+            // object, and its steps aren't WallEdgeSections at all.
+            else if (!overUI && TryGetStairUnderCursor(ray, out WallStair hoveredStair))
+            {
+                foreach (Transform child in hoveredStair.transform)
+                    doomedSections.Add(child);
                 if (mouse.leftButton.wasPressedThisFrame)
-                    deleteAnchor = hovered;
+                {
+                    Destroy(hoveredStair.gameObject);
+                    BuildLog.Add("Stair removed.");
+                    doomedSections.Clear();
+                }
             }
             else if (!overUI && TryGetRoomUnderCursor(ray, out WallRoom hoveredRoom))
             {
@@ -3731,6 +4412,21 @@ public class GridPlacementSystem : MonoBehaviour
                 continue;
             room = hit.collider.GetComponentInParent<WallRoom>();
             return room != null;
+        }
+        return false;
+    }
+
+    bool TryGetStairUnderCursor(Ray ray, out WallStair stair)
+    {
+        stair = null;
+        RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (RaycastHit hit in hits)
+        {
+            if (hit.collider.isTrigger)
+                continue;
+            stair = hit.collider.GetComponentInParent<WallStair>();
+            return stair != null;
         }
         return false;
     }
@@ -4001,13 +4697,46 @@ public class GridPlacementSystem : MonoBehaviour
         return line;
     }
 
+    static GUIStyle BuildGuideLabelStyle()
+    {
+        return new GUIStyle(GUI.skin.label)
+        {
+            alignment = TextAnchor.MiddleCenter,
+            fontSize = 14,
+            fontStyle = FontStyle.Bold,
+        };
+    }
+
     // Distance labels ride the guide midpoints. IMGUI because it renders
     // identically under any pipeline — this is a measurement readout, not
     // scene art.
     void OnGUI()
     {
-        if (cam == null || (activeGuides.Count == 0 && dimGuides.Count == 0
-            && !activeAngle.HasValue && !marqueeStart.HasValue))
+        if (cam == null)
+            return;
+
+        // The cutaway carries its own keys in its readout — it's a view
+        // control, so it stays out of the modifier panel (which reports
+        // what the tool in hand reads) and shows only while it's cutting.
+        string cutaway = CutawayView.Readout();
+        if (cutaway != null)
+        {
+            if (guideLabelStyle == null)
+                guideLabelStyle = BuildGuideLabelStyle();
+            // Centred at the top: the BuildLog owns the left margin, and a
+            // view control that covers the log is a worse trade than the
+            // one it was solving.
+            var boxed = new GUIStyle(guideLabelStyle) { alignment = TextAnchor.MiddleCenter };
+            var rect = new Rect((Screen.width - 460f) * 0.5f, 12f, 460f, 22f);
+            GUI.color = new Color(0f, 0f, 0f, 0.75f);
+            GUI.Label(new Rect(rect.x + 1f, rect.y + 1f, rect.width, rect.height), cutaway, boxed);
+            GUI.color = guideColor;
+            GUI.Label(rect, cutaway, boxed);
+            GUI.color = Color.white;
+        }
+
+        if (activeGuides.Count == 0 && dimGuides.Count == 0
+            && !activeAngle.HasValue && !marqueeStart.HasValue)
             return;
 
         // The delete marquee: a translucent red band in screen space.
@@ -4030,14 +4759,7 @@ public class GridPlacementSystem : MonoBehaviour
         }
 
         if (guideLabelStyle == null)
-        {
-            guideLabelStyle = new GUIStyle(GUI.skin.label)
-            {
-                alignment = TextAnchor.MiddleCenter,
-                fontSize = 14,
-                fontStyle = FontStyle.Bold,
-            };
-        }
+            guideLabelStyle = BuildGuideLabelStyle();
 
         foreach ((Vector3 from, Vector3 to, float distance) guide in activeGuides)
         {
