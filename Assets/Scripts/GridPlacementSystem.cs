@@ -264,6 +264,9 @@ public class GridPlacementSystem : MonoBehaviour
     private float offsetSide = 1f;
     private (Vector3 s, Vector3 c, Vector3 e, float height, float topY)? lastOffsetKey;
     private Camera cam;
+    // Latched so the walk-mode stand-down runs on the frame it starts and
+    // not every frame after it.
+    private bool stoodDown;
     private Vector3? guideCenter;
     private float guideBearing;
     private readonly List<(Vector3 from, Vector3 to, float distance)> activeGuides = new List<(Vector3, Vector3, float)>();
@@ -447,6 +450,22 @@ public class GridPlacementSystem : MonoBehaviour
         if (piecePrefab == null || cam == null)
             return;
 
+        // Walking is not building, so the tool stands DOWN rather than
+        // merely stopping: a frozen Update would leave a half-drawn
+        // gesture live, a ghost standing in the air, and the cutaway
+        // still slicing — and a sliced wall's collider is sliced with it,
+        // so a cut castle is one you walk straight through.
+        if (WalkMode.Active)
+        {
+            if (!stoodDown)
+            {
+                StandDown();
+                stoodDown = true;
+            }
+            return;
+        }
+        stoodDown = false;
+
         var mouse = Mouse.current;
         var keyboard = Keyboard.current;
         if (mouse == null)
@@ -533,6 +552,44 @@ public class GridPlacementSystem : MonoBehaviour
         CancelDelete();
         CancelStair();
         CancelDoor();
+    }
+
+    // Everything the tool has on screen or half-finished, put away — run
+    // once when walk mode takes the world. Same cancels SetMode makes,
+    // plus the per-frame overlay state, which is cleared through the
+    // normal update paths so the pooled lines and ghosts hide themselves
+    // exactly the way an empty frame would hide them.
+    void StandDown()
+    {
+        CancelCurve();
+        CancelShape();
+        CancelRoomChain();
+        CancelDelete();
+        CancelStair();
+        CancelDoor();
+        HideGhosts();
+        ClearPreviewMeshes();
+
+        guideCenter = null;
+        activeAngle = null;
+        dimGuides.Clear();
+        alignLines.Clear();
+        pendingNodeGhosts.Clear();
+        snapTint = false;
+        hoverSnap = null;
+        hoverSnapYaw = null;
+        hoverSnapHeight = null;
+        hoverBaseY = null;
+        hoverSnapBase = null;
+        heightOverride = false;
+        ClaimingScrollWheel = false;
+
+        UpdateDistanceGuides();
+        UpdateAlignGuides();
+        UpdateAngleGuide();
+        UpdateNodeGhostVisuals();
+
+        CutawayView.Clear(splineParent);
     }
 
     // What the keyboard means RIGHT NOW, for the HUD's modifier panel.
@@ -4712,7 +4769,9 @@ public class GridPlacementSystem : MonoBehaviour
     // scene art.
     void OnGUI()
     {
-        if (cam == null)
+        // Walk mode draws its own line and nothing else — no guides, no
+        // marquee, and no cutaway readout, because the walk cleared it.
+        if (cam == null || WalkMode.Active)
             return;
 
         // The cutaway carries its own keys in its readout — it's a view

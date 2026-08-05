@@ -30,13 +30,30 @@ public class FreeFlyCamera : MonoBehaviour
 
     void Start()
     {
+        SyncOrientation();
+    }
+
+    // Re-reads yaw and pitch from the transform. Anything that turns this
+    // camera from outside has to call it, or the next look-drag snaps back
+    // to the angles these fields still remember — which is exactly what
+    // WalkMode does when it hands the view back.
+    //
+    // eulerAngles is 0..360, so a camera pitched down reads as 340 rather
+    // than −20 and the clamp below would slam it to 89.
+    public void SyncOrientation()
+    {
         Vector3 angles = transform.eulerAngles;
         yaw = angles.y;
-        pitch = angles.x;
+        pitch = angles.x > 180f ? angles.x - 360f : angles.x;
     }
 
     void Update()
     {
+        // Walking is not flying. The mode owns the camera outright while
+        // it's on, including the scroll wheel.
+        if (WalkMode.Active)
+            return;
+
         var mouse = Mouse.current;
         var keyboard = Keyboard.current;
         if (mouse == null || keyboard == null)

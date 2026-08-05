@@ -49,6 +49,17 @@ Briefs: `Docs/Stairs.md` and `Docs/Doors.md` hold the *why*; they move in here o
 - **The stair's length is DERIVED from the rise, so there is no pitch refusal** — don't add one back; it would police a freedom that was never granted. The only refusal is "not enough wall". Stair width and door width/head are fixed for the same reason: dialing them needs a fifth scroll-wheel meaning, which must join `ClaimingScrollWheel`.
 - **Wells and sills are written at the two moments they can become true, never re-derived** (`NotifyStairBuilt`/`TryBuildRoof`, `FloorServing`/`RaiseSills`). This is the `FindCrossings` pattern — a geometric question asked at commit whose *answer is stored* — not the forbidden spatial "what is under me". Sill raising is one-way on purpose.
 
+## Build mode and walk mode (2026-08-05)
+
+`WalkMode` (on `Main Camera`) puts you on your own feet inside what you drew. `Tab` toggles. It exists to *judge* the builder, which is the only reason any of the above is finished.
+
+- **`WalkMode.Active` is a static flag every per-frame system reads** — `FreeFlyCamera`, `GridPlacementSystem` and `BuildMenu` stand DOWN on it rather than being enable/disabled. Each holds state a frozen `Update` would strand: a half-drawn gesture, a ghost left in the air, a cutaway still slicing. **Any new system that ticks every frame has to decide, in the same commit, whether it stands down** — and standing down is deliberate work, not an absence of it (`GridPlacementSystem.StandDown`).
+- **The stand-down MUST clear the cutaway** (`CutawayView.Clear`). The collider rides the slice — that's the feature in build mode and a castle you walk straight through in walk mode.
+- **The walker IS the camera**: a runtime `CharacterController` with its capsule hung *below* the lens (`center.y = bodyHeight/2 − eyeHeight`). Eye height is therefore baked into `center`, so changing one means changing both. Added at runtime on purpose — build mode wants no capsule in the world at all.
+- **Walk mode carries its own readout and stays out of `ModifierHints`** — same precedent as the cutaway: that panel reports what the *tool in hand* reads, and this is a mode switch.
+- **Escape belongs to the Unity editor — never take a second meaning for it.** It drops the Game view's focus, and an unfocused Game view has *no* cursor state applied to it, neither lock nor hide. Binding it to "exit walk mode" put you back in with a loose pointer every time.
+- **Do not try to fix mouse-look over Remote Desktop.** `Mouse.delta` returns zero against a screen edge and `CursorLockMode.Locked` pins only the *reported* position while the physical cursor roams ([Unity issue tracker](https://issuetracker.unity3d.com/issues/mouse-dot-delta-returns-zero-when-moving-the-cursor-against-the-screen-edge-when-using-a-remote-desktop-connection)). Four fixes were tried and reverted — re-asserting the lock (a no-op unless the state *changes*), warping plus `Mouse.delta` (double-counts), per-frame drift detection (misses a slow creep), and manual centring off position (systematic round-trip error, spins the camera). The implementation is deliberately the ordinary one.
+
 ## Elevated ground (proto-storeys)
 
 - Room slabs are **build surfaces**: `WallEdge.baseY` (default −∞) raises a section's bottom, and slab hits are detected by collider name (`"RoomRoof"` → `roofY`, else `floorY`). Any new raycast that can hit a slab must decide deliberately whether it's ground.
@@ -79,6 +90,7 @@ Briefs: `Docs/Stairs.md` and `Docs/Doors.md` hold the *why*; they move in here o
 ## Tooling gotchas
 
 - `manage_texture`'s `set_import_settings` MCP action silently drops its payload — set import settings via `execute_code` (editor API) or hand-edit the `.meta`.
-- HDRP motion blur smears screenshots taken the frame after a camera teleport — capture twice, keep the second.
+- Screenshots taken the frame after a camera teleport used to smear — capture twice, keep the second. That was **TAA ghosting, not motion blur** (there is no MotionBlur override in the volume profile), and the camera moved to FXAA on 2026-08-05, so it is probably obsolete. Confirm on the next capture and delete this line.
+- **`execute_code` that builds objects and then physics-tests them in the SAME call gets unsynced colliders** — the body walks through everything. Split across calls, or `Physics.SyncTransforms()` first.
 - After script edits: `refresh_unity` (compile) + `read_console` for errors before proceeding; play-mode `execute_code` tests that delete-then-rebuild must use `DestroyImmediate` (deferred `Destroy` races validation).
 - **The wall graph is play-mode only.** `WallEdge`/`WallNode`/`WallRoom` register in `OnEnable`, which Unity doesn't call in edit mode (no `[ExecuteAlways]`), so an edit-mode `execute_code` test builds unregistered objects: `FindAt` never shares nodes, no ring ever traces, and teardown that iterates `WallEdge.All` deletes **nothing** — the orphans stay in the scene and break the next run. Test in play mode; if you must clean edit-mode litter, scan with `FindObjectsByType`.

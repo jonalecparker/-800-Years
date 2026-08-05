@@ -60,10 +60,20 @@ public class WallRoom : MonoBehaviour
     const float LevelEps = 0.05f;
     const int EdgeSamples = 8;
     const float InteriorSampleStep = 2f;
-    // How much head a climber needs before the deck: the well opens from
-    // the tread that first comes within this of the roof, so you are
-    // through the hole before you would have hit it.
-    const float Headroom = 2f;
+    // How much CLEAR head the well guarantees under the deck's UNDERSIDE
+    // — deliberately far more than a body needs (WalkMode stands 1.8m),
+    // and deliberately not computed.
+    //
+    // Sizing this to the minimum was a mistake twice over. It was first
+    // measured to roofY instead of the soffit, so it promised 2m and
+    // delivered 2m minus the deck; and then, measured correctly, it was
+    // still tight enough that the difference between a stair and a ramp
+    // — you stand on a tread, not on the line between the ends — put a
+    // skull back into the masonry. A stairwell that is bigger than it
+    // has to be costs a little deck nobody stands on. One that is a
+    // few centimetres too small costs a head, every single climb.
+    // So: be generous, and stop doing arithmetic on the player's skull.
+    const float Headroom = 3f;
     // A stair butts flush against the wall's inner face, which is exactly
     // where the deck's edge sits — so the well's natural footprint touches
     // the deck boundary instead of sitting inside it, and a keyhole bridge
@@ -72,6 +82,13 @@ public class WallRoom : MonoBehaviour
     // deck lying over the outer few centimetres of the landing, which is
     // coplanar with it; keep this small enough to read as a joint line.
     const float WellLip = 0.05f;
+    // And the hole opens this much further down the run again, because a
+    // climber is a body and not a point: standing at the edge of the well
+    // you are up on the tread under your leading foot with the back of
+    // your skull still under the deck. Generous for the same reason
+    // Headroom is — a metre of extra slot is invisible, a tight one is a
+    // headache.
+    const float WellLead = 1f;
     const int WellSamplesPerSpan = 6;
 
     void OnEnable() { All.Add(this); }
@@ -574,13 +591,29 @@ public class WallRoom : MonoBehaviour
         float rise = stair.topY - stair.bottomY;
         if (rise < 0.05f)
             return null;
+        // The elevation a climber's feet are at when their head first
+        // needs the hole — Headroom of clear air under the deck's soffit,
+        // which is RoofThickness below the deck's top.
+        float openAt = roofY - RoofThickness - Headroom;
         // Standing on this deck, or never reaching it: no hole either way.
-        if (stair.bottomY >= roofY - 0.01f || stair.topY <= roofY - Headroom + 0.01f)
+        if (stair.bottomY >= roofY - 0.01f || stair.topY <= openAt + 0.01f)
             return null;
 
         float runArc = stair.runArc > 0.01f ? stair.runArc : stair.TotalArc;
-        float from = Mathf.Clamp(runArc * (roofY - Headroom - stair.bottomY) / rise,
-            0f, runArc);
+
+        // Where along the run that elevation falls — counted in TREADS,
+        // not along the straight line between the stair's ends. A stair
+        // is not a ramp: the step you actually stand on is up to a whole
+        // riser above that line, and taking the line for the climb is
+        // what let a well be cut a tread and a half too late.
+        int steps = WallStair.StepsFor(rise);
+        float riser = rise / steps;
+        float going = runArc / steps;
+        // The last tread whose TOP still leaves a full Headroom under the
+        // soffit. Everything above it needs the hole.
+        int lastClear = Mathf.FloorToInt((openAt - stair.bottomY) / riser);
+        float from = Mathf.Clamp(lastClear * going - WellLead, 0f, runArc);
+
         return StripFootprint(stair, from, stair.TotalArc,
             stair.width * 0.5f - WellLip);
     }

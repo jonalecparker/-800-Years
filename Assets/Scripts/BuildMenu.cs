@@ -55,6 +55,8 @@ public class BuildMenu : MonoBehaviour
     private Text hintHeaderText;
     private Text hintText;
     private string hintContextSeen;
+    // The whole build HUD, switched off while walking.
+    private GameObject hudCanvas;
 
     const int LogLinesShown = 6;
 
@@ -99,6 +101,7 @@ public class BuildMenu : MonoBehaviour
     void BuildUI()
     {
         GameObject canvasObj = new GameObject("BuildMenuCanvas");
+        hudCanvas = canvasObj;
         canvasObj.transform.SetParent(transform, false);
         Canvas canvas = canvasObj.AddComponent<Canvas>();
         canvas.renderMode = RenderMode.ScreenSpaceOverlay;
@@ -421,7 +424,14 @@ public class BuildMenu : MonoBehaviour
 
     void Update()
     {
-        if (placementSystem == null)
+        // Walking has no tools, so it has no tool HUD. Switching the
+        // canvas off takes its GraphicRaycaster with it, which is what
+        // stops a locked cursor parked over a button from "hovering" one
+        // it can no longer see.
+        bool inBuildMode = !WalkMode.Active;
+        if (hudCanvas != null && hudCanvas.activeSelf != inBuildMode)
+            hudCanvas.SetActive(inBuildMode);
+        if (!inBuildMode || placementSystem == null)
             return;
 
         int count = placementSystem.ActiveDragCount;

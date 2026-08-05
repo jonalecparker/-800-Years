@@ -52,6 +52,16 @@ public static class CutawayView
         Apply(root);
     }
 
+    // Puts every slice back and switches off. Walking takes the cut away
+    // rather than leaving it: the collider rides the slice, which is the
+    // feature in build mode and a castle you can walk straight through in
+    // walk mode.
+    public static void Clear(Transform root)
+    {
+        Level = float.PositiveInfinity;
+        Apply(root);
+    }
+
     // Is this world point ON the cut plane rather than on real masonry?
     //
     // A sliced wall's exposed top has an upward normal exactly like a real
