@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__UnityMCP__read_console",
+      "mcp__UnityMCP__refresh_unity",
+      "mcp__UnityMCP__validate_script",
+      "mcp__UnityMCP__find_gameobjects",
+      "PowerShell(Start-Sleep *)",
+      "PowerShell(Get-NetTCPConnection *)"
+    ]
+  }
+}

@@ -72,8 +72,9 @@ public class WallStair : MonoBehaviour
 
     [HideInInspector] public Material material;
 
-    float baseStep = 0.5f;
-    float baseWallHeight = 3.5f;
+    // Public so the save can round-trip them; set by Create like the rest.
+    public float baseStep = 0.5f;
+    public float baseWallHeight = 3.5f;
 
     // About 41° — a real castle stair, and steep enough that a storey's
     // worth of run fits inside a room. Rise is the primary: the count is

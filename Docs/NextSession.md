@@ -1,21 +1,33 @@
 # Next Session
 
-> Long arc: `Docs/Roadmap.md` (agreed 2026-07-30) — five phases from
-> builder to siege. Phase 1 is current work; its remaining ⚠ design
-> session (structural support) comes before its code.
+> Long arc: `Docs/Roadmap.md` — five phases from builder to siege, plus
+> the "Near arc" section (agreed 2026-08-05): save → real terrain →
+> permanent castle → economy → procedural town.
 
-**Where we left off:** You can now **walk around what you built**. `WalkMode` (Tab) drops you on your own feet inside the castle with WASD + mouselook, and `FreeFlyCamera` / `GridPlacementSystem` / `BuildMenu` all stand down while it's active. That was the milestone the last several sessions were building toward — the point at which the design doubts get answered by walking rather than reasoning. Stair wells turned out to be 1.70m against a 1.80m body and are now deliberately oversized (user-approved: bigger than necessary beats a headache). Mouse-look walls up over Remote Desktop — a documented Unity/RDP limitation, accepted, not fixable in code. A performance pass cut render-target memory 55% on an empty scene.
+**Where we left off:** The castle **saves and loads**. `CastleSave` serializes the whole graph (nodes, edges, openings, stairs, room rings, wells) to `Saves/castle.json`; geometry rebuilds on load through the same paths a commit uses. F5 saves, F9 loads, build mode only. Verified in play mode with a full-feature test castle (perfect fingerprint round-trip; the loaded graph still splits and breaches correctly) and hand-tested by the user. The lose-the-castle-every-recompile loop is over. Also fixed: the UnityMCP server registration was missing for this project (present now — tools connect natively next session if the server is running).
 
 ## Top priorities
 
-1. **Actually walk the centre castle.** The tool exists now and the thing it was built to answer is still unanswered — does the scale feel right? Are gates too narrow, halls too mean, storeys too tall? This is the session's whole purpose and it has slipped four sessions.
-2. **Confirm the performance pass** — restart the editor first (`sync_interval` still read `1` after disabling VSync, so it may need a fresh swap chain). Judge stutter *character*, not framerate: low-and-steady is RDP, irregular is something else.
-3. **Playtest round three leftovers** (`Docs/Stairs.md` step 5) — the landing's feel at 2.5m, the 5cm coplanar lip on the landing's outer edge, raised sills and threshold blocks, the door tool's step readout, and stairs arriving *at* a doorway. Wells are now confirmed good; the rest of 08-03/08-04 still isn't hand-tested.
-4. **Graduate the two design briefs.** `Docs/Stairs.md` and `Docs/Doors.md` fold into `CLAUDE.md` and become history once they've survived a playtest — same lifecycle as `WallGraphRebuild.md`.
+1. **Real European terrain** — pick a real castle site, pull ~1m national
+   LiDAR (France RGE ALTI / England DEFRA both free), import as the Unity
+   terrain. One site, one tile. Saves made before this land are throwaway
+   (terrain-tied by design — the save warns on mismatch but loads anyway).
+2. **Then: the permanent castle** — build and walk it on the real hill (the
+   feel-judgement session that has slipped five times, now on ground that
+   means something). Fold in the round-three playtest leftovers
+   (`Docs/Stairs.md` step 5: landing feel at 2.5m, the 5cm coplanar lip,
+   raised sills/thresholds, door step readout, stairs arriving at a
+   doorway) and the performance-pass confirmation (restart the editor
+   first; judge stutter *character*, not framerate). Decide here whether
+   this castle is also the game's Day-One inherited castle (design doc
+   tension flagged 2026-08-05).
+3. **Graduate the two design briefs.** `Docs/Stairs.md` and `Docs/Doors.md`
+   fold into `CLAUDE.md` and become history once they've survived a
+   playtest — same lifecycle as `WallGraphRebuild.md`.
 
 ## Backlog / open questions
 
-- **Saving the wall graph may be worth pulling forward.** The graph is play-mode only, so every code fix domain-reloads and destroys the castle. That cost us three rebuilds this session alone, and the build → walk → fix loop makes it worse. Not a design question, just newly annoying.
+- **Any new stored fact must join `CastleSave`** — a field added to `WallEdge`/`WallRoom`/`WallStair` that isn't serialized silently vanishes on load. (Also in CLAUDE.md.)
 - **Roof decks have no parapet** — you walk straight off the edge, since the deck is flush with the wall tops. Honest for a graybox; crenellations are on the procedural-detailing list.
 - **`CLAUDE.md`'s motion-blur screenshot note is probably obsolete** — the smear was TAA ghosting, and the camera is FXAA now. Confirm on the next capture, then update the note.
 - **Builds still default to High Fidelity** while the editor is on Performant (`m_PerPlatformDefaultQuality`, no scripting API). Arguably right — light editor, full-fidelity build for art judgement — but know it's there.
@@ -24,7 +36,7 @@
 - Node posts have no collider, so you can lean into the quarter-barrel at an outside corner. Visual clip, not a hole — adding one would change what the *cursor* hits too.
 - **A room inside a room may lay a second floor slab coplanar with the first** (found 08-04, **not confirmed**). `BuildFloor`'s elevated-room branch needs `wallBase > floorY + 0.25`, and a deck exactly one base step above the terrain doesn't clear it. On sloped ground the branch fired correctly.
 - **A doorway with 0.6m–2.2m of wall above its sill becomes a full-height gateway** rather than a doorway. Intentional for a low wall with the sill at grade; may read as damage where the sill was *raised*.
-- **Structural support is deliberately absent** (user's call): nothing stores what rests on what, so deleting a lower wall leaves masonry hanging. `baseY` alone is enough to reconstruct support when the design call lands — don't add a spatial "what is under me" query meanwhile.
+- **Structural support is deliberately absent** (user's call): nothing stores what rests on what, so deleting a lower wall leaves masonry hanging. `baseY` alone is enough to reconstruct support when the design call lands — don't add a spatial "what is under me" query meanwhile. Standing rule from the 2026-08-05 design session: **no new system may assume construction is instantaneous in the world.**
 - **Mid landing / dog-leg** — needs a real floating platform object at an intermediate base. Also deferred: spiral/newel stairs, mural stairs, a pitch dial (would join `ClaimingScrollWheel`).
 - **Windows** — the same `Opening` with a sill *and* a head, so `Runs` wants a second raised-bottom case. Also deferred: arched heads, a door that opens, doorways at nodes.
 - **Circle and rect don't get the skirt** — one shared `EdgeParams` per figure, so a stacked circle on a stepped host still shows gaps the wall tool no longer does.
@@ -47,6 +59,6 @@
 - Dirt texture tiling repeats on the hill shoulder; world ends hard at the 800m terrain edge.
 - Wall material lacks roughness/AO (HDRP mask map packing) — deferred for scope.
 - Art pipeline step 1 (parallel lane, not started): buy one realistic modular medieval pack → courtyard scene → HDRP lighting pass. User judges the image, Claude supplies settings.
-- Design renown (#11) — top undesigned system. Special rooms — #14. AI-prop bake-off (Tripo / Meshy / Rodin); Character Creator 5 trial. Walking liveliness — #12. Hard-mode death — #4. Liege — #5. AI nobles — #6. Vassal departure — #7. Alliances — ⏸ tabled. Deep-research pass: real lives of ~1220 landowners.
-- Editor gotchas: the wall graph is **play-mode only** (`OnEnable` registration — edit-mode tests register nothing and leave orphans). `execute_code` runs as a *method body*: no `using` directives, and `Object` is ambiguous — fully qualify `UnityEngine.Object`. Objects built and physics-tested in the **same** `execute_code` call have unsynced colliders — split across calls or `Physics.SyncTransforms()`. MCP bridge auto-start is ON; see memory note `unity-mcp-bridge-recovery`. Don't leave play mode running across recompiles.
+- Design renown (#11) — top undesigned system. Special rooms — #14. AI-prop bake-off (Tripo / Meshy / Rodin); Character Creator 5 trial. Walking liveliness — #12. Hard-mode death — #4. Liege — #5. AI nobles — #6. Vassal departure — #7. Alliances — ⏸ tabled. Deep-research pass: real lives of ~1220 landowners. The lord's income (#16) — near arc step 4.
+- Editor gotchas: the wall graph is **play-mode only** (`OnEnable` registration — edit-mode tests register nothing and leave orphans). `execute_code` runs as a *method body*: no `using` directives, and `Object` is ambiguous — fully qualify `UnityEngine.Object`. Objects built and physics-tested in the **same** `execute_code` call have unsynced colliders — split across calls or `Physics.SyncTransforms()`. MCP bridge: HTTP server at `127.0.0.1:8080/mcp`, user starts it; see memory note `unity-mcp-bridge-recovery`. Don't leave play mode running across recompiles.
 - **Mouse-look walls up over Remote Desktop** — `Mouse.delta` returns zero against a screen edge and cursor lock doesn't physically confine ([Unity issue](https://issuetracker.unity3d.com/issues/mouse-dot-delta-returns-zero-when-moving-the-cursor-against-the-screen-edge-when-using-a-remote-desktop-connection)). Accepted, not fixable in code. Don't try again.

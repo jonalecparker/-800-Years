@@ -40,6 +40,15 @@ public class WallRoom : MonoBehaviour
     public bool broken;
 
     public bool HasRoof => roofObj != null;
+    // Whether the room owns a floor slab (an elevated room doesn't — the
+    // deck its walls stand on already is one). Settled at designation;
+    // the save records the answer rather than re-asking.
+    public bool HasFloorSlab => floorObj != null;
+    // Read access for the save: both outlines are written-at-designation
+    // data (boundary splits never change them), so they serialize
+    // verbatim instead of being re-sampled from the ring on load.
+    public List<Vector3> Outline => outline;
+    public List<Vector3> DeckOutline => deckOutline;
 
     Material material;
     float baseStep = 0.5f;
@@ -130,6 +139,51 @@ public class WallRoom : MonoBehaviour
         BuildLog.Add(roofFail == null
             ? $"Room designated — {ring.Count} walls, roofed{room.roofNote}."
             : $"Room designated — {ring.Count} walls, floor only: {roofFail}.");
+        return room;
+    }
+
+    // Rebuilds a SAVED room exactly as recorded — the restore counterpart
+    // of Create, which asks the world all its questions (floor level,
+    // roof crown, sill raising, stair wells) at designation and writes
+    // the answers down. A load must not ask again: floorY, roofY,
+    // roofNote, both outlines and the wells all arrive stored, and only
+    // the slab MESHES are re-derived from them. The one thing re-sampled
+    // is the floor slab's buried bottom, which chases the terrain the way
+    // every footing does. No BuildLog entry — restoring is not an event
+    // in the build, and the roofless case must not re-refuse either.
+    public static WallRoom Restore(Transform parent, List<WallGraph.DirEdge> ring,
+        Material material, float baseStep, float baseWallHeight,
+        float floorY, bool hasFloorSlab, bool hasRoof, float roofY, string roofNote,
+        List<Vector3> outline, List<Vector3> deckOutline, List<Well> wells)
+    {
+        GameObject obj = new GameObject("WallRoom");
+        obj.transform.SetParent(parent, false);
+        WallRoom room = obj.AddComponent<WallRoom>();
+        room.material = material;
+        room.baseStep = baseStep;
+        room.baseWallHeight = baseWallHeight;
+        room.boundary.AddRange(ring);
+        room.outline = outline;
+        room.floorY = floorY;
+        if (hasFloorSlab)
+        {
+            float minGround = float.MaxValue;
+            foreach (Vector3 p in room.GroundSamplePoints())
+                minGround = Mathf.Min(minGround, GroundAt(p));
+            float bottom = (baseStep > 0f ? Mathf.Floor(minGround / baseStep) * baseStep
+                : minGround) - FloorSkirt;
+            room.floorObj = room.BuildSlab("RoomFloor", outline, bottom, floorY,
+                out room.floorMesh);
+        }
+        if (hasRoof && deckOutline != null && deckOutline.Count >= 3)
+        {
+            room.roofY = roofY;
+            room.roofNote = roofNote ?? "";
+            room.deckOutline = deckOutline;
+            if (wells != null)
+                room.wells.AddRange(wells);
+            room.BuildRoofSlab();
+        }
         return room;
     }
 

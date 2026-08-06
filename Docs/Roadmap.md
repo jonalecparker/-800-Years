@@ -35,6 +35,38 @@ needs a second foundation:
   is the structural-support design. New work is agent AI (runtime
   navmesh over player geometry) and battle presentation.
 
+## Near arc (agreed 2026-08-05)
+
+The builder is playable end-to-end (build → walk). Before the remaining
+phase-1 items, the agreed sequence:
+
+1. **Castle save/load** — serialize the graph (nodes, edges, controls,
+   heights, openings, room rings, stairs — never meshes; geometry is
+   derived and rebuilds on load). Needs stable edge/node identity so
+   rings and stairs re-find their edges. Promoted from quality-of-life
+   to prerequisite: a permanent castle underpins every step below, and
+   it ends the lose-the-castle-every-recompile loop.
+2. **Real European terrain** — import the actual hill under a real
+   castle site (~1m national LiDAR; France and England publish free).
+   Real ground is the cheapest realism, the judge for every
+   land-touching system to come, and an honest stress test of
+   skirts/footings. Guardrail: one site, one tile — not the
+   "impression of Europe" yet.
+3. **The permanent castle** — build it on that hill, walk it, keep it.
+   The long-slipped feel judgement, on ground that means something.
+4. **Economy design session** — how does a lord make money from land
+   and people? (Design doc open question #16.) Triggers the planned
+   1220 landowner deep-research pass; then build the manageable
+   income systems. Expands phase 2.
+5. **Procedural town** — common buildings and roads derived from the
+   castle (gates, market) and the real terrain. Derived-never-stored,
+   same doctrine as detailing. New work; slots alongside phase 3.
+
+Deferred with eyes open: **editing an inhabited castle / staged
+construction** (design doc, Castle Building + open question #15).
+Standing rule: no new system may assume construction is instantaneous
+in the world.
+
 ## Phases
 
 Each phase ends playable. War goes last because it consumes everything
@@ -90,6 +122,9 @@ before it (types→HP, towers→posts, gates→targets, cost→stakes).
 3. Detail rulebook sourcing — the 1220 deep-research pass becomes the
    rulebook's source material (window/crenel conventions), not just
    flavor (phase 3).
+4. **The lord's income** — demesne vs. rents/fees and the systems the
+   player manages (near arc step 4; design doc #16). Same research
+   pass as #3 feeds it.
 
 ## Prior-art anchors
 

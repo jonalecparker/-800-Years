@@ -476,6 +476,25 @@ public class GridPlacementSystem : MonoBehaviour
         // world and start placing or deleting behind the bar.
         bool overUI = EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
 
+        // Save/load hotkeys. Build mode only, by construction — walk
+        // mode's early return above never reaches here, which is right:
+        // loading swaps the world out from under a walker. Loading also
+        // stands the tool down first, so no half-drawn gesture or delete
+        // selection is left pointing at objects the load destroys. Like
+        // the cutaway's keys, these are not tool modifiers and stay out
+        // of ModifierHints; the BuildLog reports what happened.
+        if (keyboard != null && keyboard.f5Key.wasPressedThisFrame)
+        {
+            CastleSave.Save(CastleSave.DefaultPath);
+            return;
+        }
+        if (keyboard != null && keyboard.f9Key.wasPressedThisFrame)
+        {
+            StandDown();
+            CastleSave.Load(CastleSave.DefaultPath, splineParent, wallMaterial);
+            return;
+        }
+
         ClaimingScrollWheel = (Mode == ToolMode.Build && Shape == BuildShape.Curved && splineEnd.HasValue)
             || (Mode == ToolMode.Offset && offsetSource != null);
 

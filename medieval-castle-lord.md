@@ -143,18 +143,22 @@ So the ladder is: **raise money, raise armies, and/or ally with other lords** un
 
 Needs a robust way to build stone walls, designate rooms, and dig moats.
 
-**Fidelity (DECIDED): grid-based modular placement.** A few handfuls of object types — **walls, roofs, floors, and premade rooms** — accomplishes the intended look. Freeform drawing and preset-only upgrades both rejected.
+**Fidelity (DECIDED 2026-07-21: grid-based — SUPERSEDED 2026-08-05: full freeform).** The original call was grid-based modular placement with premade rooms. The graybox builder outgrew it in practice — walls at any angle and curvature, rooms of any shape and size, storeys as elevations — and building-then-walking the result confirmed freeform is correct. What survives from the original reasoning:
+- **Room detection never became inference:** a room is a *designated* enclosed face, stored as a ring of wall references — the premade-room benefit (no guessing what an enclosure is) kept under freeform.
+- **Auto-roof stayed deleted in spirit:** roofs are flat decks derived from a room's own walls, not generated guesswork; pitched/complex roofs remain deliberate future work.
 
-Two happy consequences of this exact shape:
-- **Premade rooms delete room detection** — the hardest tech in building systems. A room *is* the placed module, with its function attached; no inferring "this enclosure is a kitchen" from arbitrary walls.
-- **Explicit roof pieces delete auto-roof generation** — the other classic time sink.
-
-**Asset spec preview** (for the eventual Blender kit): tiling wall/floor/roof pieces on a fixed grid + room modules as larger set-pieces. Exact grid size etc. still comes from the graybox prototype.
+**Asset spec preview** (for the eventual Blender kit): the kit follows the freeform system's spec — pieces that read as masonry along arbitrary curves (the procedural-detailing direction), not grid tiles. Exact spec still comes from the graybox.
 
 **Tensions & synergies:**
 - ⚠️ Tests the spirit of the "short of a city-builder" guardrail — biggest single system in the game; decide fidelity deliberately.
 - Must reconcile with the head-builder decision. Likely shape: *plan* in top-down build mode, head builder is the in-person interface, construction then visibly proceeds in-world (which also feeds the seasons/construction walking baseline).
 - Feeds three threads at once: #12 (you walk your *own creation* as it changes), the defense push (walls/moats vs. sieges), and first-person functional destinations (special rooms).
+
+**Editing an inhabited castle (worry recorded 2026-08-05 — deliberately deferred).** Once the castle is full of life, how do you rebuild it without being homeless during the rebuild? Piecemeal edits are fine — builder edits are already localized, and wing-by-wing extension is the historically true pattern anyway. The hard case is total: a castle occupying its whole hill, replaced by a new one on the same ground, with construction taking in-game time.
+- **Likely shape (not decided):** the builder is the *planning layer* — instant, free, reversible. What happens in the world is a work order the head builder executes over seasons; delete becomes scheduled demolition, not instant removal. (This extends the plan/head-builder reconciliation above.)
+- **Escape hatches live in game systems, not the builder:** temporary timber lodgings, decamping to another manor, owning a second castle (already a strategic-layer feature). Total same-footprint rebuild *should* hurt — historically lords encased and extended precisely because starting over was ruinous.
+- **DECIDED: defer.** The cost of castle-lessness depends on systems that don't exist yet — time scale, household needs, sieges, the liege. The answer will be found once those impose real constraints, not designed in a vacuum. **Standing rule until then: no new system may assume construction is instantaneous in the world** — the plan-vs-execute reframe must stay available.
+- Architecture note: staged construction lands on the wall graph as stored per-wall state (planned / building / built / condemned), which the graph's stored-never-inferred doctrine handles cleanly. The **castle save system is the prerequisite** and is pulled forward (see Roadmap near arc).
 
 **Art consequence:** the castle kit becomes a *system-spec'd custom kit*, not pack assets (see Art Direction & Pipeline).
 
@@ -178,8 +182,10 @@ Two happy consequences of this exact shape:
 10. ~~How does the steward actually work?~~ **Resolved:** competence tiers priced accordingly; can mismanage; can rebel and attempt to seize the estate if you're absent too long or renown is too low. (See Vassals & Economy.)
 11. **What is renown and how do you earn/lose it?** Introduced by the steward-rebellion mechanic. Battles won? Castle grandeur? Wealth displayed? Tournaments? Generosity in famine? This could become the game's reputation spine — worth designing deliberately. (Note: tournaments now exist for gear prizes via #9 — a natural renown source too.)
 12. **What keeps ambient castle-walking fun over time?** **Baseline decided: seasons and visible construction.** Still open: what else — feasts, markets, festivals, population growth you can see? The reward for good management is what you *see* on your walk. (Strengthened by the castle-building decision: you're walking your *own creation*.)
-13. ~~Castle building fidelity?~~ **Resolved: grid-based modular placement** — walls, roofs, floors, premade rooms. (See "Castle Building.")
+13. ~~Castle building fidelity?~~ **Resolved 2026-07-21 as grid-based, revised 2026-08-05: full freeform** — free walls, designated rooms, derived roofs. (See "Castle Building.")
 14. **What are the special rooms and what do they do?** Functional rooms are decided in principle; the list (armory? chapel? treasury? great hall? dungeon?) and their game effects are undefined. Historical research pass should feed this.
+15. **How do you edit an inhabited castle without being homeless during the rebuild?** Recorded 2026-08-05, **deferred by choice** until time, household, and siege systems impose real constraints. Likely shape: builder = plan layer, head builder executes over in-game time. Standing rule meanwhile: nothing may assume instant in-world construction. (See "Castle Building.")
+16. **How does a lord make money from the land and people around his castle?** Demesne produce he sells vs. rents and fees on everyone else's — historically both, and the split is the structure (demesne farming, rents in cash and kind, labor services, mill/oven monopoly fees, court fines, market tolls). Needs a design session; triggers the planned 1220 landowner research pass. (Roadmap near arc, step 4.)
 
 ## Build Phases (draft)
 
@@ -224,7 +230,7 @@ Consequences, eyes open:
 | Characters (#1 risk) | Reallusion pipeline: Character Creator 5 → iClone 8 → Unity auto-setup; MakeHuman for background NPCs | The established solo-dev route to realistic rigged humans; iClone AI video mocap for animations. ~a few hundred dollars. |
 | Unification | Unity **HDRP** + deliberate lighting/fog/post pass | Under realism, lighting/post IS the art style. **Workflow (decided 2026-07-22):** user does NOT front-load HDRP settings knowledge — user judges the image ("the eye"/taste, the irreplaceable part), Claude supplies and applies concrete settings (via Unity MCP where possible), explaining only what's touched. Vocabulary (~10 concepts: exposure, tonemapping, baked vs. realtime, volumes…) absorbed as it comes up. |
 
-**The castle kit (REVISED after the castle-building decision):** with player-facing castle building (see "Castle Building"), the castle itself moves *out* of the buy-a-pack lane. A building system needs assets authored to its spec — exact grid dimensions, socket conventions, pieces that corner/cap cleanly, watertight interiors under arbitrary room layouts, construction-in-progress states, siege damage states. Packs are sculptures, not LEGO; AI 3D gen is at its weakest here too (one-off meshes, no shared dimensions/pivots/tiling). Plan:
+**The castle kit (REVISED after the castle-building decision):** with player-facing castle building (see "Castle Building"), the castle itself moves *out* of the buy-a-pack lane. A building system needs assets authored to its spec — under the freeform revision (2026-08-05) that means materials/details that read as masonry along arbitrary curves and heights, pieces that corner/cap cleanly, watertight interiors under arbitrary room layouts, construction-in-progress states, siege damage states. Packs are sculptures, not LEGO; AI 3D gen is at its weakest here too (one-off meshes, no shared dimensions/pivots/tiling). Plan:
 1. **System before art:** the building system defines the asset spec (grid size, wall heights, snapping) — prototype it in graybox first. Sequence decided 2026-07-23: **graybox core** (placement, snapping, walls/floors/roofs, one premade room, walk it in first person) → **thin real-asset slice** (one wall/corner/floor/room module through the system, to let asset realities push back on the spec) → **build out system and kit together**. Not 100% system then 100% art.
 2. **Then a scoped Blender effort, architecture only:** castle geometry is primitive (boxes, cylinders, arches); Megascans materials + lighting carry the realism. Weeks-not-years tier. Promoted from fallback to the likely plan.
 3. **Packs still cover everything the player doesn't build:** village, countryside, interior clutter/furnishings — and the courtyard test still proves look/lighting/characters/props (just not castle construction).

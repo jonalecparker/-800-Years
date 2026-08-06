@@ -60,6 +60,16 @@ Briefs: `Docs/Stairs.md` and `Docs/Doors.md` hold the *why*; they move in here o
 - **Escape belongs to the Unity editor — never take a second meaning for it.** It drops the Game view's focus, and an unfocused Game view has *no* cursor state applied to it, neither lock nor hide. Binding it to "exit walk mode" put you back in with a loose pointer every time.
 - **Do not try to fix mouse-look over Remote Desktop.** `Mouse.delta` returns zero against a screen edge and `CursorLockMode.Locked` pins only the *reported* position while the physical cursor roams ([Unity issue tracker](https://issuetracker.unity3d.com/issues/mouse-dot-delta-returns-zero-when-moving-the-cursor-against-the-screen-edge-when-using-a-remote-desktop-connection)). Four fixes were tried and reverted — re-asserting the lock (a no-op unless the state *changes*), warping plus `Mouse.delta` (double-counts), per-frame drift detection (misses a slow creep), and manual centring off position (systematic round-trip error, spins the camera). The implementation is deliberately the ordinary one.
 
+## Save/load (2026-08-05)
+
+`CastleSave` (F5/F9, `Saves/castle.json`) serializes the graph and riders; geometry rebuilds on load.
+
+- **Every new stored fact must join `CastleSave` in the same commit** — a field added to `WallEdge`/`WallRoom`/`WallStair` that isn't serialized silently vanishes on load. This is the serialization face of stored-never-inferred: if it can't be re-derived, it must be saved.
+- **Load restores, never re-derives**: `WallRoom.Restore`, not `Create` — no `RaiseSills`, no `TryBuildRoof`, no `NotifyStairBuilt`. And load is NOT a graph mutation: `WallEdge.Create`, never `CommitEdge` — no splits, no crossings, no room hooks. The save came from a legal graph; restore it wholesale.
+- **`-Infinity` travels as a `-1e30` sentinel** (`Pack`/`Unpack`) — JSON has no infinity. Any new float field with the terrain-sentinel convention must go through them.
+- Identity is positional (index within the file); nothing needs cross-save identity yet. `Saves/` is deliberately committed — the permanent castle save is a project artifact.
+- F5/F9 are build-mode only (loading would swap the world out from under a walker) and stay out of `ModifierHints` by the cutaway precedent.
+
 ## Elevated ground (proto-storeys)
 
 - Room slabs are **build surfaces**: `WallEdge.baseY` (default −∞) raises a section's bottom, and slab hits are detected by collider name (`"RoomRoof"` → `roofY`, else `floorY`). Any new raycast that can hit a slab must decide deliberately whether it's ground.
