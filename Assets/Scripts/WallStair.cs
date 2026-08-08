@@ -8,7 +8,7 @@ using UnityEngine;
 // float. A stair belongs to two storeys at once, which is a different
 // kind of fact, so it gets its own object rather than a flag on WallEdge
 // that every planar query would have to filter out. It is a RIDER on the
-// graph the way WallRoom is: registered here, member of no WallNode,
+// graph the way SlabTile is: registered here, member of no WallNode,
 // invisible to FindCrossings / OverlapsExisting / FaceAt. It never splits
 // a wall and no wall splits it.
 //
@@ -92,11 +92,6 @@ public class WallStair : MonoBehaviour
 
     void OnEnable() { All.Add(this); }
     void OnDisable() { All.Remove(this); }
-
-    // A stair that goes leaves no hole behind it. The room owns the well,
-    // so the room heals it — this is the only place that knows the stair
-    // is gone while it still has an identity to match on.
-    void OnDestroy() { WallRoom.NotifyStairGone(this); }
 
     public static int StepsFor(float rise)
     {

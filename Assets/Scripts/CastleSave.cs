@@ -6,21 +6,19 @@ using UnityEngine;
 // Save/load for the castle: the wall graph and its riders serialized to
 // JSON, geometry rebuilt on load. WHAT is saved follows the graph's own
 // doctrine — stored facts only, never derived geometry: nodes, edges
-// (curve, heights, openings), stairs (their baked runs), and rooms (ring,
-// slab planes, outlines, wells). Meshes, sections and treads are all
-// re-derived on load by the same Rebuild paths a commit uses.
+// (curve, heights, openings), stairs (their baked runs), and slab tiles
+// (center, size, planes). Meshes, sections and treads are all re-derived
+// on load by the same Rebuild paths a commit uses.
 //
-// Written-at-the-moment data (a room's frozen roofY and roofNote, raised
-// sills, stair wells) is serialized VERBATIM and restored without
-// re-running the moments that wrote it — WallRoom.Restore, not
-// WallRoom.Create. Those answers are stored precisely because the world
-// that produced them can have moved on; a load that re-derived them would
-// quietly re-answer old questions with new facts.
+// Written-at-the-moment data (raised sills) is serialized VERBATIM and
+// restored without re-running the moments that wrote it. Those answers
+// are stored precisely because the world that produced them can have
+// moved on; a load that re-derived them would quietly re-answer old
+// questions with new facts.
 //
-// Identity is positional: a node or edge's id is its index in this file,
-// and rooms/wells reference edges/stairs by that index. Nothing needs
-// identity that survives ACROSS saves yet — a save is a complete graph,
-// so within-file indices are all the stability required.
+// Identity is positional: a node or edge's id is its index in this file.
+// Nothing needs identity that survives ACROSS saves yet — a save is a
+// complete graph, so within-file indices are all the stability required.
 //
 // A save is tied to its terrain: footings, slab bottoms and stair wedges
 // sample the ground on rebuild. The terrain's name is stored and a
@@ -34,7 +32,10 @@ using UnityEngine;
 // graph. WallEdge.Create (not CommitEdge) is the right door in.
 public static class CastleSave
 {
-    const int Version = 1;
+    // 2: the building rebuild (Docs/BuildingRebuild.md) — rooms left the
+    // schema, slab tiles joined it. Version-1 saves refuse cleanly; the
+    // user's call was to delete them, not migrate.
+    const int Version = 2;
 
     // JSON has no -Infinity, and JsonUtility's handling of one is not
     // worth trusting across Unity versions — the graph's "-inf means
@@ -64,7 +65,6 @@ public static class CastleSave
         public Vector3 control;
         public float height, thickness, baseWallHeight, targetSectionLength, baseStep;
         public float fixedTopY, baseY, skirt;
-        public bool roomBuilt;
         public List<OpeningData> openings = new List<OpeningData>();
     }
 
@@ -83,32 +83,27 @@ public static class CastleSave
         public float baseWallHeight, baseStep;
     }
 
+    // One earthwork operation (kind 0 pad / 1 bench / 2 restore) — older
+    // saves carry only poly+level, whose missing fields default to kind 0,
+    // which is exactly what those saves meant.
     [Serializable]
-    class RingRef
+    class PadData
     {
-        public int edge;
-        public bool forward;
-    }
-
-    [Serializable]
-    class WellData
-    {
-        public int stair;
+        public int kind;
         public List<Vector3> poly = new List<Vector3>();
+        public float level;
+        public float width;
+        public float ya, yb;
     }
 
+    // A slab tile (foundation or between-storey floor) — pure stored
+    // facts, rebuilt as the same prism on load.
     [Serializable]
-    class RoomData
+    class SlabData
     {
-        public List<RingRef> boundary = new List<RingRef>();
-        public float floorY;
-        public bool hasFloorSlab;
-        public bool hasRoof;
-        public float roofY;
-        public string roofNote;
-        public List<Vector3> outline = new List<Vector3>();
-        public List<Vector3> deckOutline = new List<Vector3>();
-        public List<WellData> wells = new List<WellData>();
+        public float x, z;
+        public float size, yaw, topY, bottomY;
+        public bool isFoundation;
     }
 
     [Serializable]
@@ -116,23 +111,68 @@ public static class CastleSave
     {
         public int version;
         public string terrainName;
+        public List<PadData> pads = new List<PadData>();
         public List<NodeData> nodes = new List<NodeData>();
         public List<EdgeData> edges = new List<EdgeData>();
         public List<StairData> stairs = new List<StairData>();
-        public List<RoomData> rooms = new List<RoomData>();
+        public List<SlabData> slabs = new List<SlabData>();
     }
 
-    // Project-root /Saves, next to Assets — visible, diffable test saves.
-    // Real save slots move to persistentDataPath when the game has a
-    // front end to pick them from.
-    public static string DefaultPath =>
-        Path.GetFullPath(Path.Combine(Application.dataPath, "..", "Saves", "castle.json"));
+    // Project-root /Saves, next to Assets — visible, diffable saves.
+    // Slots are files: the slot NAME is the file name, the save DATE is
+    // the file's write time — nothing stored twice. The Saves panel in
+    // BuildMenu is the front end; F5/F9 act on whichever slot was last
+    // saved or loaded (CurrentSlot), so the hotkeys never guess.
+    public static string SavesDir =>
+        Path.GetFullPath(Path.Combine(Application.dataPath, "..", "Saves"));
+
+    public static string CurrentSlot = "castle";
+
+    public static string PathFor(string slot) => Path.Combine(SavesDir, slot + ".json");
+
+    public static string DefaultPath => PathFor(CurrentSlot);
+
+    // A slot name doubles as a file name, so it keeps only characters
+    // every filesystem accepts. Empty after cleaning means "not a name".
+    public static string SanitizeSlot(string raw)
+    {
+        if (string.IsNullOrEmpty(raw))
+            return "";
+        var sb = new System.Text.StringBuilder();
+        foreach (char c in raw)
+            if (char.IsLetterOrDigit(c) || c == ' ' || c == '-' || c == '_')
+                sb.Append(c);
+        return sb.ToString().Trim();
+    }
+
+    // Every slot on disk, newest first — the Saves panel's list.
+    public static List<(string slot, DateTime time)> ListSlots()
+    {
+        var slots = new List<(string, DateTime)>();
+        if (!Directory.Exists(SavesDir))
+            return slots;
+        foreach (string file in Directory.GetFiles(SavesDir, "*.json"))
+            slots.Add((Path.GetFileNameWithoutExtension(file), File.GetLastWriteTime(file)));
+        slots.Sort((a, b) => b.Item2.CompareTo(a.Item2));
+        return slots;
+    }
 
     public static bool Save(string path)
     {
         var data = new SaveData { version = Version };
         Terrain terrain = Terrain.activeTerrain;
         data.terrainName = terrain != null ? terrain.name : "";
+
+        foreach (TerrainPads.Op op in TerrainPads.All)
+            data.pads.Add(new PadData
+            {
+                kind = op.kind,
+                poly = new List<Vector3>(op.poly),
+                level = op.level,
+                width = op.width,
+                ya = op.ya,
+                yb = op.yb,
+            });
 
         var nodeIndex = new Dictionary<WallNode, int>();
         foreach (WallNode n in WallNode.All)
@@ -168,7 +208,6 @@ public static class CastleSave
                 fixedTopY = Pack(e.fixedTopY),
                 baseY = Pack(e.baseY),
                 skirt = e.skirt,
-                roomBuilt = e.roomBuilt,
             };
             foreach (WallEdge.Opening o in e.openings)
                 ed.openings.Add(new OpeningData
@@ -210,43 +249,26 @@ public static class CastleSave
             data.stairs.Add(sd);
         }
 
-        foreach (WallRoom r in WallRoom.All)
+        foreach (SlabTile t in SlabTile.All)
         {
-            if (r == null || r.broken || r.Outline == null)
+            if (t == null)
                 continue;
-            var rd = new RoomData
+            data.slabs.Add(new SlabData
             {
-                floorY = r.floorY,
-                hasFloorSlab = r.HasFloorSlab,
-                hasRoof = r.HasRoof,
-                roofY = r.HasRoof ? r.roofY : 0f,
-                roofNote = r.roofNote,
-            };
-            bool ringIntact = true;
-            foreach (WallGraph.DirEdge d in r.boundary)
-            {
-                if (d.edge == null || !edgeIndex.TryGetValue(d.edge, out int ei))
-                {
-                    ringIntact = false;
-                    break;
-                }
-                rd.boundary.Add(new RingRef { edge = ei, forward = d.forward });
-            }
-            if (!ringIntact)
-                continue;
-            rd.outline.AddRange(r.Outline);
-            if (r.DeckOutline != null)
-                rd.deckOutline.AddRange(r.DeckOutline);
-            foreach (WallRoom.Well w in r.wells)
-                if (w.owner != null && w.poly != null && stairIndex.TryGetValue(w.owner, out int si))
-                    rd.wells.Add(new WellData { stair = si, poly = new List<Vector3>(w.poly) });
-            data.rooms.Add(rd);
+                x = t.center.x,
+                z = t.center.z,
+                size = t.size,
+                yaw = t.yaw,
+                topY = t.topY,
+                bottomY = t.bottomY,
+                isFoundation = t.isFoundation,
+            });
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(path));
         File.WriteAllText(path, JsonUtility.ToJson(data, true));
-        BuildLog.Add($"Saved — {data.edges.Count} walls, {data.rooms.Count} rooms,"
-            + $" {data.stairs.Count} stairs → {Path.GetFileName(path)}.");
+        BuildLog.Add($"Saved — {data.edges.Count} walls, {data.stairs.Count} stairs,"
+            + $" {data.slabs.Count} slab tiles → {Path.GetFileName(path)}.");
         return true;
     }
 
@@ -272,6 +294,23 @@ public static class CastleSave
 
         Clear();
 
+        // Earth before masonry: pristine ground back first, then the
+        // saved pads reapply in order — every wall created below re-foots
+        // on the padded ground exactly as it stood at save time. (Nothing
+        // exists yet, so the live keep-out around existing walls is moot
+        // here; footings re-foot regardless.)
+        TerrainPads.ResetToPristine();
+        foreach (PadData pd in data.pads)
+            TerrainPads.Replay(new TerrainPads.Op
+            {
+                kind = pd.kind,
+                poly = pd.poly,
+                level = pd.level,
+                width = pd.width,
+                ya = pd.ya,
+                yb = pd.yb,
+            });
+
         var nodes = new List<WallNode>();
         foreach (NodeData nd in data.nodes)
             nodes.Add(WallNode.Create(parent, new Vector3(nd.x, 0f, nd.z),
@@ -289,7 +328,6 @@ public static class CastleSave
                 ed.height, ed.thickness, ed.baseWallHeight, material,
                 ed.targetSectionLength, ed.baseStep, Unpack(ed.fixedTopY),
                 Unpack(ed.baseY), ed.skirt);
-            edge.roomBuilt = ed.roomBuilt;
             if (ed.openings.Count > 0)
             {
                 foreach (OpeningData od in ed.openings)
@@ -322,45 +360,17 @@ public static class CastleSave
                     arcStart = sp.arcStart,
                     arcEnd = sp.arcEnd,
                 });
-            // No NotifyStairBuilt: the wells this stair earned are stored
-            // on the rooms below and restored with them.
             stairs.Add(WallStair.Create(parent, spans, sd.bottomY, sd.topY, sd.runArc,
                 Unpack(sd.baseFrom), sd.width, sd.baseWallHeight, sd.baseStep, material));
         }
 
-        int roomCount = 0;
-        foreach (RoomData rd in data.rooms)
-        {
-            var ring = new List<WallGraph.DirEdge>();
-            bool ringIntact = true;
-            foreach (RingRef rr in rd.boundary)
-            {
-                if (rr.edge < 0 || rr.edge >= edges.Count || edges[rr.edge] == null)
-                {
-                    ringIntact = false;
-                    break;
-                }
-                ring.Add(new WallGraph.DirEdge { edge = edges[rr.edge], forward = rr.forward });
-            }
-            if (!ringIntact || rd.outline.Count < 3)
-                continue;
-            var wells = new List<WallRoom.Well>();
-            foreach (WellData wd in rd.wells)
-                if (wd.stair >= 0 && wd.stair < stairs.Count && stairs[wd.stair] != null)
-                    wells.Add(new WallRoom.Well
-                    {
-                        owner = stairs[wd.stair],
-                        poly = new List<Vector3>(wd.poly),
-                    });
-            WallRoom.Restore(parent, ring, material, ring[0].edge.baseStep,
-                ring[0].edge.baseWallHeight, rd.floorY, rd.hasFloorSlab,
-                rd.hasRoof, rd.roofY, rd.roofNote, rd.outline, rd.deckOutline, wells);
-            roomCount++;
-        }
+        foreach (SlabData sd in data.slabs)
+            SlabTile.Create(parent, material, new Vector3(sd.x, 0f, sd.z),
+                sd.size, sd.yaw, sd.topY, sd.bottomY, sd.isFoundation);
 
         Physics.SyncTransforms();
-        BuildLog.Add($"Loaded — {data.edges.Count} walls, {roomCount} rooms,"
-            + $" {stairs.Count} stairs from {Path.GetFileName(path)}.");
+        BuildLog.Add($"Loaded — {data.edges.Count} walls, {stairs.Count} stairs,"
+            + $" {data.slabs.Count} slab tiles from {Path.GetFileName(path)}.");
         return true;
     }
 
@@ -373,9 +383,6 @@ public static class CastleSave
     // own nodes; the final node sweep catches only free-standing litter.
     static void Clear()
     {
-        foreach (WallRoom r in new List<WallRoom>(WallRoom.All))
-            if (r != null)
-                UnityEngine.Object.DestroyImmediate(r.gameObject);
         foreach (WallStair s in new List<WallStair>(WallStair.All))
             if (s != null)
                 UnityEngine.Object.DestroyImmediate(s.gameObject);
@@ -385,5 +392,8 @@ public static class CastleSave
         foreach (WallNode n in new List<WallNode>(WallNode.All))
             if (n != null)
                 UnityEngine.Object.DestroyImmediate(n.gameObject);
+        foreach (SlabTile t in new List<SlabTile>(SlabTile.All))
+            if (t != null)
+                UnityEngine.Object.DestroyImmediate(t.gameObject);
     }
 }

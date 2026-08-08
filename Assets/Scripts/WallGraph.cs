@@ -25,10 +25,6 @@ public static class WallGraph
         // safe default (see WallEdge.skirt).
         public float skirt;
         public Material material;
-        // Stamped onto every edge the gesture creates: the room tool's
-        // walls can be designated a room after the fact, the wall tool's
-        // cannot. See WallEdge.roomBuilt.
-        public bool roomBuilt;
     }
 
     // Where a proposed curve crosses an existing edge. reuseNode is set
@@ -213,10 +209,10 @@ public static class WallGraph
                 List<DirEdge> face = TraceFace(e, dir == 0);
                 if (face == null)
                     continue;
-                float area = WallRoom.RingArea(face);
+                float area = Enclosure.RingArea(face);
                 if (area <= 0.5f || area >= bestArea)
                     continue;
-                if (!WallRoom.RingContains(face, point))
+                if (!Enclosure.RingContains(face, point))
                     continue;
                 best = face;
                 bestArea = area;
@@ -406,7 +402,6 @@ public static class WallGraph
             WallEdge made = WallEdge.Create(parent, n0, n1, subC, p.height, p.thickness,
                 p.baseWallHeight, p.material, p.targetSectionLength, p.baseStep, p.fixedTopY,
                 p.baseY, p.skirt);
-            made.roomBuilt = p.roomBuilt;
             created.Add(made);
             touched.Add(n0);
             touched.Add(n1);
@@ -415,10 +410,6 @@ public static class WallGraph
             if (n != null)
                 n.RebuildMesh();
         Physics.SyncTransforms();
-        // A room that refused a roof may have just been completed or
-        // levelled by this run.
-        if (created.Count > 0)
-            WallRoom.RetryRoofless();
         return created;
     }
 
@@ -457,11 +448,6 @@ public static class WallGraph
         WallNode nodeA = edge.nodeA;
         WallNode nodeB = edge.nodeB;
 
-        // Deleting masonry breaches any room this edge bounded —
-        // the sub-edges cover less than the whole run, so the ring is
-        // open no matter which sections went.
-        WallRoom.NotifyBreach(edge);
-
         Vector3 s = edge.A, c = edge.control, e = edge.B;
         var touched = new HashSet<WallNode> { nodeA, nodeB };
         foreach ((float lo, float hi) in ranges)
@@ -480,7 +466,6 @@ public static class WallGraph
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
                 edge.fixedTopY, edge.baseY, edge.skirt);
-            sub.roomBuilt = edge.roomBuilt;
             WallEdge.CarryOpenings(edge, sub, lo, hi);
             touched.Add(n0);
             touched.Add(n1);
@@ -540,15 +525,11 @@ public static class WallGraph
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
                 edge.fixedTopY, edge.baseY, edge.skirt);
-            sub.roomBuilt = edge.roomBuilt;
             WallEdge.CarryOpenings(edge, sub, t0, t1);
             orderedSubs.Add(sub);
             touched.Add(n0);
             touched.Add(n1);
         }
-        // The sub-edges cover the whole old run, so any room ring through
-        // this edge stays closed — it just re-points at the pieces.
-        WallRoom.NotifySplit(edge, orderedSubs);
         Object.DestroyImmediate(edge.gameObject);
         foreach (WallNode n in touched)
             if (n != null)

@@ -34,11 +34,24 @@ public class BuildMenu : MonoBehaviour
     private Image roomButtonImage;
     private Image stairButtonImage;
     private Image doorButtonImage;
-    // The Room tool's job buttons, shown in the item row while it's in
+    private Image groundButtonImage;
+    // Sub-tool buttons shown in the item row while their category is in
     // hand — tinted from the placement system's actual state like every
-    // other control here.
-    private readonly List<(Image image, GridPlacementSystem.RoomAction task)> roomTaskButtons =
-        new List<(Image, GridPlacementSystem.RoomAction)>();
+    // other control here. Room's jobs are the building tools in build
+    // order: Foundation, then Wall (the chain), then Floor.
+    private readonly List<(Image image, GridPlacementSystem.GroundAction task)> groundTaskButtons =
+        new List<(Image, GridPlacementSystem.GroundAction)>();
+    private readonly List<(Image image, GridPlacementSystem.ToolMode mode)> roomTaskButtons =
+        new List<(Image, GridPlacementSystem.ToolMode)>();
+    // The Saves panel: a modal list of named save slots. While it's open
+    // it owns the keyboard (slot names are typed), so the placement
+    // system and walk mode both check this flag and stand aside.
+    public static bool ModalOpen { get; private set; }
+    private Image savesButtonImage;
+    private GameObject savesPanel;
+    private Text saveNameText;
+    private RectTransform savesListParent;
+    private string saveName = "";
     private Toggle curvedToggle;
     private Toggle offsetToggle;
     private Toggle circleToggle;
@@ -47,6 +60,8 @@ public class BuildMenu : MonoBehaviour
     private Text dragCountText;
     private GameObject heightPanel;
     private Text heightText;
+    private GameObject inspectPanel;
+    private Text inspectText;
     private GameObject logBody;
     private Text logText;
     private Text logHeaderText;
@@ -124,14 +139,17 @@ public class BuildMenu : MonoBehaviour
         }
 
         // The bar holds objects and tools: build items by category, the
-        // Room tool, and Delete (one click arms it — button turns red — a
-        // second click or picking any build item returns to building).
-        // Gesture helpers (Curved, Offset, Circle, Rectangle) live as
-        // checkboxes in the options panel instead.
+        // Room category (Foundation / Wall / Floor as its jobs), and
+        // Delete (one click arms it — button turns red — a second click
+        // or picking any build item returns to building). Gesture helpers
+        // (Curved, Offset, Circle, Rectangle) live as checkboxes in the
+        // options panel instead.
         roomButtonImage = CreateButton(categoryRow, "Room", ToggleRoomMode).GetComponent<Image>();
         stairButtonImage = CreateButton(categoryRow, "Stairs", ToggleStairMode).GetComponent<Image>();
         doorButtonImage = CreateButton(categoryRow, "Doors", ToggleDoorMode).GetComponent<Image>();
+        groundButtonImage = CreateButton(categoryRow, "Ground", ToggleGroundMode).GetComponent<Image>();
         deleteButtonImage = CreateButton(categoryRow, "Delete", ToggleDeleteMode).GetComponent<Image>();
+        savesButtonImage = CreateButton(categoryRow, "Saves", ToggleSavesPanel).GetComponent<Image>();
 
         // Small readouts tucked above the bar's right end: the wall height
         // for the build tool (always visible while building), and the piece
@@ -140,12 +158,188 @@ public class BuildMenu : MonoBehaviour
             new Vector2(-8f, 68f), new Vector2(120f, 40f), out dragCountText);
         dragCountPanel.SetActive(false);
         heightPanel = CreateReadout(canvasObj.transform, "HeightPanel",
-            new Vector2(-136f, 68f), new Vector2(190f, 40f), out heightText);
+            new Vector2(-136f, 68f), new Vector2(290f, 40f), out heightText);
         heightPanel.SetActive(false);
+        // The hover inspect line: absolute planes of whatever the cursor
+        // is over (a room's floor/roof, a wall's top, the ground), so you
+        // can read the elevation a new build has to match.
+        inspectPanel = CreateReadout(canvasObj.transform, "InspectPanel",
+            new Vector2(-8f, 112f), new Vector2(290f, 40f), out inspectText);
+        inspectPanel.SetActive(false);
 
         CreateOptionsPanel(canvasObj.transform);
         CreateLogPanel(canvasObj.transform);
         CreateHintPanel(canvasObj.transform);
+        CreateSavesPanel(canvasObj.transform);
+    }
+
+    // The Saves panel: centered, modal, and built from the same cloth as
+    // the rest of the HUD. One name field (always focused — it is the
+    // only text on screen), a Save button, and every slot on disk newest
+    // first with its date; clicking a slot loads it. The date is the
+    // file's write time and the name is the file's name — the panel
+    // stores nothing the Saves folder doesn't already say.
+    void CreateSavesPanel(Transform parent)
+    {
+        savesPanel = new GameObject("SavesPanel", typeof(RectTransform));
+        savesPanel.transform.SetParent(parent, false);
+        RectTransform rt = savesPanel.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0.5f, 0.5f);
+        rt.anchorMax = new Vector2(0.5f, 0.5f);
+        rt.pivot = new Vector2(0.5f, 0.5f);
+        rt.anchoredPosition = new Vector2(0f, 60f);
+        rt.sizeDelta = new Vector2(480f, 0f);
+
+        Image bg = savesPanel.AddComponent<Image>();
+        bg.color = new Color(barColor.r, barColor.g, barColor.b, 0.96f);
+        VerticalLayoutGroup layout = savesPanel.AddComponent<VerticalLayoutGroup>();
+        layout.padding = new RectOffset(14, 14, 10, 12);
+        layout.spacing = 8f;
+        layout.childForceExpandWidth = true;
+        layout.childForceExpandHeight = false;
+        ContentSizeFitter fitter = savesPanel.AddComponent<ContentSizeFitter>();
+        fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+        Text title = CreateHintLabel(savesPanel.transform, "Title", 18, Color.white);
+        title.text = "Saves — type a name, Enter or Save writes it; click a slot to load";
+
+        // The name row: the live field and the Save button side by side.
+        GameObject nameRow = new GameObject("NameRow", typeof(RectTransform));
+        nameRow.transform.SetParent(savesPanel.transform, false);
+        nameRow.AddComponent<LayoutElement>().minHeight = 40f;
+        HorizontalLayoutGroup nameLayout = nameRow.AddComponent<HorizontalLayoutGroup>();
+        nameLayout.spacing = 8f;
+        nameLayout.childForceExpandWidth = false;
+        nameLayout.childForceExpandHeight = true;
+
+        GameObject field = new GameObject("NameField", typeof(RectTransform));
+        field.transform.SetParent(nameRow.transform, false);
+        LayoutElement fieldLayout = field.AddComponent<LayoutElement>();
+        fieldLayout.minWidth = 300f;
+        fieldLayout.flexibleWidth = 1f;
+        Image fieldBg = field.AddComponent<Image>();
+        fieldBg.color = new Color(0f, 0f, 0f, 0.5f);
+        GameObject fieldTextObj = new GameObject("Label", typeof(RectTransform));
+        fieldTextObj.transform.SetParent(field.transform, false);
+        RectTransform fieldTextRt = fieldTextObj.GetComponent<RectTransform>();
+        fieldTextRt.anchorMin = Vector2.zero;
+        fieldTextRt.anchorMax = Vector2.one;
+        fieldTextRt.offsetMin = new Vector2(10f, 0f);
+        fieldTextRt.offsetMax = new Vector2(-10f, 0f);
+        saveNameText = fieldTextObj.AddComponent<Text>();
+        saveNameText.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        saveNameText.alignment = TextAnchor.MiddleLeft;
+        saveNameText.color = Color.white;
+        saveNameText.fontSize = 18;
+
+        CreateButton(nameRow.transform, "Save", CommitSave);
+
+        // The slot list rebuilds itself every time the panel opens or a
+        // save is written.
+        GameObject list = new GameObject("SlotList", typeof(RectTransform));
+        list.transform.SetParent(savesPanel.transform, false);
+        VerticalLayoutGroup listLayout = list.AddComponent<VerticalLayoutGroup>();
+        listLayout.spacing = 4f;
+        listLayout.childForceExpandWidth = true;
+        listLayout.childForceExpandHeight = false;
+        ContentSizeFitter listFitter = list.AddComponent<ContentSizeFitter>();
+        listFitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+        savesListParent = list.GetComponent<RectTransform>();
+
+        savesPanel.SetActive(false);
+    }
+
+    void ToggleSavesPanel()
+    {
+        if (ModalOpen)
+        {
+            CloseSavesPanel();
+            return;
+        }
+        ModalOpen = true;
+        // The field opens holding the current slot's name, so re-saving
+        // the save you're working in is one click.
+        saveName = CastleSave.CurrentSlot;
+        RefreshSavesPanel();
+        savesPanel.SetActive(true);
+        var keyboard = UnityEngine.InputSystem.Keyboard.current;
+        if (keyboard != null)
+            keyboard.onTextInput += OnSaveNameChar;
+    }
+
+    void CloseSavesPanel()
+    {
+        ModalOpen = false;
+        if (savesPanel != null)
+            savesPanel.SetActive(false);
+        var keyboard = UnityEngine.InputSystem.Keyboard.current;
+        if (keyboard != null)
+            keyboard.onTextInput -= OnSaveNameChar;
+    }
+
+    // Leaving play mode mid-panel must not leave the modal flag set or
+    // the keyboard hook attached for whoever runs next.
+    void OnDisable()
+    {
+        if (ModalOpen)
+            CloseSavesPanel();
+    }
+
+    // Slot names come in as raw typed characters; only filename-safe
+    // ones stick (CastleSave.SanitizeSlot is the same filter at commit,
+    // so what you see is what the file is called).
+    void OnSaveNameChar(char c)
+    {
+        if (!ModalOpen)
+            return;
+        if (!char.IsLetterOrDigit(c) && c != ' ' && c != '-' && c != '_')
+            return;
+        if (saveName.Length >= 30)
+            return;
+        saveName += c;
+        RefreshSaveNameText();
+    }
+
+    void CommitSave()
+    {
+        string slot = CastleSave.SanitizeSlot(saveName);
+        if (slot.Length == 0)
+        {
+            BuildLog.Add("Name the save first.");
+            return;
+        }
+        if (placementSystem != null)
+            placementSystem.SaveSlot(slot);
+        saveName = slot;
+        RefreshSavesPanel();
+    }
+
+    void RefreshSaveNameText()
+    {
+        saveNameText.text = saveName + "▌";
+    }
+
+    void RefreshSavesPanel()
+    {
+        RefreshSaveNameText();
+        foreach (Transform child in savesListParent)
+            Destroy(child.gameObject);
+        foreach ((string slot, System.DateTime time) in CastleSave.ListSlots())
+        {
+            string capturedSlot = slot;
+            GameObject row = CreateButton(savesListParent,
+                $"{slot}    —    {time:yyyy-MM-dd HH:mm}", () =>
+                {
+                    if (placementSystem != null)
+                        placementSystem.LoadSlot(capturedSlot);
+                    CloseSavesPanel();
+                });
+            row.GetComponent<LayoutElement>().minHeight = 36f;
+            Text label = row.GetComponentInChildren<Text>();
+            label.alignment = TextAnchor.MiddleLeft;
+            RectTransform labelRt = label.GetComponent<RectTransform>();
+            labelRt.offsetMin = new Vector2(10f, 0f);
+        }
     }
 
     // Top-right: what the keyboard means for the tool in hand, right now.
@@ -434,6 +628,24 @@ public class BuildMenu : MonoBehaviour
         if (!inBuildMode || placementSystem == null)
             return;
 
+        // The Saves panel owns the keyboard while it's open: Backspace
+        // edits the slot name, Enter commits the save. Characters arrive
+        // through the onTextInput hook, not here.
+        if (ModalOpen)
+        {
+            var kb = UnityEngine.InputSystem.Keyboard.current;
+            if (kb != null)
+            {
+                if (kb.backspaceKey.wasPressedThisFrame && saveName.Length > 0)
+                {
+                    saveName = saveName.Substring(0, saveName.Length - 1);
+                    RefreshSaveNameText();
+                }
+                if (kb.enterKey.wasPressedThisFrame || kb.numpadEnterKey.wasPressedThisFrame)
+                    CommitSave();
+            }
+        }
+
         int count = placementSystem.ActiveDragCount;
         if (count > 0)
             dragCountText.text = count == 1 ? "1 wall" : count + " walls";
@@ -443,18 +655,45 @@ public class BuildMenu : MonoBehaviour
         // offsetting), so the readout follows the tool. A stair takes its
         // climb from the wall it's against and a doorway takes its head
         // from a constant, so the dial says nothing in either.
-        bool building = placementSystem.Mode != GridPlacementSystem.ToolMode.Delete
+        // The slab tools dial tile size, not wall height, so their readout
+        // speaks tiles; the ghost-top elevation carries over unchanged.
+        bool slabTool = placementSystem.Mode == GridPlacementSystem.ToolMode.Foundation
+            || placementSystem.Mode == GridPlacementSystem.ToolMode.Floor;
+        bool building = !slabTool
+            && placementSystem.Mode != GridPlacementSystem.ToolMode.Delete
             && placementSystem.Mode != GridPlacementSystem.ToolMode.Stair
             && placementSystem.Mode != GridPlacementSystem.ToolMode.Door;
-        heightPanel.SetActive(building);
+        heightPanel.SetActive(building || slabTool);
+        if (slabTool)
+        {
+            float s = placementSystem.SlabSize;
+            float? tileTop = placementSystem.GhostTopY;
+            heightText.text = tileTop.HasValue
+                ? $"Tile {s:0.#}×{s:0.#}m  top {tileTop.Value:0.##}m"
+                : $"Tile {s:0.#}×{s:0.#}m";
+        }
         if (building)
         {
             // EffectiveWallHeight, not CurrentWallHeight: while snapped to
             // a wall the ghost adopts that wall's height, and the readout
-            // shows what would actually be built.
+            // shows what would actually be built. GhostTopY carries the
+            // ABSOLUTE elevation the ghost's top lands at — the number a
+            // rendezvous with another building's floor or roof dials
+            // against.
             float height = placementSystem.EffectiveWallHeight;
-            heightText.text = $"Height ×{height / placementSystem.BaseHeight:0.##}  ({height:0.##}m)";
+            float? top = placementSystem.GhostTopY;
+            heightText.text = top.HasValue
+                ? $"Height ×{height / placementSystem.BaseHeight:0.##}  ({height:0.##}m)  top {top.Value:0.##}m"
+                : $"Height ×{height / placementSystem.BaseHeight:0.##}  ({height:0.##}m)";
         }
+
+        // What the cursor is over, as absolute planes — visible with the
+        // same tools as the height readout, since matching is what both
+        // numbers are for.
+        string inspect = building || slabTool ? placementSystem.InspectLine : null;
+        if (!string.IsNullOrEmpty(inspect))
+            inspectText.text = inspect;
+        inspectPanel.SetActive(!string.IsNullOrEmpty(inspect));
 
         // The hint panel follows the tool's phase, so it re-reads only
         // when the context line changes rather than every frame.
@@ -489,13 +728,21 @@ public class BuildMenu : MonoBehaviour
         circleToggle.SetIsOnWithoutNotify(placementSystem.Shape == GridPlacementSystem.BuildShape.Circle);
         rectToggle.SetIsOnWithoutNotify(placementSystem.Shape == GridPlacementSystem.BuildShape.Rect);
         offsetToggle.SetIsOnWithoutNotify(placementSystem.Mode == GridPlacementSystem.ToolMode.Offset);
-        roomButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Room
-            ? selectedColor : buttonColor;
-        bool roomTool = placementSystem.Mode == GridPlacementSystem.ToolMode.Room;
-        foreach ((Image image, GridPlacementSystem.RoomAction task) in roomTaskButtons)
+        bool roomFamily = placementSystem.Mode == GridPlacementSystem.ToolMode.Room
+            || placementSystem.Mode == GridPlacementSystem.ToolMode.Foundation
+            || placementSystem.Mode == GridPlacementSystem.ToolMode.Floor;
+        roomButtonImage.color = roomFamily ? selectedColor : buttonColor;
+        foreach ((Image image, GridPlacementSystem.ToolMode mode) in roomTaskButtons)
             if (image != null)
-                image.color = roomTool && placementSystem.RoomTask == task
+                image.color = placementSystem.Mode == mode ? selectedColor : buttonColor;
+        groundButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Ground
+            ? selectedColor : buttonColor;
+        bool groundTool = placementSystem.Mode == GridPlacementSystem.ToolMode.Ground;
+        foreach ((Image image, GridPlacementSystem.GroundAction task) in groundTaskButtons)
+            if (image != null)
+                image.color = groundTool && placementSystem.GroundTask == task
                     ? selectedColor : buttonColor;
+        savesButtonImage.color = ModalOpen ? selectedColor : buttonColor;
         stairButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Stair
             ? selectedColor : buttonColor;
         doorButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Door
@@ -504,20 +751,67 @@ public class BuildMenu : MonoBehaviour
             ? deleteActiveColor : buttonColor;
     }
 
-    // The Room tool: chained wall placement that closes into a designated
-    // room (floor now, roof when the walls crown level). The active shape
-    // helper applies — Circle or Rectangle draws the whole room in one
-    // gesture. Its two jobs open in the item row like a category's
-    // contents: Build (the default) and Designate.
+    // Room: the building category. Its three jobs in the item row are the
+    // building tools in build order — Foundation (the slab that sets the
+    // level), Wall (the chain gesture that closes and announces an
+    // enclosure; Circle/Rectangle ride it), Floor (the between-storey
+    // tile). Opening the category arms Foundation, because a building
+    // starts from one.
     void ToggleRoomMode()
     {
         if (placementSystem == null)
             return;
 
-        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Room;
-        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Room : GridPlacementSystem.ToolMode.Build);
-        if (entering)
+        bool inFamily = placementSystem.Mode == GridPlacementSystem.ToolMode.Room
+            || placementSystem.Mode == GridPlacementSystem.ToolMode.Foundation
+            || placementSystem.Mode == GridPlacementSystem.ToolMode.Floor;
+        if (inFamily)
+        {
+            placementSystem.SetMode(GridPlacementSystem.ToolMode.Build);
+            itemRow.gameObject.SetActive(false);
+            openCategory = null;
+        }
+        else
+        {
+            placementSystem.SetMode(GridPlacementSystem.ToolMode.Foundation);
             ShowRoomTasks();
+        }
+    }
+
+    void ShowRoomTasks()
+    {
+        openCategory = null;
+        roomTaskButtons.Clear();
+        foreach (Transform child in itemRow)
+            Destroy(child.gameObject);
+        AddRoomTaskButton("Foundation", GridPlacementSystem.ToolMode.Foundation);
+        AddRoomTaskButton("Wall", GridPlacementSystem.ToolMode.Room);
+        AddRoomTaskButton("Floor", GridPlacementSystem.ToolMode.Floor);
+        itemRow.gameObject.SetActive(true);
+    }
+
+    void AddRoomTaskButton(string label, GridPlacementSystem.ToolMode mode)
+    {
+        GameObject button = CreateButton(itemRow, label, () =>
+        {
+            if (placementSystem != null)
+                placementSystem.SetMode(mode);
+        });
+        roomTaskButtons.Add((button.GetComponent<Image>(), mode));
+    }
+
+    // Ground: earthworks under the deviation law. Two jobs in the item
+    // row, like Room's: Path (bench a walkable band, the default) and
+    // Restore (return ground to the natural hill).
+    void ToggleGroundMode()
+    {
+        if (placementSystem == null)
+            return;
+
+        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Ground;
+        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Ground : GridPlacementSystem.ToolMode.Build);
+        if (entering)
+            ShowGroundTasks();
         else
         {
             itemRow.gameObject.SetActive(false);
@@ -525,27 +819,25 @@ public class BuildMenu : MonoBehaviour
         }
     }
 
-    // Build chains walls into a new room; Designate hands an EXISTING
-    // enclosure a floor and roof, and only runs while it's picked.
-    void ShowRoomTasks()
+    void ShowGroundTasks()
     {
         openCategory = null;
-        roomTaskButtons.Clear();
+        groundTaskButtons.Clear();
         foreach (Transform child in itemRow)
             Destroy(child.gameObject);
-        AddRoomTaskButton("Build", GridPlacementSystem.RoomAction.Build);
-        AddRoomTaskButton("Designate", GridPlacementSystem.RoomAction.Designate);
+        AddGroundTaskButton("Path", GridPlacementSystem.GroundAction.Path);
+        AddGroundTaskButton("Restore", GridPlacementSystem.GroundAction.Restore);
         itemRow.gameObject.SetActive(true);
     }
 
-    void AddRoomTaskButton(string label, GridPlacementSystem.RoomAction task)
+    void AddGroundTaskButton(string label, GridPlacementSystem.GroundAction task)
     {
         GameObject button = CreateButton(itemRow, label, () =>
         {
             if (placementSystem != null)
-                placementSystem.SetRoomTask(task);
+                placementSystem.SetGroundTask(task);
         });
-        roomTaskButtons.Add((button.GetComponent<Image>(), task));
+        groundTaskButtons.Add((button.GetComponent<Image>(), task));
     }
 
     // Stairs: no gesture and no sub-jobs, so the item row stays shut —
@@ -662,7 +954,6 @@ public class BuildMenu : MonoBehaviour
         }
 
         openCategory = category.categoryName;
-        roomTaskButtons.Clear();
         foreach (Transform child in itemRow)
             Destroy(child.gameObject);
 

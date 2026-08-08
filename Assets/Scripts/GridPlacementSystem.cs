@@ -79,16 +79,21 @@ public class GridPlacementSystem : MonoBehaviour
     // instead of the top riding the ground section by section.
     public bool lockTopHeight;
 
-    public enum ToolMode { Build, Delete, Offset, Room, Stair, Door }
+    public enum ToolMode { Build, Delete, Offset, Room, Stair, Door, Ground, Foundation, Floor }
     public ToolMode Mode { get; private set; } = ToolMode.Build;
 
-    // The Room tool's two jobs, picked in the menu. Build chains walls
-    // into a new room. Designate hands an EXISTING enclosure a floor and
-    // roof — the answer to "I fixed the wall and nothing re-checked" —
-    // and runs ONLY when it's selected, so an ordinary room-building
-    // click can never designate something by accident.
-    public enum RoomAction { Build, Designate }
-    public RoomAction RoomTask { get; private set; } = RoomAction.Build;
+    // The Ground tool's two jobs. Path benches a graded walkable band
+    // along a drag (Shift holds the anchor's height instead — a level
+    // path); Restore returns a band to the natural hill — the undo for
+    // every earthwork. Both obey the deviation law.
+    public enum GroundAction { Path, Restore }
+    public GroundAction GroundTask { get; private set; } = GroundAction.Path;
+
+    // The Room tool is a chain gesture and nothing more since the
+    // building rebuild (Docs/BuildingRebuild.md): closing a loop
+    // ANNOUNCES the enclosure (Enclosure.AnnounceChainClose) but derives
+    // no floor or roof — foundations, floors and roofs are the player's
+    // own authored slabs.
 
     // Straight and Curved shape the wall tool's drag; Circle and Rect are
     // whole-figure gestures (center-out ring, corner-to-corner box) that
@@ -103,7 +108,18 @@ public class GridPlacementSystem : MonoBehaviour
 
     public float HeightMultiplier => heightMultiplier;
     public float BaseHeight => placementYOffset * 2f;
-    public float CurrentWallHeight => BaseHeight * heightMultiplier;
+    // The dialed height LANDS on the quarter-metre grid (heightScrollRate),
+    // it doesn't just move by it: fractional trackpad notches accumulate in
+    // the multiplier, and absolute tops must rendezvous exactly. Footings
+    // sit on the half-metre grid, so a gridded height puts every free-built
+    // top on the quarter lattice — floors seat on the same lattice
+    // (SlabTile.FloorStep), which is what lets one building's roof meet
+    // another's floor by scrolling instead of luck. Snapped adoption still
+    // copies exact heights (EffectiveWallHeight): matching a neighbour IS
+    // alignment and beats the grid.
+    public float CurrentWallHeight => heightScrollRate > 0f
+        ? Mathf.Round(BaseHeight * heightMultiplier / heightScrollRate) * heightScrollRate
+        : BaseHeight * heightMultiplier;
 
     // The height the active ghost actually builds at: a snapped ghost
     // adopts the snapped wall's exact height (a scrolled height would
@@ -118,7 +134,8 @@ public class GridPlacementSystem : MonoBehaviour
                 return CurrentWallHeight;
             if (anchorSnapHeight.HasValue)
                 return anchorSnapHeight.Value;
-            if (dragEndSnap.HasValue && dragEndSnap.Value.edge != null)
+            if (dragEndSnap.HasValue && dragEndSnap.Value.edge != null
+                && !dragEndSnap.Value.noHeightAdopt)
                 return SnapHeightOf(dragEndSnap.Value.edge, dragEndSnap.Value.point);
             if (hoverSnapHeight.HasValue)
                 return hoverSnapHeight.Value;
@@ -142,6 +159,21 @@ public class GridPlacementSystem : MonoBehaviour
             : edge.baseY;
         return Mathf.Max(0.25f, edge.fixedTopY - floor);
     }
+
+    // The absolute elevation the active ghost's top will land at — set by
+    // the preview builders from the SAME numbers the commit writes
+    // (capture-at-anchor planes, stack fits), so ghost = commit extends to
+    // the readout. Null when nothing is being ghosted. On an unlocked
+    // terrain run the tops step per section; the readout reports the top
+    // at the ANCHOR cell — the number you dial against.
+    public float? GhostTopY => ghostTopY;
+    private float? ghostTopY;
+
+    // What the cursor is over, as absolute planes read from STORED data
+    // (section tops, a room's floor/roof) — never from hit geometry, so
+    // the cutaway's sliced colliders can't misreport them. Purely a
+    // readout; no tool logic reads it.
+    public string InspectLine { get; private set; }
 
     // How many sections the active preview will actually lay down —
     // 0 when idle or refused, so the HUD counter can show/hide off this
@@ -197,6 +229,10 @@ public class GridPlacementSystem : MonoBehaviour
         // masonry (half a thickness for flank snaps) — the ghost starts
         // past it, at the visible face.
         public float stubTrim;
+        // A building landing (the never-cross-into-a-building clamp):
+        // the run's dialed height is sacred there — landing on a first
+        // storey must NOT shrink a second-storey run to match it.
+        public bool noHeightAdopt;
     }
 
     private readonly List<GameObject> ghostPool = new List<GameObject>();
@@ -245,6 +281,12 @@ public class GridPlacementSystem : MonoBehaviour
     private Transform splineParent;
     private float currentYRotation;
     private float heightMultiplier = 1f;
+    // The slab tools (Foundation / Floor): tile edge length, dialed by
+    // Ctrl+scroll like the Ground tool's brush, and the free tile's
+    // bearing, stepped by R. Snapped tiles adopt the host's yaw instead.
+    private float slabSize = 2f;
+    private float slabYaw;
+    public float SlabSize => slabSize;
     private float curveBulge;
     private float curveApexT = 0.5f;
     private Vector3? splineStart;
@@ -258,7 +300,7 @@ public class GridPlacementSystem : MonoBehaviour
     // everything whose center lands inside dies on release.
     private Vector2? marqueeStart;
     private Vector2? marqueeEnd;
-    private readonly List<WallRoom> marqueeRooms = new List<WallRoom>();
+    private readonly List<SlabTile> marqueeSlabs = new List<SlabTile>();
     private WallEdge offsetSource;
     private float offsetDistance = 3f;
     private float offsetSide = 1f;
@@ -292,6 +334,29 @@ public class GridPlacementSystem : MonoBehaviour
     private readonly List<Mesh> roomFixedMeshes = new List<Mesh>();
     private readonly List<WallEdge.SectionSpec> roomLiveSpecs = new List<WallEdge.SectionSpec>();
     private readonly List<Mesh> roomLiveMeshes = new List<Mesh>();
+
+    // Ground tool gesture: one drag = one bench or restore band.
+    private Vector3? groundAnchor;
+    // The anchor's ground height, captured at the click — the live
+    // preview deforms the terrain under the anchor itself, so sampling
+    // mid-drag would read the bench back instead of the hill.
+    private float groundAnchorY;
+    private Vector3? restorePaintLast;
+    private float restorePainted;
+    // Preview throttle: re-deform only when the drag meaningfully moved.
+    private Vector3 groundPreviewB;
+    private float groundPreviewYb, groundPreviewW;
+    private bool groundPreviewLive;
+    private Mesh groundGhostMesh;
+    private Mesh groundGhostCutMesh;
+    private Mesh brushGhostMesh;
+    // Ctrl+scroll dials these, like wall height — 0.5m per notch within
+    // honest bounds: a footpath to a road, a touch-up to a broad sweep.
+    public float pathWidth = 2.5f;
+    public float restoreBrushRadius = 4f;
+    const float MinPathWidth = 1.5f, MaxPathWidth = 10f;
+    const float MinBrushRadius = 1.5f, MaxBrushRadius = 12f;
+
     private (Vector3 a, Vector3 b, float h, float topY, float trimA, float trimB)? lastRoomKey;
     private bool roomLiveBlocked;
     private bool roomLiveClosing;
@@ -321,6 +386,9 @@ public class GridPlacementSystem : MonoBehaviour
     // host's. Recomputing later would silently use the HUD height (the
     // hover snap is gone by the drag frames) and miss by a step.
     private float shapeTopY = float.NegativeInfinity;
+    // The anchor's stepped ground — the plane a terrain figure's tops
+    // stand on (plus the dialed height). Ground is never moved.
+    private float shapePadY;
     // White alignment lines: shown whenever a point being placed lines
     // up with existing masonry.
     private readonly List<(Vector3 from, Vector3 to)> alignLines =
@@ -454,8 +522,11 @@ public class GridPlacementSystem : MonoBehaviour
         // merely stopping: a frozen Update would leave a half-drawn
         // gesture live, a ghost standing in the air, and the cutaway
         // still slicing — and a sliced wall's collider is sliced with it,
-        // so a cut castle is one you walk straight through.
-        if (WalkMode.Active)
+        // so a cut castle is one you walk straight through. The Saves
+        // panel stands the tool down the same way: it captures the
+        // keyboard for slot names, and a tool that kept reading R, C and
+        // F5 under someone's typing would act on their spelling.
+        if (WalkMode.Active || BuildMenu.ModalOpen)
         {
             if (!stoodDown)
             {
@@ -490,8 +561,7 @@ public class GridPlacementSystem : MonoBehaviour
         }
         if (keyboard != null && keyboard.f9Key.wasPressedThisFrame)
         {
-            StandDown();
-            CastleSave.Load(CastleSave.DefaultPath, splineParent, wallMaterial);
+            LoadSlot(CastleSave.CurrentSlot);
             return;
         }
 
@@ -513,6 +583,7 @@ public class GridPlacementSystem : MonoBehaviour
         hoverBaseY = null;
         hoverSnapBase = null;
         pendingNodeGhosts.Clear();
+        ghostTopY = null;
 
         if (Mode == ToolMode.Delete)
             UpdateDelete(mouse, keyboard, ray, overUI);
@@ -525,16 +596,20 @@ public class GridPlacementSystem : MonoBehaviour
         // Nor does the door tool: point at a wall, the opening is there.
         else if (Mode == ToolMode.Door)
             UpdateDoor(mouse, ray, overUI);
-        // Designating has no gesture, so it outranks the shape helpers —
-        // an armed Circle or Rectangle has nothing to do with it.
-        else if (Mode == ToolMode.Room && RoomTask == RoomAction.Designate)
-            UpdateRoomDesignate(mouse, ray, overUI);
+        // Ground has one gesture for both jobs: drag a line on terrain.
+        else if (Mode == ToolMode.Ground)
+            UpdateGround(mouse, ray, overUI);
+        // The slab tools place one tile per click — no drag, no shapes.
+        else if (Mode == ToolMode.Foundation || Mode == ToolMode.Floor)
+            UpdateSlab(mouse, keyboard, ray, overUI);
         else if (Shape == BuildShape.Circle || Shape == BuildShape.Rect)
             UpdateShapeGesture(mouse, keyboard, ray, overUI, Mode == ToolMode.Room);
         else if (Mode == ToolMode.Room)
             UpdateRoom(mouse, keyboard, ray, overUI);
         else
             UpdateBuild(mouse, keyboard, ray, overUI);
+
+        InspectLine = overUI ? null : InspectElevations(ray);
 
         // A scrolled height override lives as long as its context — the
         // active drag, or the hovered snap it was scrolled against.
@@ -560,10 +635,10 @@ public class GridPlacementSystem : MonoBehaviour
         if (Mode == mode)
             return;
         Mode = mode;
-        // Entering the Room tool always starts on Build — designating is
-        // a deliberate pick, never a state you return to unawares.
-        if (mode == ToolMode.Room)
-            RoomTask = RoomAction.Build;
+        // Entering the Ground tool always starts on Path — restoring is
+        // a deliberate pick, exactly like Designate.
+        if (mode == ToolMode.Ground)
+            GroundTask = GroundAction.Path;
         offsetSource = null;
         CancelCurve();
         CancelShape();
@@ -571,6 +646,7 @@ public class GridPlacementSystem : MonoBehaviour
         CancelDelete();
         CancelStair();
         CancelDoor();
+        CancelGround();
     }
 
     // Everything the tool has on screen or half-finished, put away — run
@@ -586,6 +662,7 @@ public class GridPlacementSystem : MonoBehaviour
         CancelDelete();
         CancelStair();
         CancelDoor();
+        CancelGround();
         HideGhosts();
         ClearPreviewMeshes();
 
@@ -602,6 +679,11 @@ public class GridPlacementSystem : MonoBehaviour
         hoverSnapBase = null;
         heightOverride = false;
         ClaimingScrollWheel = false;
+        // Walk mode hides the HUD, but the Saves panel doesn't — a stale
+        // inspect line or ghost-top under the open panel would report a
+        // hover that no longer exists.
+        InspectLine = null;
+        ghostTopY = null;
 
         UpdateDistanceGuides();
         UpdateAlignGuides();
@@ -609,6 +691,23 @@ public class GridPlacementSystem : MonoBehaviour
         UpdateNodeGhostVisuals();
 
         CutawayView.Clear(splineParent);
+    }
+
+    // The Saves panel's two doors — slot-aware wrappers that keep
+    // splineParent and wallMaterial private. Saving or loading a slot
+    // makes it the CURRENT slot, so F5/F9 keep acting on the save you
+    // were last working in.
+    public void SaveSlot(string slot)
+    {
+        CastleSave.CurrentSlot = slot;
+        CastleSave.Save(CastleSave.PathFor(slot));
+    }
+
+    public void LoadSlot(string slot)
+    {
+        StandDown();
+        if (CastleSave.Load(CastleSave.PathFor(slot), splineParent, wallMaterial))
+            CastleSave.CurrentSlot = slot;
     }
 
     // What the keyboard means RIGHT NOW, for the HUD's modifier panel.
@@ -671,11 +770,45 @@ public class GridPlacementSystem : MonoBehaviour
             lines.Add("Click — cut it through");
             lines.Add("Delete tool, click a doorway's stone — fill it in");
         }
-        else if (Mode == ToolMode.Room && RoomTask == RoomAction.Designate)
+        else if (Mode == ToolMode.Foundation)
         {
-            context = "Room · Designate";
-            lines.Add("Click an outlined enclosure — make it a room");
-            lines.Add("(no modifiers in this mode)");
+            context = "Foundation";
+            lines.Add("Click — place a tile (snaps to the patch, adopts its level)");
+            lines.Add($"Ctrl + scroll — tile size ({slabSize:0.#}m)");
+            lines.Add("R — turn a free tile");
+            lines.Add("Alt — break the snap, start a new level");
+            lines.Add("Red — mostly buried, or overlapping a tile");
+        }
+        else if (Mode == ToolMode.Floor)
+        {
+            context = "Floor";
+            lines.Add("Point at a wall top — seed a floor at its plane");
+            lines.Add("Point at a floor tile — grow it edge to edge");
+            lines.Add($"Ctrl + scroll — tile size ({slabSize:0.#}m)");
+            lines.Add("Red — nothing to connect to, or overlapping");
+        }
+        else if (Mode == ToolMode.Ground)
+        {
+            // Grade is whatever you draw, and the deviation law is not
+            // a setting.
+            if (GroundTask == GroundAction.Restore)
+            {
+                context = restorePaintLast.HasValue ? "Ground · Restore · sweeping" : "Ground · Restore";
+                lines.Add("Hold and sweep — paint ground back to the natural hill");
+                lines.Add($"Ctrl + scroll — brush size ({restoreBrushRadius:0.0}m)");
+                lines.Add("(stops short of standing walls)");
+            }
+            else
+            {
+                context = groundAnchor.HasValue ? "Ground · Path · drag" : "Ground · Path";
+                lines.Add("Drag a line — bench a walkable path (the ground moves live)");
+                lines.Add("Hold Shift — hold the anchor's height (a level path)");
+                lines.Add($"Ctrl + scroll — path width ({pathWidth:0.0}m)");
+                lines.Add("Blue — earth raised. Red — earth cut.");
+                if (groundAnchor.HasValue)
+                    lines.Add("Esc — cancel, the hill comes back");
+                lines.Add($"(ground moves at most {TerrainPads.MaxDeviation:0}m from natural)");
+            }
         }
         else if (Shape == BuildShape.Circle || Shape == BuildShape.Rect)
         {
@@ -718,7 +851,7 @@ public class GridPlacementSystem : MonoBehaviour
         else if (Mode == ToolMode.Room)
         {
             bool chaining = roomChain.Count > 0;
-            context = chaining ? "Room · Build · chaining" : "Room · Build";
+            context = chaining ? "Room · chaining" : "Room";
             if (chaining)
                 lines.Add("Shift — 5° steps from the last corner");
             lines.Add("Alt — free placement (no snapping or stepping)");
@@ -800,14 +933,12 @@ public class GridPlacementSystem : MonoBehaviour
         hints = string.Join("\n", lines);
     }
 
-    // Switching jobs abandons a half-drawn chain, like switching tools.
-    public void SetRoomTask(RoomAction task)
+    public void SetGroundTask(GroundAction task)
     {
-        if (RoomTask == task)
+        if (GroundTask == task)
             return;
-        RoomTask = task;
-        CancelRoomChain();
-        CancelShape();
+        GroundTask = task;
+        CancelGround();
     }
 
     public void SetShape(BuildShape shape)
@@ -985,6 +1116,12 @@ public class GridPlacementSystem : MonoBehaviour
                         AddExtensionAlignGuides(splineEnd.Value);
                     }
                 }
+
+                // The old never-cross-into-a-building landing, the floor
+                // step and the partition tell died with derived rooms
+                // (Docs/BuildingRebuild.md): buildings stand on foundation
+                // slabs now, so their walls live on a slab storey the
+                // terrain gesture's planar graph never meets.
             }
 
             Vector3 anchor = splineStart.Value;
@@ -1432,13 +1569,13 @@ public class GridPlacementSystem : MonoBehaviour
             foreach ((Vector3 s, Vector3 c, Vector3 e, float height, float topY, float baseY,
                 float skirt) in pendingCommits)
                 WallGraph.CommitEdge(splineParent, s, c, e,
-                    EdgeParamsNow(height, topY, baseY, false, skirt));
+                    EdgeParamsNow(height, topY, baseY, skirt));
         }
         CancelCurve();
     }
 
     WallGraph.EdgeParams EdgeParamsNow(float height, float topY,
-        float baseY = float.NegativeInfinity, bool roomBuilt = false, float skirt = 0f)
+        float baseY = float.NegativeInfinity, float skirt = 0f)
     {
         return new WallGraph.EdgeParams
         {
@@ -1451,7 +1588,6 @@ public class GridPlacementSystem : MonoBehaviour
             baseY = baseY,
             skirt = skirt,
             material = wallMaterial,
-            roomBuilt = roomBuilt,
         };
     }
 
@@ -1471,10 +1607,12 @@ public class GridPlacementSystem : MonoBehaviour
             if (hit.collider.isTrigger)
                 continue;
             point = new Vector3(hit.point.x, 0f, hit.point.z);
-            WallRoom room = hit.collider.GetComponentInParent<WallRoom>();
-            if (room != null)
+            // A slab tile is elevated ground: building on it is
+            // free-form (no ride lock).
+            SlabTile slab = hit.collider.GetComponent<SlabTile>();
+            if (slab != null)
             {
-                deckY = hit.collider.gameObject.name == "RoomRoof" ? room.roofY : room.floorY;
+                deckY = slab.topY;
                 hoverSnapBase = deckY;
                 return true;
             }
@@ -1612,11 +1750,15 @@ public class GridPlacementSystem : MonoBehaviour
                 // The deck under the cursor, or a snapped elevated wall's
                 // own storey — either way the figure builds from there.
                 shapeBaseY = hoverBaseY;
-                // Plane captured NOW, while the hover snap still feeds
-                // EffectiveWallHeight — a snapped figure locks exactly
-                // onto the host's plane.
+                // On terrain the anchor's plane is the whole figure's:
+                // tops at the anchor's stepped ground plus the dialed
+                // height. The ground itself is never moved — a ROOM
+                // figure refuses only ground above that top plane.
+                // Captured NOW, while the hover snap still feeds
+                // EffectiveWallHeight.
+                shapePadY = SampleCellGroundY(point.x, point.z);
                 shapeTopY = hoverBaseY.HasValue
-                    ? float.NegativeInfinity : LockedTopFor(point);
+                    ? float.NegativeInfinity : shapePadY + EffectiveWallHeight;
             }
             return;
         }
@@ -1987,6 +2129,10 @@ public class GridPlacementSystem : MonoBehaviour
     {
         float height = ShapeHeight();
         float topY = shapeTopY;
+        // Terrain figures captured their plane at the anchor; deck figures
+        // stand flat on the deck. Set before the cache check.
+        ghostTopY = !float.IsNegativeInfinity(topY) ? topY
+            : shapeBaseY.HasValue ? shapeBaseY.Value + height : ghostTopY;
         var key = (keyA, keyB, keyW, height, topY);
         if (lastShapeKey.HasValue && lastShapeKey.Value == key)
             return;
@@ -2012,8 +2158,12 @@ public class GridPlacementSystem : MonoBehaviour
                 continue;
             if (coverage > 0.05f)
                 shapeBlocked = true;
+            // Terrain figures preview fitted to the real ground — rooms
+            // never move earth, so the slope the ghost stands on is the
+            // slope the commit builds on.
+            float floor = shapeBaseY ?? float.NegativeInfinity;
             shapeSpecs.AddRange(WallEdge.BuildSpecs(s, c, e, height,
-                gridSize, gridSize, baseStepSize, BaseHeight, topY, shapeBase));
+                gridSize, gridSize, baseStepSize, BaseHeight, topY, floor));
             foreach (WallGraph.Crossing x in WallGraph.FindCrossings(s, c, e, shapeBase))
                 shapeCrossings.Add(x.point);
         }
@@ -2038,12 +2188,12 @@ public class GridPlacementSystem : MonoBehaviour
             ghostPool[i].SetActive(false);
     }
 
-    void CommitShape(bool designate)
+    void CommitShape(bool announce)
     {
         WallEdge lastEdge = null;
         int reused = 0;
         WallGraph.EdgeParams p = EdgeParamsNow(ShapeHeight(), shapeTopY,
-            shapeBaseY ?? float.NegativeInfinity, designate);
+            shapeBaseY ?? float.NegativeInfinity);
         foreach ((Vector3 s, Vector3 c, Vector3 e) in shapeEdgesLive)
         {
             // Re-derived rather than read from preview state, so the
@@ -2063,8 +2213,8 @@ public class GridPlacementSystem : MonoBehaviour
                 : $"Reused existing walls as {reused} sides.");
         // ShapeEdges runs counter-clockwise, so the interior is on the
         // left of the last edge's own direction.
-        if (designate && lastEdge != null)
-            TryDesignateRoom(lastEdge, true);
+        if (announce && lastEdge != null)
+            Enclosure.AnnounceChainClose(lastEdge, true);
     }
 
     void CancelShape()
@@ -2092,7 +2242,7 @@ public class GridPlacementSystem : MonoBehaviour
     // whole chain stays a ghost until it CLOSES: the far end lands on the
     // chain's own start, or on existing masonry connected back to the
     // start attachment — then every segment commits through the graph at
-    // once and the enclosed face designates a WallRoom. Escape abandons
+    // once and the enclosed face is announced. Escape abandons
     // the chain and leaves nothing. Segments never cross walls: a drag
     // over one clamps to the first crossing point (a T at commit, and
     // often the closure itself).
@@ -2170,8 +2320,14 @@ public class GridPlacementSystem : MonoBehaviour
                 // The deck under the cursor, or a snapped elevated wall's
                 // own storey — the whole chain builds from there.
                 roomChainBaseY = hoverBaseY;
+                // On terrain the anchor names the room's plane: tops at
+                // this stepped ground plus the dialed height. The ground
+                // itself is never moved — the chain refuses only ground
+                // standing above that top plane (buried walls); dips and
+                // bumps below it are the floor's job.
                 roomChainTopY = hoverBaseY.HasValue
-                    ? float.NegativeInfinity : LockedTopFor(point);
+                    ? float.NegativeInfinity
+                    : SampleCellGroundY(point.x, point.z) + roomChainHeight;
             }
             return;
         }
@@ -2310,85 +2466,6 @@ public class GridPlacementSystem : MonoBehaviour
             // Off-target frames (HUD, sky) keep the chain visible.
             ShowRoomGhosts();
         }
-    }
-
-    // Designate mode: no gesture at all. The cursor asks the graph which
-    // face it stands in, an eligible one outlines in white, and a click
-    // hands it a floor and a roof. A refused click SAYS which of the
-    // three reasons applied — silence would read as a broken button.
-    void UpdateRoomDesignate(Mouse mouse, Ray ray, bool overUI)
-    {
-        HideGhosts();
-        if (overUI || !TryGetBuildSurface(ray, out Vector3 raw, out float? deckY))
-            return;
-        List<WallGraph.DirEdge> face = DesignatableFaceAt(raw, out string why);
-        if (face != null)
-        {
-            OutlineFace(face);
-            snapTint = true;
-        }
-        if (!mouse.leftButton.wasPressedThisFrame)
-            return;
-        if (face != null)
-            WallRoom.Create(splineParent, face, wallMaterial, baseStepSize, BaseHeight);
-        else
-            BuildLog.Add(why);
-    }
-
-    // The enclosure under the cursor that a click may designate: an
-    // interior face, not already a room, whose walls the ROOM tool laid.
-    // Provenance is judged by LENGTH, so a room that borrows a span of
-    // someone else's masonry still qualifies while a bailey ringed by
-    // curtain walls never does, however room-shaped it looks.
-    List<WallGraph.DirEdge> DesignatableFaceAt(Vector3 point, out string why)
-    {
-        why = "Nothing to designate — the cursor isn't inside an enclosure.";
-        List<WallGraph.DirEdge> face = WallGraph.FaceAt(point);
-        if (face == null)
-            return null;
-        foreach (WallRoom room in WallRoom.All)
-            if (!room.broken && room.ContainsPoint(point))
-            {
-                why = "That enclosure is already a room.";
-                return null;
-            }
-        float mine = 0f;
-        float total = 0f;
-        foreach (WallGraph.DirEdge d in face)
-        {
-            if (d.edge == null)
-                return null;
-            float len = FlatDistance(d.edge.A, d.edge.B);
-            total += len;
-            if (d.edge.roomBuilt)
-                mine += len;
-        }
-        if (total < 0.01f || mine <= total * 0.5f)
-        {
-            why = "Not a room: these walls were laid with the wall tool."
-                + " Only an enclosure the room tool built can be designated.";
-            return null;
-        }
-        why = null;
-        return face;
-    }
-
-    // The face drawn as guide lines — the "click to designate"
-    // affordance, in the same white as the alignment ties. Drawn on the
-    // FOOTPRINT, not the ring: the ring runs down the middle of the
-    // masonry, where a guide line is buried inside the wall and invisible.
-    void OutlineFace(List<WallGraph.DirEdge> ring)
-    {
-        float inset = 0.5f;
-        foreach (WallGraph.DirEdge d in ring)
-            if (d.edge != null)
-            {
-                inset = d.edge.thickness * 0.5f;
-                break;
-            }
-        List<Vector3> poly = WallRoom.FaceFootprint(ring, inset);
-        for (int i = 0; i < poly.Count; i++)
-            alignLines.Add((poly[i], poly[(i + 1) % poly.Count]));
     }
 
     // ------------------------------------------------------------------
@@ -2735,7 +2812,6 @@ public class GridPlacementSystem : MonoBehaviour
         BuildLog.Add($"Stair — {stair.StepCount} steps, {stair.Rise:0.0}m rise,"
             + $" {landing:0.0}m landing.");
         // A stair that arrives at a roofed deck opens its own way through.
-        WallRoom.NotifyStairBuilt(stair);
         CancelStair();
     }
 
@@ -2784,7 +2860,9 @@ public class GridPlacementSystem : MonoBehaviour
         // interior ground, so on a slope it is metres above the downhill
         // wall's footing.
         float ground = MasonryFloorAt(sec);
-        doorSill = Mathf.Max(ground, WallRoom.FloorServing(doorHost));
+        // A wall on a slab bottoms at the slab, so its ground IS the
+        // floor it serves — sills no longer need a room to raise them.
+        doorSill = ground;
         doorStep = doorSill - ground;
         doorRefusal = DoorRefusal(doorHost, doorT, sec);
         doorBlocked = doorRefusal != null;
@@ -2949,6 +3027,10 @@ public class GridPlacementSystem : MonoBehaviour
 
     void BuildRoomLivePreview(Vector3 a, Vector3 b, float trimStart = 0f, float trimEnd = 0f)
     {
+        // The chain captured its plane at the anchor; a deck chain stands
+        // flat on the deck. Set before the cache check.
+        ghostTopY = !float.IsNegativeInfinity(roomChainTopY) ? roomChainTopY
+            : roomChainBaseY.HasValue ? roomChainBaseY.Value + roomChainHeight : ghostTopY;
         var key = (a, b, roomChainHeight, roomChainTopY, trimStart, trimEnd);
         if (lastRoomKey.HasValue && lastRoomKey.Value == key)
             return;
@@ -2958,7 +3040,20 @@ public class GridPlacementSystem : MonoBehaviour
             Destroy(m);
         roomLiveMeshes.Clear();
         roomLiveSpecs.Clear();
-        Vector3 mid = (a + b) * 0.5f;
+        AppendRoomSegmentSpecs(a, b, trimStart, trimEnd, roomChainTopY, roomLiveSpecs);
+        foreach (WallEdge.SectionSpec spec in roomLiveSpecs)
+            roomLiveMeshes.Add(spec.mesh);
+        roomLiveBlocked = WallGraph.OverlapsExisting(a, (a + b) * 0.5f, b,
+            roomChainBaseY ?? float.NegativeInfinity);
+    }
+
+    // One chain segment's section specs at the chain's plane. Terrain
+    // chains preview fitted to the real ground — rooms never move
+    // earth, so the slope the ghost stands on is the slope the commit
+    // builds on (a legal footprint is level within the base course).
+    void AppendRoomSegmentSpecs(Vector3 a, Vector3 b, float trimStart, float trimEnd,
+        float top, List<WallEdge.SectionSpec> into)
+    {
         Vector3 da = a, db = b;
         if (trimStart > 0.001f || trimEnd > 0.001f)
         {
@@ -2975,16 +3070,13 @@ public class GridPlacementSystem : MonoBehaviour
             db = b - dir * trimEnd;
         }
         // Same burial a stacked wall gets, so the ghost shows the joint the
-        // commit will actually build.
-        float liveBase = roomChainBaseY ?? float.NegativeInfinity;
-        float liveTop = roomChainTopY;
-        StackFit(null, a, b, roomChainHeight, liveBase, out float liveSkirt, ref liveTop);
-        roomLiveSpecs.AddRange(WallEdge.BuildSpecs(da, (da + db) * 0.5f, db, roomChainHeight,
-            gridSize, gridSize, baseStepSize, BaseHeight, liveTop, liveBase - liveSkirt));
-        foreach (WallEdge.SectionSpec spec in roomLiveSpecs)
-            roomLiveMeshes.Add(spec.mesh);
-        roomLiveBlocked = WallGraph.OverlapsExisting(a, mid, b,
-            roomChainBaseY ?? float.NegativeInfinity);
+        // commit will actually build. Terrain chains sample the ground.
+        float segBase = roomChainBaseY ?? float.NegativeInfinity;
+        StackFit(null, a, b, roomChainHeight, segBase, out float segSkirt, ref top);
+        float floor = roomChainBaseY.HasValue
+            ? segBase - segSkirt : float.NegativeInfinity;
+        into.AddRange(WallEdge.BuildSpecs(da, (da + db) * 0.5f, db, roomChainHeight,
+            gridSize, gridSize, baseStepSize, BaseHeight, top, floor));
     }
 
     // A click fixed the live segment: its specs and meshes move to the
@@ -3003,13 +3095,16 @@ public class GridPlacementSystem : MonoBehaviour
     // would close the loop (red when refused).
     void ShowRoomGhosts()
     {
+        // A law warning is about the ROOM, not the segment being drawn —
+        // the whole chain reds together.
+        Color fixedTint = previewColor;
         int shown = 0;
         foreach (WallEdge.SectionSpec spec in roomFixedSpecs)
         {
             GameObject ghost = GetPooled(ghostPool, shown++, previewColor, "PlacementPreview");
             ghost.SetActive(true);
             SetGhostMesh(ghost, spec.mesh);
-            SetGhostTint(ghost, previewColor);
+            SetGhostTint(ghost, fixedTint);
             ghost.transform.SetPositionAndRotation(spec.position, Quaternion.Euler(0f, spec.yaw, 0f));
             ghost.transform.localScale = Vector3.one;
         }
@@ -3030,9 +3125,8 @@ public class GridPlacementSystem : MonoBehaviour
 
     // Closes the loop: every chain segment commits through the graph in
     // order (splitting whatever it tees into), then the enclosed face is
-    // traced from the last chain edge and designated a WallRoom. The
-    // chain's own winding picks the trace side, so the room is the face
-    // the player drew around, not its complement.
+    // traced from the last chain edge and ANNOUNCED — the check, without
+    // the derivation. The chain's own winding picks the trace side.
     void CommitRoomChain()
     {
         WallEdge lastEdge = null;
@@ -3046,7 +3140,7 @@ public class GridPlacementSystem : MonoBehaviour
             float segTop = roomChainTopY;
             StackFit(null, a, b, roomChainHeight, segBase, out float segSkirt, ref segTop);
             List<WallEdge> created = WallGraph.CommitEdge(splineParent, a, (a + b) * 0.5f, b,
-                EdgeParamsNow(roomChainHeight, segTop, segBase, true, segSkirt));
+                EdgeParamsNow(roomChainHeight, segTop, segBase, segSkirt));
             if (created.Count > 0)
                 lastEdge = created[created.Count - 1];
         }
@@ -3054,23 +3148,8 @@ public class GridPlacementSystem : MonoBehaviour
         // travel, which is the side TraceFace walks — trace the last edge
         // along the gesture. Clockwise → trace it reversed.
         if (lastEdge != null)
-            TryDesignateRoom(lastEdge, WallRoom.SignedArea(roomChain) > 0f);
+            Enclosure.AnnounceChainClose(lastEdge, Enclosure.SignedArea(roomChain) > 0f);
         CancelRoomChain();
-    }
-
-    // Traces the enclosed face off one committed boundary edge and
-    // designates it a room. The caller's winding guess picks the side;
-    // if that walk comes back as the outer face (negative area), the
-    // other side is tried before giving up — walls stay either way.
-    void TryDesignateRoom(WallEdge lastEdge, bool ccw)
-    {
-        List<WallGraph.DirEdge> ring = WallGraph.TraceFace(lastEdge, ccw);
-        if (ring == null || WallRoom.RingArea(ring) <= 0f)
-            ring = WallGraph.TraceFace(lastEdge, !ccw);
-        if (ring != null && WallRoom.RingArea(ring) > 0f)
-            WallRoom.Create(splineParent, ring, wallMaterial, baseStepSize, BaseHeight);
-        else
-            BuildLog.Add("No room: the walls committed but no enclosed face could be traced.");
     }
 
     void CancelRoomChain()
@@ -3089,6 +3168,636 @@ public class GridPlacementSystem : MonoBehaviour
             Destroy(m);
         roomLiveMeshes.Clear();
         roomLiveSpecs.Clear();
+        HideGhosts();
+    }
+
+    // ------------------------------------------------------------------
+    // Ground tool: drag a line, get a bench (graded walkable band, or a
+    // level one with Shift) or a restore (band returned to the natural
+    // hill). Terrain only — walls, decks and cut surfaces are not
+    // ground — and every op obeys the deviation law, which TerrainPads
+    // enforces per sample.
+    // ------------------------------------------------------------------
+    void UpdateGround(Mouse mouse, Ray ray, bool overUI)
+    {
+        HandleGroundSizeScroll(mouse);
+        Vector3 point = default;
+        bool hasPoint = !overUI && TryGetTerrainPoint(ray, out point);
+
+        // Restore is a PAINT brush: hold and sweep, the ground returns to
+        // nature under the brush as you go — the terrain itself is the
+        // preview. The circular ghost drapes over the current surface.
+        if (GroundTask == GroundAction.Restore)
+        {
+            if (hasPoint)
+                ShowBrushGhost(point, restoreBrushRadius, snapColor);
+            else
+                HideGhosts();
+            if (hasPoint && mouse.leftButton.wasPressedThisFrame)
+            {
+                restorePaintLast = point;
+                restorePainted = 0f;
+                // The initial dab: a stamp under the brush before any
+                // sweep, so a bare click restores what it touched.
+                TerrainPads.RestoreLine(point - new Vector3(0.3f, 0f, 0f),
+                    point + new Vector3(0.3f, 0f, 0f), restoreBrushRadius * 2f);
+            }
+            if (restorePaintLast.HasValue && mouse.leftButton.isPressed && hasPoint)
+            {
+                float moved = FlatDistance(restorePaintLast.Value, point);
+                if (moved >= 1.5f)
+                {
+                    TerrainPads.RestoreLine(restorePaintLast.Value, point,
+                        restoreBrushRadius * 2f);
+                    restorePainted += moved;
+                    restorePaintLast = point;
+                }
+            }
+            if (restorePaintLast.HasValue && mouse.leftButton.wasReleasedThisFrame)
+            {
+                if (restorePainted > 0.5f)
+                    BuildLog.Add($"Ground restored to nature — {restorePainted:0}m swept.");
+                restorePaintLast = null;
+            }
+            return;
+        }
+
+        // Path: circular brush while aiming, then the TERRAIN ITSELF is
+        // the preview — each drag frame deforms the real ground to the
+        // candidate bench (reverted and reapplied as the endpoint moves,
+        // committed as an Op only on release; Esc puts the hill back).
+        // The two-tone ribbon rides the deformed surface: blue where
+        // earth was raised, red where it was cut. Shift holds the
+        // anchor's height for the whole run — a LEVEL path — instead of
+        // grading to the far end's ground.
+        Keyboard keyboard = Keyboard.current;
+        if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame
+            && groundAnchor.HasValue)
+        {
+            CancelGround();
+            return;
+        }
+        if (!groundAnchor.HasValue)
+        {
+            if (hasPoint)
+            {
+                ShowBrushGhost(point, pathWidth * 0.5f, previewColor);
+                if (mouse.leftButton.wasPressedThisFrame)
+                {
+                    groundAnchor = point;
+                    groundAnchorY = ClampToLaw(point, GroundYAt(point));
+                }
+            }
+            else
+                HideGhosts();
+            return;
+        }
+
+        Vector3 a = groundAnchor.Value;
+        Vector3 b = hasPoint ? point : a;
+        float len = FlatDistance(a, b);
+        bool level = keyboard != null
+            && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
+        // End heights the commit will use, law-clamped. The anchor's was
+        // captured at the click; the far end samples the PRE-PREVIEW
+        // ground (the live deformation must never feed itself), unless
+        // Shift levels the whole run at the anchor's height.
+        float ya = groundAnchorY;
+        float yb = level ? groundAnchorY
+            : ClampToLaw(b, TerrainPads.PrePreviewGroundAt(b.x, b.z));
+
+        if (len >= 0.5f)
+        {
+            if (!groundPreviewLive
+                || FlatDistance(b, groundPreviewB) > 0.25f
+                || Mathf.Abs(yb - groundPreviewYb) > 0.01f
+                || Mathf.Abs(pathWidth - groundPreviewW) > 0.01f)
+            {
+                TerrainPads.PreviewBench(a, b, pathWidth, ya, yb);
+                groundPreviewB = b;
+                groundPreviewYb = yb;
+                groundPreviewW = pathWidth;
+                groundPreviewLive = true;
+            }
+        }
+        else if (groundPreviewLive)
+        {
+            TerrainPads.PreviewBench(a, a, pathWidth, ya, yb);
+            groundPreviewLive = false;
+        }
+        BuildPathGhost(a, b, pathWidth, ya, yb);
+        guideCenter = (a + b) * 0.5f;
+        guideBearing = Mathf.Atan2(b.z - a.z, b.x - a.x) * Mathf.Rad2Deg;
+
+        if (mouse.leftButton.wasReleasedThisFrame)
+        {
+            if (len >= 0.5f)
+            {
+                // Revert the preview, then walk the same door a direct
+                // commit uses — what previewed is exactly what commits.
+                TerrainPads.CancelPreview();
+                TerrainPads.Bench(a, b, pathWidth, ya, yb);
+                if (level)
+                    BuildLog.Add($"Path leveled — {len:0}m held at the anchor's height.");
+                else
+                {
+                    float grade = Mathf.Abs(yb - ya) / Mathf.Max(0.5f, len) * 100f;
+                    BuildLog.Add($"Path benched — {grade:0}% grade over {len:0}m.");
+                }
+            }
+            CancelGround();
+        }
+    }
+
+    // Ctrl+scroll sizes the tool in hand, exactly as it dials wall height
+    // for the build tools — FreeFlyCamera already stands down from
+    // dollying while Ctrl is held, so the wheel means one thing.
+    void HandleGroundSizeScroll(Mouse mouse)
+    {
+        Keyboard keyboard = Keyboard.current;
+        if (keyboard == null || (!keyboard.leftCtrlKey.isPressed && !keyboard.rightCtrlKey.isPressed))
+            return;
+        float scroll = mouse.scroll.ReadValue().y;
+        if (Mathf.Abs(scroll) < 0.01f)
+            return;
+        if (Mathf.Abs(scroll) >= 100f)
+            scroll /= 120f;
+        float notches = Mathf.Clamp(scroll, -4f, 4f);
+        if (GroundTask == GroundAction.Restore)
+            restoreBrushRadius = Mathf.Clamp(restoreBrushRadius + notches * 0.5f,
+                MinBrushRadius, MaxBrushRadius);
+        else
+            pathWidth = Mathf.Clamp(pathWidth + notches * 0.5f,
+                MinPathWidth, MaxPathWidth);
+    }
+
+    // ------------------------------------------------------------------
+    // The slab tools (Docs/BuildingRebuild.md): FOUNDATION tiles author a
+    // building's footprint and level on the terrain — the first storey's
+    // floor, placed first, never derived. FLOOR tiles author a
+    // between-storey plane, legal only connected to a wall top or to
+    // another floor tile. One tile per click, edge-snapped to its own
+    // kind with the host's plane and bearing adopted; Ctrl+scroll sizes
+    // the tile, R turns a free tile, Alt breaks the foundation snap to
+    // start a new level (a floor with nothing to connect to just
+    // refuses — there is no free-floating floor).
+    void UpdateSlab(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
+    {
+        HandleSlabSizeScroll(mouse, keyboard);
+        bool free = keyboard != null
+            && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
+        if (keyboard != null && keyboard.rKey.wasPressedThisFrame)
+            slabYaw = Mathf.Repeat(slabYaw + 15f, 360f);
+
+        bool foundation = Mode == ToolMode.Foundation;
+        bool has = foundation
+            ? ResolveFoundationTile(ray, free, out Vector3 center, out float plane,
+                out float yaw, out bool attached)
+            : ResolveFloorTile(ray, out center, out plane, out yaw, out attached);
+        if (overUI || !has)
+        {
+            HideGhosts();
+            return;
+        }
+
+        float bottom = foundation
+            ? FoundationBottom(center, yaw, plane)
+            : plane - SlabTile.Thickness;
+        // The refusals, run live on the ghost — the click runs the SAME
+        // tests, so red is never a surprise (one-test doctrine).
+        bool refused = SlabOverlapsExisting(center, plane, yaw, foundation)
+            || (foundation && FoundationBuried(center, plane, yaw))
+            || (!foundation && !attached);
+
+        ghostTopY = plane;
+        guideCenter = center;
+        ShowSlabGhost(center, plane, bottom, yaw,
+            refused ? deletePreviewColor : attached ? snapColor : previewColor);
+
+        if (!refused && mouse.leftButton.wasPressedThisFrame)
+        {
+            SlabTile.Create(splineParent, wallMaterial, center, slabSize, yaw,
+                plane, bottom, foundation);
+            BuildLog.Add((foundation ? "Foundation" : "Floor")
+                + $" tile {slabSize:0.#}×{slabSize:0.#}m at {plane:0.##}m.");
+        }
+    }
+
+    void HandleSlabSizeScroll(Mouse mouse, Keyboard keyboard)
+    {
+        if (keyboard == null
+            || (!keyboard.leftCtrlKey.isPressed && !keyboard.rightCtrlKey.isPressed))
+            return;
+        float scroll = mouse.scroll.ReadValue().y;
+        if (Mathf.Abs(scroll) < 0.01f)
+            return;
+        if (Mathf.Abs(scroll) >= 100f)
+            scroll /= 120f;
+        float notches = Mathf.Clamp(scroll, -4f, 4f);
+        slabSize = Mathf.Clamp(
+            Mathf.Round((slabSize + notches * SlabTile.SizeStep) / SlabTile.SizeStep)
+                * SlabTile.SizeStep,
+            SlabTile.MinSize, SlabTile.MaxSize);
+    }
+
+    // A foundation tile lives where the terrain is: the cursor names a
+    // ground point (the terrain-only ray sees straight through existing
+    // tiles, so hovering the patch still works), the nearest same-kind
+    // tile edge captures the ghost, and a captured tile adopts the
+    // host's plane and bearing. A free tile seats like a floor slab
+    // does: top at the highest ground under it, stepped to the quarter
+    // grid.
+    bool ResolveFoundationTile(Ray ray, bool free, out Vector3 center,
+        out float plane, out float yaw, out bool attached)
+    {
+        center = default;
+        plane = 0f;
+        yaw = slabYaw;
+        attached = false;
+        if (!TryGetTerrainPoint(ray, out Vector3 p))
+            return false;
+        if (!free && TrySlabSnap(p, true, out center, out plane, out yaw))
+        {
+            attached = true;
+            return true;
+        }
+        center = new Vector3(p.x, 0f, p.z);
+        SampleTileGround(center, yaw, slabSize, out _, out float maxG);
+        plane = Mathf.Ceil(maxG / SlabTile.FloorStep) * SlabTile.FloorStep;
+        return true;
+    }
+
+    // A floor tile exists only by connection: hovering a wall's top face
+    // seeds one at that wall's plane and bearing, hovering an existing
+    // floor tile abuts one to its nearest edge. Anything else has
+    // nothing to connect to and shows nothing.
+    bool ResolveFloorTile(Ray ray, out Vector3 center, out float plane,
+        out float yaw, out bool attached)
+    {
+        center = default;
+        plane = 0f;
+        yaw = slabYaw;
+        attached = false;
+
+        RaycastHit[] hits = Physics.RaycastAll(ray, 3000f);
+        RaycastHit best = default;
+        float bestDist = float.MaxValue;
+        foreach (RaycastHit h in hits)
+        {
+            if (h.collider == null || h.collider.isTrigger)
+                continue;
+            if (h.distance < bestDist)
+            {
+                bestDist = h.distance;
+                best = h;
+            }
+        }
+        if (bestDist == float.MaxValue)
+            return false;
+
+        SlabTile tile = best.collider.GetComponent<SlabTile>();
+        if (tile != null && !tile.isFoundation)
+        {
+            plane = tile.topY;
+            yaw = tile.yaw;
+            center = AbutTile(tile, best.point);
+            attached = true;
+            return true;
+        }
+
+        WallEdgeSection section = best.collider.GetComponent<WallEdgeSection>();
+        if (section != null && section.edge != null && best.normal.y > 0.7f
+            && !CutawayView.IsCutSurface(best.point))
+        {
+            plane = section.topY;
+            Vector3 d = section.edge.B - section.edge.A;
+            yaw = Mathf.Atan2(-d.z, d.x) * Mathf.Rad2Deg;
+            center = new Vector3(best.point.x, 0f, best.point.z);
+            attached = true;
+            return true;
+        }
+        return false;
+    }
+
+    // The nearest same-kind tile whose edge zone holds this point:
+    // the ghost abuts that edge, sliding along it, corners snapping
+    // into alignment when close. Plane and bearing come from the host.
+    bool TrySlabSnap(Vector3 point, bool foundations, out Vector3 center,
+        out float plane, out float yaw)
+    {
+        center = default;
+        plane = 0f;
+        yaw = 0f;
+        SlabTile bestTile = null;
+        float bestEdge = float.MaxValue;
+        foreach (SlabTile t in SlabTile.All)
+        {
+            if (t == null || t.isFoundation != foundations)
+                continue;
+            float rad = t.yaw * Mathf.Deg2Rad;
+            Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad));
+            Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad));
+            Vector3 local = new Vector3(point.x, 0f, point.z) - t.center;
+            float a = Mathf.Abs(Vector3.Dot(local, ax));
+            float b = Mathf.Abs(Vector3.Dot(local, az));
+            float outside = Mathf.Max(a, b) - t.size * 0.5f;
+            // Inside the tile counts (face placement off the near edge);
+            // outside it, the reach scales with the ghost so a big tile
+            // is as easy to extend as a small one.
+            if (outside > slabSize * 0.75f + 0.75f)
+                continue;
+            if (Mathf.Min(a, b) > t.size * 0.5f + slabSize * 0.5f)
+                continue;
+            if (outside < bestEdge)
+            {
+                bestEdge = outside;
+                bestTile = t;
+            }
+        }
+        if (bestTile == null)
+            return false;
+        plane = bestTile.topY;
+        yaw = bestTile.yaw;
+        center = AbutTile(bestTile, point);
+        return true;
+    }
+
+    // Place the ghost flush against the host edge nearest this point,
+    // sliding along that edge; slide snaps to centered and to
+    // corner-aligned within 0.3m.
+    Vector3 AbutTile(SlabTile host, Vector3 point)
+    {
+        float rad = host.yaw * Mathf.Deg2Rad;
+        Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad));
+        Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad));
+        Vector3 local = new Vector3(point.x, 0f, point.z) - host.center;
+        float a = Vector3.Dot(local, ax);
+        float b = Vector3.Dot(local, az);
+        Vector3 normal;
+        float slide;
+        if (Mathf.Abs(a) >= Mathf.Abs(b))
+        {
+            normal = ax * Mathf.Sign(a);
+            slide = b;
+        }
+        else
+        {
+            normal = az * Mathf.Sign(b);
+            slide = a;
+        }
+        Vector3 along = Vector3.Cross(Vector3.up, normal);
+        float cornerAt = (host.size - slabSize) * 0.5f;
+        if (Mathf.Abs(slide) < 0.3f)
+            slide = 0f;
+        else if (Mathf.Abs(Mathf.Abs(slide) - Mathf.Abs(cornerAt)) < 0.3f)
+            slide = Mathf.Abs(cornerAt) * Mathf.Sign(slide);
+        slide = Mathf.Clamp(slide,
+            -(host.size + slabSize) * 0.5f + 0.5f,
+            (host.size + slabSize) * 0.5f - 0.5f);
+        return host.center + normal * ((host.size + slabSize) * 0.5f) + along * slide;
+    }
+
+    // Ground extremes under a yawed square, sampled on a grid.
+    void SampleTileGround(Vector3 center, float yaw, float size,
+        out float minG, out float maxG)
+    {
+        minG = float.MaxValue;
+        maxG = float.MinValue;
+        float rad = yaw * Mathf.Deg2Rad;
+        Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad));
+        Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad));
+        const int N = 6;
+        for (int i = 0; i < N; i++)
+            for (int j = 0; j < N; j++)
+            {
+                float u = (i / (float)(N - 1) - 0.5f) * size;
+                float v = (j / (float)(N - 1) - 0.5f) * size;
+                float g = GroundYAt(center + ax * u + az * v);
+                minG = Mathf.Min(minG, g);
+                maxG = Mathf.Max(maxG, g);
+            }
+    }
+
+    // The foundation refusal: a tile whose top is MOSTLY clipping
+    // through terrain (ground above the plane over more than half its
+    // area) is buried, not built. Dips never refuse — the skirt spans
+    // them. Tile-local and self-scaling with the adopted plane; this is
+    // what stops one level marching up a hill.
+    bool FoundationBuried(Vector3 center, float plane, float yaw)
+    {
+        float rad = yaw * Mathf.Deg2Rad;
+        Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad));
+        Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad));
+        const int N = 6;
+        int buried = 0;
+        for (int i = 0; i < N; i++)
+            for (int j = 0; j < N; j++)
+            {
+                float u = (i / (float)(N - 1) - 0.5f) * slabSize;
+                float v = (j / (float)(N - 1) - 0.5f) * slabSize;
+                if (GroundYAt(center + ax * u + az * v) > plane + 0.05f)
+                    buried++;
+            }
+        return buried * 2 > N * N;
+    }
+
+    // A foundation reaches down past the lowest ground under it so dips
+    // near its edges stay closed — the floor-slab skirt convention.
+    float FoundationBottom(Vector3 center, float yaw, float plane)
+    {
+        SampleTileGround(center, yaw, slabSize, out float minG, out _);
+        float bottom = Mathf.Floor(minG / baseStepSize) * baseStepSize - 0.5f;
+        return Mathf.Min(bottom, plane - 0.25f);
+    }
+
+    // Same-kind tiles at the same plane must not overlap — abutting is
+    // the point, burying one tile in another is a redraw.
+    bool SlabOverlapsExisting(Vector3 center, float plane, float yaw, bool foundations)
+    {
+        foreach (SlabTile t in SlabTile.All)
+        {
+            if (t == null || t.isFoundation != foundations)
+                continue;
+            if (Mathf.Abs(t.topY - plane) > 0.25f)
+                continue;
+            if (SlabTile.Overlaps(center, slabSize, yaw, t.center, t.size, t.yaw))
+                return true;
+        }
+        return false;
+    }
+
+    void ShowSlabGhost(Vector3 center, float top, float bottom, float yaw, Color tint)
+    {
+        GameObject ghost = GetPooled(ghostPool, 0, tint, "PlacementPreview");
+        ghost.SetActive(true);
+        SetGhostMesh(ghost, SlabTile.SharedCube());
+        SetGhostTint(ghost, tint);
+        ghost.transform.SetPositionAndRotation(
+            new Vector3(center.x, (top + bottom) * 0.5f, center.z),
+            Quaternion.Euler(0f, yaw, 0f));
+        ghost.transform.localScale =
+            new Vector3(slabSize, Mathf.Max(0.05f, top - bottom), slabSize);
+        for (int i = 1; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    // The terrain under the cursor and nothing else: not a wall, not a
+    // deck, and not a cutaway cross-section (the type filter refuses
+    // those before their upward normals can lie about being ground).
+    bool TryGetTerrainPoint(Ray ray, out Vector3 point)
+    {
+        point = default;
+        var hits = Physics.RaycastAll(ray, 3000f);
+        float best = float.MaxValue;
+        foreach (RaycastHit h in hits)
+        {
+            if (h.collider == null || h.collider.isTrigger)
+                continue;
+            if (!(h.collider is TerrainCollider))
+                continue;
+            if (h.distance < best)
+            {
+                best = h.distance;
+                point = h.point;
+            }
+        }
+        return best < float.MaxValue;
+    }
+
+    float GroundYAt(Vector3 p)
+    {
+        Terrain t = Terrain.activeTerrain;
+        return t == null ? 0f : t.transform.position.y + t.SampleHeight(p);
+    }
+
+    float ClampToLaw(Vector3 p, float y)
+    {
+        float natural = TerrainPads.PristineGroundAt(p.x, p.z);
+        return Mathf.Clamp(y, natural - TerrainPads.MaxDeviation,
+            natural + TerrainPads.MaxDeviation);
+    }
+
+    // The path drag's ribbon: the future surface at bench height, split
+    // into a FILL mesh (bench above current ground — earth raised, blue)
+    // and a CUT mesh (bench below it — earth dug, red), so the drag reads
+    // as the alteration it is. Each rung drapes toward the current ground
+    // at its own station; the profile is the law-clamped grade the commit
+    // computes, so the ribbon IS the ground the release builds.
+    void BuildPathGhost(Vector3 a, Vector3 b, float width, float ya, float yb)
+    {
+        if (groundGhostMesh == null)
+            groundGhostMesh = new Mesh { name = "GroundGhostFill" };
+        if (groundGhostCutMesh == null)
+            groundGhostCutMesh = new Mesh { name = "GroundGhostCut" };
+        int n = Mathf.Max(1, Mathf.CeilToInt(FlatDistance(a, b)));
+        Vector3 dir = b - a;
+        dir.y = 0f;
+        dir = dir.sqrMagnitude < 0.0001f ? Vector3.forward : dir.normalized;
+        var side = new Vector3(-dir.z, 0f, dir.x) * (width * 0.5f);
+        var fillV = new List<Vector3>(); var fillT = new List<int>();
+        var cutV = new List<Vector3>(); var cutT = new List<int>();
+        Vector3 PointAt(int i)
+        {
+            float t = (float)i / n;
+            Vector3 p = Vector3.Lerp(a, b, t);
+            p.y = ClampToLaw(p, Mathf.Lerp(ya, yb, t)) + 0.05f;
+            return p;
+        }
+        for (int i = 0; i < n; i++)
+        {
+            Vector3 p0 = PointAt(i), p1 = PointAt(i + 1);
+            Vector3 mid = (p0 + p1) * 0.5f;
+            // Against the PRE-preview ground: the live deformation has
+            // already moved the surface to the bench, so the current
+            // ground would call every rung a wash.
+            bool cutting = mid.y - 0.05f
+                < TerrainPads.PrePreviewGroundAt(mid.x, mid.z) - 0.05f;
+            var V = cutting ? cutV : fillV;
+            var T = cutting ? cutT : fillT;
+            int v = V.Count;
+            V.Add(p0 - side); V.Add(p0 + side); V.Add(p1 - side); V.Add(p1 + side);
+            T.Add(v); T.Add(v + 2); T.Add(v + 1);
+            T.Add(v + 1); T.Add(v + 2); T.Add(v + 3);
+        }
+        groundGhostMesh.Clear();
+        groundGhostMesh.SetVertices(fillV);
+        groundGhostMesh.SetTriangles(fillT, 0);
+        groundGhostMesh.RecalculateNormals();
+        groundGhostCutMesh.Clear();
+        groundGhostCutMesh.SetVertices(cutV);
+        groundGhostCutMesh.SetTriangles(cutT, 0);
+        groundGhostCutMesh.RecalculateNormals();
+
+        ShowWorldGhost(0, groundGhostMesh, previewColor);
+        ShowWorldGhost(1, groundGhostCutMesh, deletePreviewColor);
+        for (int i = 2; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    // A circular brush cursor draped onto the terrain surface — each rim
+    // vertex sits on the ground under it, so the ring molds to the hill
+    // instead of floating as a flat disc.
+    void ShowBrushGhost(Vector3 center, float radius, Color tint)
+    {
+        if (brushGhostMesh == null)
+            brushGhostMesh = new Mesh { name = "GroundBrush" };
+        const int Segs = 28;
+        var verts = new Vector3[Segs + 1];
+        var tris = new int[Segs * 3];
+        verts[0] = new Vector3(center.x, GroundYAt(center) + 0.08f, center.z);
+        for (int i = 0; i < Segs; i++)
+        {
+            float ang = i / (float)Segs * Mathf.PI * 2f;
+            var p = new Vector3(center.x + Mathf.Cos(ang) * radius, 0f,
+                center.z + Mathf.Sin(ang) * radius);
+            p.y = GroundYAt(p) + 0.08f;
+            verts[i + 1] = p;
+            tris[i * 3] = 0;
+            tris[i * 3 + 1] = 1 + (i + 1) % Segs;
+            tris[i * 3 + 2] = 1 + i;
+        }
+        brushGhostMesh.Clear();
+        brushGhostMesh.vertices = verts;
+        brushGhostMesh.triangles = tris;
+        brushGhostMesh.RecalculateNormals();
+        ShowWorldGhost(0, brushGhostMesh, tint);
+        for (int i = 1; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    void ShowWorldGhost(int slot, Mesh mesh, Color tint)
+    {
+        GameObject ghost = GetPooled(ghostPool, slot, previewColor, "PlacementPreview");
+        ghost.SetActive(true);
+        SetGhostMesh(ghost, mesh);
+        SetGhostTint(ghost, tint);
+        ghost.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+        ghost.transform.localScale = Vector3.one;
+    }
+
+    void CancelGround()
+    {
+        // Any live path preview goes back to the hill it borrowed.
+        TerrainPads.CancelPreview();
+        groundPreviewLive = false;
+        groundAnchor = null;
+        restorePaintLast = null;
+        restorePainted = 0f;
+        if (groundGhostMesh != null)
+        {
+            Destroy(groundGhostMesh);
+            groundGhostMesh = null;
+        }
+        if (groundGhostCutMesh != null)
+        {
+            Destroy(groundGhostCutMesh);
+            groundGhostCutMesh = null;
+        }
+        if (brushGhostMesh != null)
+        {
+            Destroy(brushGhostMesh);
+            brushGhostMesh = null;
+        }
         HideGhosts();
     }
 
@@ -3126,13 +3835,14 @@ public class GridPlacementSystem : MonoBehaviour
         // gets built directly over the one below, rather than inset onto
         // a deck). Snaps below stay live but filter to that base's own
         // walls — the masonry a storey down never grabs the gesture.
-        WallRoom slabRoom = first.collider.GetComponentInParent<WallRoom>();
+        SlabTile slabTile = first.collider.GetComponent<SlabTile>();
         WallEdgeSection hitSection = first.collider.GetComponent<WallEdgeSection>();
         float? deckY = null;
-        if (slabRoom != null)
+        // A slab tile is a deck: elevated ground, free-form building,
+        // no ride lock.
+        if (slabTile != null)
         {
-            deckY = first.collider.gameObject.name == "RoomRoof"
-                ? slabRoom.roofY : slabRoom.floorY;
+            deckY = slabTile.topY;
             hoverBaseY = deckY;
         }
         // A cut-open wall's cross-section is not a wall top: it has the
@@ -3177,7 +3887,7 @@ public class GridPlacementSystem : MonoBehaviour
                 hoverSnapHeight = SnapHeightOf(nodeSnap.edge, nodeSnap.point);
             AdoptSnapElevation(nodeSnap);
             point = nodeSnap.point;
-            AdoptRideHostUnder(point, slabRoom != null);
+            AdoptRideHostUnder(point, slabTile != null);
             return true;
         }
 
@@ -3194,7 +3904,7 @@ public class GridPlacementSystem : MonoBehaviour
                 hoverSnapHeight = SnapHeightOf(flankSnap.edge, flankSnap.point);
             AdoptSnapElevation(flankSnap);
             point = flankSnap.point;
-            AdoptRideHostUnder(point, slabRoom != null);
+            AdoptRideHostUnder(point, slabTile != null);
             return true;
         }
 
@@ -3710,6 +4420,23 @@ public class GridPlacementSystem : MonoBehaviour
     {
         float height = EffectiveWallHeight;
         float baseFloor = (anchorBaseY ?? hoverBaseY) ?? float.NegativeInfinity;
+        // The readout reports the ANCHOR span's top (before the cache
+        // check — the field clears every frame). Adjacent hosts can sit at
+        // different heights, so spans further along may top out elsewhere;
+        // the anchor span is the one you dialed against.
+        if (rideSpans.Count > 0)
+        {
+            (WallEdge h0, float tA0, float tB0) = rideSpans[0];
+            WallGraph.SubCurve(h0.A, h0.control, h0.B, tA0, tB0,
+                out Vector3 s0, out _, out Vector3 e0);
+            s0 = new Vector3(s0.x, 0f, s0.z);
+            e0 = new Vector3(e0.x, 0f, e0.z);
+            float top0 = float.NegativeInfinity;
+            StackFit(h0, s0, e0, height, baseFloor, out _, ref top0);
+            ghostTopY = !float.IsNegativeInfinity(top0) ? top0
+                : !float.IsNegativeInfinity(baseFloor) ? baseFloor + height
+                : SampleCellGroundY(s0.x, s0.z) + height;
+        }
         var key = (start, end, height, baseFloor, rideSpans.Count,
             rideSpans.Count > 0 ? rideSpans[rideSpans.Count - 1].tB : 0f);
         if (lastRideKey.HasValue && lastRideKey.Value == key)
@@ -3851,6 +4578,7 @@ public class GridPlacementSystem : MonoBehaviour
             : float.NegativeInfinity;
     }
 
+
     // trimStart/trimEnd pull the DISPLAYED wall back from ends that land
     // on a host's flank, so the ghost meets the face instead of clipping
     // half a thickness into the masonry. The commit curve (pendingCommit)
@@ -3877,6 +4605,11 @@ public class GridPlacementSystem : MonoBehaviour
         Vector3 control = TryRideControl(start, end, out Vector3 ridden)
             ? ridden
             : ControlPointFor(start, end, bulge, apexT);
+        // Set before the cache check: the field is cleared every frame,
+        // and an unchanged preview still needs its readout.
+        ghostTopY = !float.IsNegativeInfinity(topY) ? topY
+            : !float.IsNegativeInfinity(baseFloor) ? baseFloor + height
+            : SampleCellGroundY(start.x, start.z) + height;
         var key = (start, end, control, height, topY, baseFloor - skirt, trimStart, trimEnd);
         if (lastPreviewKey.HasValue && lastPreviewKey.Value == key)
             return;
@@ -3965,6 +4698,45 @@ public class GridPlacementSystem : MonoBehaviour
         }
     }
 
+    // The hover inspect line: nearest thing under the cursor, reported as
+    // absolute planes so you know what a rendezvous has to match. A room's
+    // slab — roof OR floor — reports both of that room's planes, because a
+    // roofed building's floor is hidden inside and the readout shouldn't
+    // need the cutaway. A wall reports its stored section top at the
+    // hovered point. Bare terrain reports the ground.
+    string InspectElevations(Ray ray)
+    {
+        RaycastHit[] hits = Physics.RaycastAll(ray, 3000f);
+        RaycastHit best = default;
+        float bestDist = float.MaxValue;
+        foreach (RaycastHit h in hits)
+        {
+            if (h.collider == null || h.collider.isTrigger)
+                continue;
+            if (h.distance < bestDist)
+            {
+                bestDist = h.distance;
+                best = h;
+            }
+        }
+        if (bestDist == float.MaxValue)
+            return null;
+
+        WallEdgeSection section = best.collider.GetComponent<WallEdgeSection>();
+        if (section != null)
+            return $"Wall top {section.topY:0.##}m";
+
+        SlabTile slab = best.collider.GetComponent<SlabTile>();
+        if (slab != null)
+            return (slab.isFoundation ? "Foundation top " : "Floor top ")
+                + $"{slab.topY:0.##}m";
+
+        if (best.collider is TerrainCollider)
+            return $"Ground {best.point.y:0.##}m";
+
+        return null;
+    }
+
     // A full box ghost marking the curve tool's start point.
     void ShowStartMarker(Vector3 point)
     {
@@ -3978,6 +4750,7 @@ public class GridPlacementSystem : MonoBehaviour
 
         float ground = hoverBaseY ?? SampleCellGroundY(point.x, point.z);
         float height = EffectiveWallHeight;
+        ghostTopY = ground + height;
         GameObject ghost = GetPooled(ghostPool, 0, previewColor, "PlacementPreview");
         ghost.SetActive(true);
         SetGhostMesh(ghost, null);
@@ -4109,6 +4882,9 @@ public class GridPlacementSystem : MonoBehaviour
         // is already flat, so the top lock is moot).
         float srcBase = offsetSource != null ? offsetSource.baseY : float.NegativeInfinity;
         float topY = float.IsNegativeInfinity(srcBase) ? LockedTopFor(s) : float.NegativeInfinity;
+        ghostTopY = !float.IsNegativeInfinity(topY) ? topY
+            : !float.IsNegativeInfinity(srcBase) ? srcBase + CurrentWallHeight
+            : SampleCellGroundY(s.x, s.z) + CurrentWallHeight;
         var key = (s, c, e, CurrentWallHeight, topY);
         if (lastOffsetKey.HasValue && lastOffsetKey.Value == key)
             return;
@@ -4248,16 +5024,16 @@ public class GridPlacementSystem : MonoBehaviour
                     doomedSections.Clear();
                 }
             }
-            else if (!overUI && TryGetRoomUnderCursor(ray, out WallRoom hoveredRoom))
+            // A slab tile dies whole, like a stair. Walls standing on it
+            // stay standing — structural rules are deferred, deliberately.
+            else if (!overUI && TryGetSlabUnderCursor(ray, out SlabTile hoveredSlab))
             {
-                // A room's slabs delete as one: the designation lifts,
-                // floor and roof go, the walls stay standing.
-                foreach (Transform child in hoveredRoom.transform)
-                    doomedSections.Add(child);
+                doomedSections.Add(hoveredSlab.transform);
                 if (mouse.leftButton.wasPressedThisFrame)
                 {
-                    Destroy(hoveredRoom.gameObject);
-                    BuildLog.Add("Room removed — walls kept.");
+                    Destroy(hoveredSlab.gameObject);
+                    BuildLog.Add(hoveredSlab.isFoundation
+                        ? "Foundation tile removed." : "Floor tile removed.");
                     doomedSections.Clear();
                 }
             }
@@ -4296,12 +5072,13 @@ public class GridPlacementSystem : MonoBehaviour
         foreach (KeyValuePair<WallEdge, HashSet<int>> pair in byEdge)
             if (pair.Key != null)
                 WallGraph.DeleteSections(splineParent, pair.Key, pair.Value);
-        foreach (WallRoom room in marqueeRooms)
+        foreach (SlabTile slab in marqueeSlabs)
         {
-            if (room == null || room.broken)
+            if (slab == null)
                 continue;
-            Destroy(room.gameObject);
-            BuildLog.Add("Room removed — walls kept.");
+            Destroy(slab.gameObject);
+            BuildLog.Add(slab.isFoundation
+                ? "Foundation tile removed." : "Floor tile removed.");
         }
         CancelDelete();
     }
@@ -4313,7 +5090,7 @@ public class GridPlacementSystem : MonoBehaviour
         marqueeEnd = null;
         doomedSections.Clear();
         deleteRanges.Clear();
-        marqueeRooms.Clear();
+        marqueeSlabs.Clear();
         HideDeleteOverlays();
     }
 
@@ -4426,14 +5203,14 @@ public class GridPlacementSystem : MonoBehaviour
     }
 
     // Everything the rubber-band caught: wall sections at any storey by
-    // their screen-projected centers, and rooms by either slab's center
-    // — the red shells are the confirmation of exactly what release
+    // their screen-projected centers, and slab tiles by their centers —
+    // the red shells are the confirmation of exactly what release
     // will take.
     void MarkMarqueeDoomed()
     {
         doomedSections.Clear();
         deleteRanges.Clear();
-        marqueeRooms.Clear();
+        marqueeSlabs.Clear();
         Rect r = Rect.MinMaxRect(
             Mathf.Min(marqueeStart.Value.x, marqueeEnd.Value.x),
             Mathf.Min(marqueeStart.Value.y, marqueeEnd.Value.y),
@@ -4455,39 +5232,30 @@ public class GridPlacementSystem : MonoBehaviour
                 deleteRanges.Add((edge, section.index, section.index));
             }
         }
-        foreach (WallRoom room in WallRoom.All)
+        foreach (SlabTile tile in SlabTile.All)
         {
-            if (room == null || room.broken)
+            if (tile == null)
                 continue;
-            foreach (Transform child in room.transform)
-            {
-                Renderer rend = child.GetComponent<Renderer>();
-                if (rend == null)
-                    continue;
-                Vector3 sp = cam.WorldToScreenPoint(rend.bounds.center);
-                if (sp.z <= 0f || !r.Contains(new Vector2(sp.x, sp.y)))
-                    continue;
-                marqueeRooms.Add(room);
-                foreach (Transform slab in room.transform)
-                    doomedSections.Add(slab);
-                break;
-            }
+            Vector3 sp = cam.WorldToScreenPoint(tile.transform.position);
+            if (sp.z <= 0f || !r.Contains(new Vector2(sp.x, sp.y)))
+                continue;
+            marqueeSlabs.Add(tile);
+            doomedSections.Add(tile.transform);
         }
     }
 
-    // The room whose slab (floor or roof deck) is directly under the
-    // cursor — the delete tool's un-room target.
-    bool TryGetRoomUnderCursor(Ray ray, out WallRoom room)
+    // The slab tile directly under the cursor — the delete tool's target.
+    bool TryGetSlabUnderCursor(Ray ray, out SlabTile tile)
     {
-        room = null;
+        tile = null;
         RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
         System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
         foreach (RaycastHit hit in hits)
         {
             if (hit.collider.isTrigger)
                 continue;
-            room = hit.collider.GetComponentInParent<WallRoom>();
-            return room != null;
+            tile = hit.collider.GetComponent<SlabTile>();
+            return tile != null;
         }
         return false;
     }

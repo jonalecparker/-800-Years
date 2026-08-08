@@ -115,7 +115,9 @@ public class WalkMode : MonoBehaviour
         // lock nor the hide — so leaving by Escape and returning by Tab
         // landed you in walk mode with a loose pointer every time. The
         // key belongs to the editor; don't take a second meaning for it.
-        if (keyboard.tabKey.wasPressedThisFrame)
+        // While the Saves panel has the keyboard, Tab is a keystroke in
+        // someone's typing, not a mode switch.
+        if (keyboard.tabKey.wasPressedThisFrame && !BuildMenu.ModalOpen)
         {
             if (Active)
                 Leave();

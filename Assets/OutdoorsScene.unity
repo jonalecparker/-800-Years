@@ -210,7 +210,7 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 157207112}
   serializedVersion: 2
-  m_LocalRotation: {x: 0.38268343, y: 0, z: 0, w: 0.92387956}
+  m_LocalRotation: {x: 0.38268346, y: 0, z: 0, w: 0.9238795}
   m_LocalPosition: {x: 0, y: 3, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
@@ -456,6 +456,8 @@ MonoBehaviour:
   angleStep: 5
   lengthStep: 0.5
   lockTopHeight: 0
+  pathWidth: 2.5
+  restoreBrushRadius: 4
 --- !u!4 &1064011757
 Transform:
   m_ObjectHideFlags: 0
@@ -502,9 +504,11 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 5176e65a3c7181e44a029a95da60f6f4, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::TerrainGenerator
-  terrainSize: 800
-  terrainMaxHeight: 80
+  terrainSize: 1024
+  terrainMaxHeight: 180.15103
   heightmapResolution: 1025
+  demHeightmap: {fileID: 4900000, guid: 2c86966306cfefb49aa2ac60f28b618d, type: 3}
+  demCellSize: 1
   baseElevation: 14
   rollingAmplitude: 12
   rollingWavelength: 150
@@ -593,7 +597,7 @@ Transform:
   m_GameObject: {fileID: 1184855072}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -400, y: 0, z: -400}
+  m_LocalPosition: {x: -512, y: 0, z: -512}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -851,7 +855,7 @@ Transform:
   m_GameObject: {fileID: 1823688464}
   serializedVersion: 2
   m_LocalRotation: {x: 0.1445266, y: -0.377972, z: 0.059864886, w: 0.91250503}
-  m_LocalPosition: {x: 180, y: 130, z: -180}
+  m_LocalPosition: {x: 79.3, y: 211.4, z: -59.2}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []

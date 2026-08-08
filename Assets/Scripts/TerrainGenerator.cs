@@ -18,6 +18,15 @@ public class TerrainGenerator : MonoBehaviour
     public float terrainMaxHeight = 80f;
     public int heightmapResolution = 1025;
 
+    [Header("Real DEM (overrides procedural when set)")]
+    // Raw little-endian float32 elevations in meters, square grid, row-major
+    // from the NW corner (rows run north to south). Cell size below sets the
+    // world meters per sample; the file's own min elevation becomes y=0, so
+    // absolute elevation is a per-tile offset, not world Y. Current tile:
+    // Spis Castle, Slovakia — ETRS89/UTM34N E 482545..483569, N 5427020..5428044.
+    public TextAsset demHeightmap;
+    public float demCellSize = 1f;
+
     [Header("Countryside")]
     public float baseElevation = 14f;
     // Total relief of the open fields and the size of their features —
@@ -71,6 +80,29 @@ public class TerrainGenerator : MonoBehaviour
         }
         terrainCollider.terrainData = data;
 
+        if (demHeightmap != null)
+            ApplyDemHeights(data);
+        else
+            ApplyProceduralHeights(data);
+        float half = terrainSize * 0.5f;
+
+        ApplySurface(data);
+        ApplyMaterial(terrain);
+
+        // Terrain pivot is its corner; keep the hill centered on the world
+        // origin, where the build systems and camera already live.
+        transform.position = new Vector3(-half, 0f, -half);
+        terrain.Flush();
+
+#if UNITY_EDITOR
+        EditorUtility.SetDirty(terrain);
+        EditorUtility.SetDirty(data);
+        AssetDatabase.SaveAssets();
+#endif
+    }
+
+    void ApplyProceduralHeights(TerrainData data)
+    {
         data.heightmapResolution = heightmapResolution;
         data.size = new Vector3(terrainSize, terrainMaxHeight, terrainSize);
 
@@ -86,20 +118,51 @@ public class TerrainGenerator : MonoBehaviour
             }
         }
         data.SetHeights(0, 0, heights);
+    }
 
-        ApplySurface(data);
-        ApplyMaterial(terrain);
+    void ApplyDemHeights(TerrainData data)
+    {
+        byte[] bytes = demHeightmap.bytes;
+        int count = bytes.Length / 4;
+        int res = Mathf.RoundToInt(Mathf.Sqrt(count));
+        if (res * res != count)
+        {
+            Debug.LogError($"DEM file is {count} floats, not a square grid — aborting.");
+            return;
+        }
 
-        // Terrain pivot is its corner; keep the hill centered on the world
-        // origin, where the build systems and camera already live.
-        transform.position = new Vector3(-half, 0f, -half);
-        terrain.Flush();
+        float[] elev = new float[count];
+        System.Buffer.BlockCopy(bytes, 0, elev, 0, bytes.Length);
 
-#if UNITY_EDITOR
-        EditorUtility.SetDirty(terrain);
-        EditorUtility.SetDirty(data);
-        AssetDatabase.SaveAssets();
-#endif
+        float min = float.MaxValue, max = float.MinValue;
+        for (int i = 0; i < count; i++)
+        {
+            if (elev[i] < min) min = elev[i];
+            if (elev[i] > max) max = elev[i];
+        }
+        float range = Mathf.Max(1f, max - min);
+
+        // The DEM dictates the dimensions; write them back so the inspector
+        // tells the truth about what's in the scene.
+        heightmapResolution = res;
+        terrainSize = (res - 1) * demCellSize;
+        terrainMaxHeight = range;
+
+        data.heightmapResolution = res;
+        data.size = new Vector3(terrainSize, range, terrainSize);
+
+        // File rows run north to south; Unity's heights[iz, ix] starts at the
+        // pivot corner with iz increasing along +z. Flip rows so north stays +z.
+        float[,] heights = new float[res, res];
+        for (int iz = 0; iz < res; iz++)
+        {
+            int fileRow = res - 1 - iz;
+            for (int ix = 0; ix < res; ix++)
+                heights[iz, ix] = (elev[fileRow * res + ix] - min) / range;
+        }
+        data.SetHeights(0, 0, heights);
+
+        Debug.Log($"DEM applied: {res}x{res} at {demCellSize}m, elevation {min:F1}..{max:F1}m ({range:F1}m relief); y=0 is {min:F1}m ASL.");
     }
 
     float ComputeHeight(float x, float z)

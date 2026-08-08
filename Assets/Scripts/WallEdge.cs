@@ -48,13 +48,6 @@ public class WallEdge : MonoBehaviour
     public float skirt;
     // Where the masonry actually starts — baseY less the buried skirt.
     public float FloorY => float.IsNegativeInfinity(baseY) ? baseY : baseY - skirt;
-    // Provenance: laid by the ROOM tool, not the wall tool. Stored, never
-    // inferred from shape — a bailey ringed by curtain walls encloses a
-    // face exactly like a hall does, and only this tells them apart when
-    // the player asks to designate an enclosure after the fact. Surgery
-    // copies it onto sub-edges: splitting a room wall leaves room walls.
-    public bool roomBuilt;
-
     // A doorway through this wall. STORED ON THE EDGE, not as a rider:
     // an opening is a hole in this masonry and nothing else's, so it
     // belongs to the same data the sections are derived from and the
@@ -115,11 +108,7 @@ public class WallEdge : MonoBehaviour
     {
         All.Remove(this);
         // Defensive cleanup for teardown paths that skip WallGraph: nodes
-        // silently drop this member (a node left empty dissolves), and
-        // any room still ringing through this edge breaches. Graph ops
-        // that split (full coverage) re-point rooms BEFORE destroying, so
-        // this only fires for true deaths.
-        WallRoom.NotifyBreach(this);
+        // silently drop this member (a node left empty dissolves).
         if (nodeA != null)
             nodeA.OnMemberGone(this);
         if (nodeB != null)
