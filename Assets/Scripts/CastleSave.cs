@@ -38,7 +38,9 @@ public static class CastleSave
     // 3: slabs became drawn polygons (2026-08-08) — a SlabData carries an
     // outline. Version-2 square tiles still load: they migrate as
     // 4-corner outlines derived from their center/size/yaw.
-    const int Version = 3;
+    // 4: floors carry stairwells (2026-08-09) — stamped holes, stored on
+    // the slab. Versions 2–3 load unchanged: no wells means no wells.
+    const int Version = 4;
 
     // JSON has no -Infinity, and JsonUtility's handling of one is not
     // worth trusting across Unity versions — the graph's "-inf means
@@ -103,10 +105,23 @@ public static class CastleSave
     // rebuilt as the same polygon prism on load. The x/z/size/yaw fields
     // are the version-2 square-tile schema, read only to migrate: a v2
     // tile with no verts loads as the 4-corner outline it was.
+    // A stairwell hole through a floor slab. Its own type because
+    // JsonUtility can't serialize a list of lists directly. `stair` is
+    // the owning stair's index in this save's stairs list (-1 = no owner;
+    // the well then never heals on stair delete) — positional identity,
+    // like everything else here.
+    [Serializable]
+    class WellData
+    {
+        public List<Vector3> verts = new List<Vector3>();
+        public int stair = -1;
+    }
+
     [Serializable]
     class SlabData
     {
         public List<Vector3> verts = new List<Vector3>();
+        public List<WellData> wells = new List<WellData>();
         public float topY, bottomY;
         public bool isFoundation;
         public float x, z;
@@ -175,6 +190,18 @@ public static class CastleSave
     }
 
     public static bool Save(string path)
+    {
+        SaveData data = Capture();
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+        File.WriteAllText(path, JsonUtility.ToJson(data, true));
+        BuildLog.Add($"Saved — {data.edges.Count} walls, {data.stairs.Count} stairs,"
+            + $" {data.slabs.Count} slabs → {Path.GetFileName(path)}.");
+        return true;
+    }
+
+    // Everything the world stores, as data — the save's body, shared with
+    // the delete tool's snapshot undo so both go through one door.
+    static SaveData Capture()
     {
         var data = new SaveData { version = Version };
         Terrain terrain = Terrain.activeTerrain;
@@ -277,13 +304,36 @@ public static class CastleSave
                 isFoundation = t.isFoundation,
             };
             sd.verts.AddRange(t.verts);
+            foreach (SlabTile.Well w in t.wells)
+            {
+                var wd = new WellData();
+                wd.verts.AddRange(w.verts);
+                if (w.owner != null && stairIndex.TryGetValue(w.owner, out int si))
+                    wd.stair = si;
+                sd.wells.Add(wd);
+            }
             data.slabs.Add(sd);
         }
 
-        Directory.CreateDirectory(Path.GetDirectoryName(path));
-        File.WriteAllText(path, JsonUtility.ToJson(data, true));
-        BuildLog.Add($"Saved — {data.edges.Count} walls, {data.stairs.Count} stairs,"
-            + $" {data.slabs.Count} slabs → {Path.GetFileName(path)}.");
+        return data;
+    }
+
+    // In-memory snapshot for one-step undo: the same data a save writes,
+    // never touching disk, restored through the same Apply a load uses —
+    // restore, never re-derive.
+    public static string Snapshot()
+    {
+        return JsonUtility.ToJson(Capture());
+    }
+
+    public static bool RestoreSnapshot(string json, Transform parent, Material material)
+    {
+        if (string.IsNullOrEmpty(json))
+            return false;
+        SaveData data = JsonUtility.FromJson<SaveData>(json);
+        if (data == null)
+            return false;
+        Apply(data, parent, material);
         return true;
     }
 
@@ -295,7 +345,8 @@ public static class CastleSave
             return false;
         }
         SaveData data = JsonUtility.FromJson<SaveData>(File.ReadAllText(path));
-        if (data == null || (data.version != Version && data.version != 2))
+        if (data == null || (data.version != Version && data.version != 2
+            && data.version != 3))
         {
             BuildLog.Add("Save file unreadable or from a different version — not loaded.");
             return false;
@@ -307,6 +358,16 @@ public static class CastleSave
             BuildLog.Add($"Save was made on terrain '{data.terrainName}' — footings"
                 + $" will re-foot on '{terrain.name}'.");
 
+        Apply(data, parent, material);
+        BuildLog.Add($"Loaded — {data.edges.Count} walls, {data.stairs.Count} stairs,"
+            + $" {data.slabs.Count} slabs from {Path.GetFileName(path)}.");
+        return true;
+    }
+
+    // The restore itself: tear the world down and rebuild it from data.
+    // The load's body, shared with the snapshot undo.
+    static void Apply(SaveData data, Transform parent, Material material)
+    {
         Clear();
 
         // Earth before masonry: pristine ground back first, then the
@@ -402,14 +463,22 @@ public static class CastleSave
                 outline.Add(c + ax + az);
                 outline.Add(c - ax + az);
             }
+            List<SlabTile.Well> wells = null;
+            if (sd.wells != null && sd.wells.Count > 0)
+            {
+                wells = new List<SlabTile.Well>();
+                foreach (WellData wd in sd.wells)
+                    if (wd != null && wd.verts != null && wd.verts.Count >= 3)
+                        wells.Add(new SlabTile.Well(
+                            wd.stair >= 0 && wd.stair < stairs.Count
+                                ? stairs[wd.stair] : null,
+                            wd.verts));
+            }
             SlabTile.Create(parent, material, outline, sd.topY, sd.bottomY,
-                sd.isFoundation);
+                sd.isFoundation, wells);
         }
 
         Physics.SyncTransforms();
-        BuildLog.Add($"Loaded — {data.edges.Count} walls, {stairs.Count} stairs,"
-            + $" {data.slabs.Count} slabs from {Path.GetFileName(path)}.");
-        return true;
     }
 
     // Everything the graph owns, removed before the restore —

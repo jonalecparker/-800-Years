@@ -48,7 +48,7 @@ public class GridPlacementSystem : MonoBehaviour
     // Fixed for now rather than scrolled: the wheel already carries four
     // meanings and any new use has to join the arbitration, which isn't
     // worth it to dial a width.
-    public float stairWidth = 1.2f;
+    public float stairWidth = 1.8f;
 
     [Header("Doors")]
     // Fixed for the same reason a stair's width is: dialing them would
@@ -117,8 +117,12 @@ public class GridPlacementSystem : MonoBehaviour
     // another's floor by scrolling instead of luck. Snapped adoption still
     // copies exact heights (EffectiveWallHeight): matching a neighbour IS
     // alignment and beats the grid.
+    // Round HALF-UP, not Mathf.Round: banker's rounding sends exact
+    // half-ties alternately up and down, and the min-height clamp lands
+    // the raw height on exactly such a tie (0.25 × 3.5m = 0.875m) — from
+    // there every notch is a tie and the dial jumped 0.5m with repeats.
     public float CurrentWallHeight => heightScrollRate > 0f
-        ? Mathf.Round(BaseHeight * heightMultiplier / heightScrollRate) * heightScrollRate
+        ? Mathf.Floor(BaseHeight * heightMultiplier / heightScrollRate + 0.5f) * heightScrollRate
         : BaseHeight * heightMultiplier;
 
     // The height the active ghost actually builds at: a snapped ghost
@@ -297,6 +301,10 @@ public class GridPlacementSystem : MonoBehaviour
     private Mesh slabPreviewMesh;
     private readonly List<Vector3> slabTempPoly = new List<Vector3>();
     private readonly List<Vector3> slabBladePoly = new List<Vector3>();
+    // The stairwells the tentative floor outline owes, refilled by
+    // SlabPolyRefusal each frame (one-test doctrine: the wells the ghost
+    // shows are the wells the closing click stores).
+    private readonly List<SlabTile.Well> slabWells = new List<SlabTile.Well>();
     private float curveBulge;
     private float curveApexT = 0.5f;
     private Vector3? splineStart;
@@ -311,6 +319,13 @@ public class GridPlacementSystem : MonoBehaviour
     private Vector2? marqueeStart;
     private Vector2? marqueeEnd;
     private readonly List<SlabTile> marqueeSlabs = new List<SlabTile>();
+    // One-step delete undo: the whole world as save data, captured just
+    // before each delete commits, restored by a right click through the
+    // load path (CastleSave.RestoreSnapshot — full fidelity, one door).
+    // Lives only within the delete-mode session: leaving the tool or
+    // standing down clears it, so a stale snapshot can never roll back
+    // work done since.
+    private string deleteUndoJson;
     private WallEdge offsetSource;
     private float offsetDistance = 3f;
     private float offsetSide = 1f;
@@ -344,6 +359,32 @@ public class GridPlacementSystem : MonoBehaviour
     private readonly List<Mesh> roomFixedMeshes = new List<Mesh>();
     private readonly List<WallEdge.SectionSpec> roomLiveSpecs = new List<WallEdge.SectionSpec>();
     private readonly List<Mesh> roomLiveMeshes = new List<Mesh>();
+    // How many specs/meshes each baked room segment contributed — a right
+    // click pops exactly one segment's worth back off the fixed lists.
+    private readonly List<(int specs, int meshes)> roomBakeCounts = new List<(int, int)>();
+
+    // A clean right CLICK — press and release without crossing the same
+    // pixel threshold the camera's right-drag orbit uses — means "take
+    // back the previous placement" in every chain gesture (slab outline
+    // corners, room chain corners, wall chain legs). A right DRAG is the
+    // orbit and never an undo. Recomputed once per frame, before dispatch.
+    private bool rightClick;
+    private bool rightPressLive;
+    private Vector2 rightPressPos;
+    private const float RightClickMaxPixels = 4f;
+
+    // The straight wall tool CHAINS: each commit re-anchors the gesture
+    // at its own end node, and each leg remembers the edges it created so
+    // a right click can unwind it. History is only live while the chain
+    // is (splineStart set); a fresh anchor click clears it.
+    private struct WallChainLeg
+    {
+        public Vector3 start;
+        public float? baseY;
+        public float height;
+        public List<WallEdge> created;
+    }
+    private readonly List<WallChainLeg> wallChainLegs = new List<WallChainLeg>();
 
     // Ground tool gesture: one drag = one bench or restore band.
     private Vector3? groundAnchor;
@@ -432,6 +473,12 @@ public class GridPlacementSystem : MonoBehaviour
     // ray is the one thing that can tell them apart, and throwing it away
     // made the hover flip between storeys on every stack.
     private float? hoverSnapBase;
+    // The slab the cursor is standing on (its top OR side face — a ray
+    // just past the rim hits the prism's skirt, which is still an aim at
+    // this slab). Walls hug its rim: the point pulls to the outline inset
+    // half a wall thickness, so the wall's outer face lies exactly on the
+    // slab edge (TrySlabRimSnap).
+    private SlabTile hoverSlabTile;
     // The host the CURRENT preview is riding — the gesture's own host
     // while the run stays on it, cleared the moment Alt frees the run so
     // the ghost stops inheriting a curve it no longer follows.
@@ -455,7 +502,21 @@ public class GridPlacementSystem : MonoBehaviour
     // the camera would silently undo an R press.
     private bool stairForward = true;
     private bool stairHeld;
-    private (WallEdge host, int section, float t, bool forward, float side)? lastStairKey;
+    // R's extra stop: the flight turns OUT from the wall face — a
+    // straight perpendicular run from its own foot up to the wall top,
+    // arriving flush at the face. It consumes no masonry arc, so it fits
+    // where an along-wall run can't.
+    private bool stairPerp;
+    // Ctrl+scroll: the dialed CLIMB in quarter steps. Null (the rest
+    // state) means the wall answers — the full top, the old behaviour.
+    // The dial only ever chooses LESS than the hovered wall's own rise;
+    // dialing back up to the top re-adopts it (back to null).
+    private float? stairRiseDial;
+    // The ghost's landing elevation, for the GhostTopY readout — a field
+    // because the preview early-returns on its cache key most frames.
+    private float stairPreviewTopY;
+    private (WallEdge host, int section, float t, bool forward, float side,
+        bool perp, float rise, float bottom)? lastStairKey;
     // Where the run came to rest, so the second sizing pass can read the
     // wall top it actually lands on rather than the one under the cursor.
     private (WallEdge edge, float t)? stairLanding;
@@ -557,6 +618,23 @@ public class GridPlacementSystem : MonoBehaviour
         // world and start placing or deleting behind the bar.
         bool overUI = EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
 
+        // Right-CLICK detection (see the field block): fires on release
+        // only if the pointer stayed inside the orbit threshold, so the
+        // camera's right-drag orbit and the chain undo never collide.
+        rightClick = false;
+        if (mouse.rightButton.wasPressedThisFrame)
+        {
+            rightPressLive = true;
+            rightPressPos = mouse.position.ReadValue();
+        }
+        else if (mouse.rightButton.wasReleasedThisFrame)
+        {
+            rightClick = rightPressLive && !overUI
+                && (mouse.position.ReadValue() - rightPressPos).sqrMagnitude
+                    <= RightClickMaxPixels * RightClickMaxPixels;
+            rightPressLive = false;
+        }
+
         // Save/load hotkeys. Build mode only, by construction — walk
         // mode's early return above never reaches here, which is right:
         // loading swaps the world out from under a walker. Loading also
@@ -592,6 +670,7 @@ public class GridPlacementSystem : MonoBehaviour
         hoverSnapHeight = null;
         hoverBaseY = null;
         hoverSnapBase = null;
+        hoverSlabTile = null;
         pendingNodeGhosts.Clear();
         ghostTopY = null;
 
@@ -651,6 +730,9 @@ public class GridPlacementSystem : MonoBehaviour
         if (mode == ToolMode.Ground)
             GroundTask = GroundAction.Path;
         offsetSource = null;
+        // The delete undo dies with its tool session: anything built
+        // under another tool must never be rolled back by a stale one.
+        deleteUndoJson = null;
         CancelCurve();
         CancelShape();
         CancelRoomChain();
@@ -690,7 +772,9 @@ public class GridPlacementSystem : MonoBehaviour
         hoverSnapHeight = null;
         hoverBaseY = null;
         hoverSnapBase = null;
+        hoverSlabTile = null;
         heightOverride = false;
+        deleteUndoJson = null;
         ClaimingScrollWheel = false;
         // Walk mode hides the HUD, but the Saves panel doesn't — a stale
         // inspect line or ghost-top under the open panel would report a
@@ -737,6 +821,8 @@ public class GridPlacementSystem : MonoBehaviour
             context = "Delete";
             lines.Add("Drag over walls — paint a selection");
             lines.Add("Drag from open ground — marquee");
+            if (deleteUndoJson != null)
+                lines.Add("Right-click — undo the last delete");
             lines.Add("Esc — clear the selection");
         }
         else if (Mode == ToolMode.Offset)
@@ -750,21 +836,25 @@ public class GridPlacementSystem : MonoBehaviour
         }
         else if (Mode == ToolMode.Stair)
         {
-            // No Ctrl+scroll: a stair's height is the wall it's against,
-            // and its length follows from that — neither is dialable, so
-            // neither is listed.
             if (stairHost == null)
                 context = "Stair · point at a wall";
             else if (stairBlocked)
                 context = $"Stair · needs {stairShortfall:0.0}m more wall";
             else if (stairToDoor)
                 context = "Stair · up to the doorway";
+            else if (stairPerp)
+                context = "Stair · out from the wall";
             else
                 context = "Stair";
             lines.Add("Point at a wall's side — the stair fits it");
             lines.Add("Point at a raised doorway — steps up to its sill");
             if (stairHost != null)
-                lines.Add("R — climb the other way");
+                lines.Add("R — flip the climb / turn it out from the wall");
+            // The climb is dialable now; the LENGTH still follows from it
+            // and stays undialable — that's the no-refusal doctrine.
+            lines.Add(stairRiseDial.HasValue
+                ? $"Ctrl + scroll — climb height ({stairRiseDial.Value:0.0#}m)"
+                : "Ctrl + scroll — climb height (the wall top)");
             lines.Add("Click — place it");
         }
         else if (Mode == ToolMode.Door)
@@ -793,7 +883,10 @@ public class GridPlacementSystem : MonoBehaviour
             lines.Add("Ctrl + scroll — plane up/down (¼m)");
             lines.Add("Alt — ignore snaps");
             if (slabChain.Count > 0)
+            {
+                lines.Add("Right-click — undo the last corner");
                 lines.Add("Esc — abandon the outline");
+            }
             lines.Add("Red — mostly buried, skirt too deep, or overlapping");
         }
         else if (Mode == ToolMode.Floor)
@@ -809,6 +902,7 @@ public class GridPlacementSystem : MonoBehaviour
                 lines.Add("Click — add a corner; close on the first corner to fill");
                 lines.Add("Corners snap to wall corners at this plane");
                 lines.Add("A stairwell is drawn AROUND — leave it out of the outline");
+                lines.Add("Right-click — undo the last corner");
                 lines.Add("Esc — abandon the outline");
             }
             lines.Add("Alt — ignore snaps");
@@ -883,7 +977,10 @@ public class GridPlacementSystem : MonoBehaviour
             lines.Add("Alt — free placement (no snapping or stepping)");
             lines.Add("Ctrl + scroll — wall height");
             if (chaining)
+            {
+                lines.Add("Right-click — undo the last corner");
                 lines.Add("Esc — abandon the chain");
+            }
         }
         else if (Shape == BuildShape.Curved)
         {
@@ -923,23 +1020,30 @@ public class GridPlacementSystem : MonoBehaviour
             // Stacking has no free direction, so the keys that steer one
             // (Shift, C) are deliberately absent — the run can only slide
             // along the wall below.
+            bool wallChaining = wallChainLegs.Count > 0;
             if (anchorRideHost != null)
             {
-                context = "Wall · stacking on a wall";
+                context = wallChaining
+                    ? "Wall · chaining on a wall top" : "Wall · stacking on a wall";
                 lines.Add("Drag along the walls — it follows on past corners");
                 lines.Add("Alt — leave the wall below (free placement)");
                 lines.Add("Ctrl + scroll — wall height");
-                lines.Add("Esc — cancel the drag");
             }
             else
             {
-                context = "Wall · drag";
+                context = wallChaining ? "Wall · chaining" : "Wall · drag";
                 lines.Add("Shift — 5° direction steps");
                 lines.Add("C — tangent-tied connector (both ends snapped)");
                 lines.Add("Alt — free placement (no snapping or stepping)");
                 lines.Add("Ctrl + scroll — wall height");
-                lines.Add("Esc — cancel the drag");
             }
+            // Each commit chains: the wall's end is already the next
+            // anchor. Right-click walks the chain back leg by leg.
+            lines.Add(wallChaining
+                ? "Right-click — take back the last wall"
+                : "Right-click — drop the anchor");
+            lines.Add(wallChaining
+                ? "Esc — end the chain (walls stay)" : "Esc — cancel the drag");
         }
         else if (hoverRideHost != null)
         {
@@ -1007,6 +1111,17 @@ public class GridPlacementSystem : MonoBehaviour
             CancelCurve();
             return;
         }
+        // Right click unwinds the chain one leg; with nothing committed
+        // yet it drops the anchor instead. Guarded on a live gesture so a
+        // stale history (chain ended by Esc) can never fire.
+        if (rightClick && splineStart.HasValue)
+        {
+            if (wallChainLegs.Count > 0)
+                UndoWallChainLeg();
+            else
+                CancelCurve();
+            return;
+        }
         if (keyboard != null && keyboard.rKey.wasPressedThisFrame)
             currentYRotation += 45f;
 
@@ -1046,6 +1161,9 @@ public class GridPlacementSystem : MonoBehaviour
                 guideBearing = -(hoverSnapYaw ?? currentYRotation);
                 if (mouse.leftButton.wasPressedThisFrame)
                 {
+                    // A fresh anchor starts a fresh chain — any history
+                    // left from a chain Esc ended is dead now.
+                    wallChainLegs.Clear();
                     splineStart = point;
                     anchorSnap = hoverSnap;
                     anchorSnapYaw = hoverSnapYaw;
@@ -1107,6 +1225,18 @@ public class GridPlacementSystem : MonoBehaviour
                 {
                     splineEnd = flankSnap.point;
                     dragEndSnap = flankSnap;
+                }
+                // The slab rim grabs the far end too, so a drag along a
+                // foundation edge lands corner-miter to corner-miter and
+                // the run lies exactly on the inset line — face flush with
+                // the slab edge. Like the flank, the rim yields to Shift's
+                // stepped bearing; the snap outranks length stepping while
+                // it holds, exactly as a node snap does.
+                else if (!freePlace && !steppedAim && hoverSlabTile != null
+                    && TrySlabRimSnap(hoverSlabTile, rawSurface, out Vector3 rimEnd, out _))
+                {
+                    splineEnd = rimEnd;
+                    dragEndSnap = null;
                 }
                 else
                 {
@@ -1470,6 +1600,9 @@ public class GridPlacementSystem : MonoBehaviour
                 guideBearing = -(hoverSnapYaw ?? 0f);
                 if (mouse.leftButton.wasPressedThisFrame)
                 {
+                    // A fresh anchor starts a fresh chain — any history
+                    // left from a chain Esc ended is dead now.
+                    wallChainLegs.Clear();
                     splineStart = point;
                     anchorSnap = hoverSnap;
                     anchorSnapYaw = hoverSnapYaw;
@@ -1590,14 +1723,78 @@ public class GridPlacementSystem : MonoBehaviour
     // a shared node.
     void CommitSpline()
     {
+        var created = new List<WallEdge>();
+        float chainHeight = 0f;
         if (!previewBlocked && splineSpecs.Count > 0 && pendingCommits.Count > 0)
         {
             foreach ((Vector3 s, Vector3 c, Vector3 e, float height, float topY, float baseY,
                 float skirt) in pendingCommits)
-                WallGraph.CommitEdge(splineParent, s, c, e,
-                    EdgeParamsNow(height, topY, baseY, skirt));
+            {
+                created.AddRange(WallGraph.CommitEdge(splineParent, s, c, e,
+                    EdgeParamsNow(height, topY, baseY, skirt)));
+                chainHeight = height;
+            }
+        }
+
+        // The straight wall tool CHAINS like the room chain: the commit
+        // re-anchors the gesture on its own end node, so the next click
+        // grows the run — same storey, same height, ride re-locked if the
+        // chain stands on masonry. Esc ends the chain; a right click
+        // takes the last leg back. Curved keeps its three-click gesture.
+        if (created.Count > 0 && Mode == ToolMode.Build && Shape == BuildShape.Straight)
+        {
+            wallChainLegs.Add(new WallChainLeg
+            {
+                start = splineStart.Value,
+                baseY = anchorBaseY,
+                height = chainHeight,
+                created = created,
+            });
+            // Sub-edges chain from the gesture's anchor toward its end,
+            // so the last created edge's B node IS the end joint.
+            WallNode endNode = created[created.Count - 1].nodeB;
+            float? chainBase = anchorBaseY;
+            CancelCurve();
+            splineStart = new Vector3(endNode.point.x, 0f, endNode.point.z);
+            anchorBaseY = chainBase;
+            anchorSnapHeight = chainHeight;
+            anchorSnap = MakeNodeSnap(endNode, chainBase);
+            anchorRideHost = chainBase.HasValue
+                ? RideHostUnder(splineStart.Value, chainBase.Value) : null;
+            return;
+        }
+        wallChainLegs.Clear();
+        CancelCurve();
+    }
+
+    // Unwinds the last chain leg: its committed edges come back out of
+    // the graph (hosts it split stay split — a collinear 2-valent node
+    // renders nothing) and the gesture re-anchors where that leg began.
+    // With no legs left the anchor itself is kept, so one more right
+    // click can drop it.
+    void UndoWallChainLeg()
+    {
+        WallChainLeg leg = wallChainLegs[wallChainLegs.Count - 1];
+        wallChainLegs.RemoveAt(wallChainLegs.Count - 1);
+        foreach (WallEdge e in leg.created)
+        {
+            if (e == null)
+                continue;
+            var doomed = new HashSet<int>();
+            foreach (WallEdgeSection sec in e.SectionsInOrder())
+                doomed.Add(sec.index);
+            WallGraph.DeleteSections(splineParent, e, doomed);
         }
         CancelCurve();
+        splineStart = leg.start;
+        anchorBaseY = leg.baseY;
+        anchorSnapHeight = leg.height;
+        WallNode node = WallNode.FindAt(leg.start,
+            leg.baseY ?? float.NegativeInfinity);
+        if (node != null)
+            anchorSnap = MakeNodeSnap(node, leg.baseY);
+        anchorRideHost = leg.baseY.HasValue
+            ? RideHostUnder(leg.start, leg.baseY.Value) : null;
     }
 
     WallGraph.EdgeParams EdgeParamsNow(float height, float topY,
@@ -1626,6 +1823,7 @@ public class GridPlacementSystem : MonoBehaviour
         deckY = null;
         hoverRideHost = null;
         hoverSnapBase = null;
+        hoverSlabTile = null;
         RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
         System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
         foreach (RaycastHit hit in hits)
@@ -1640,6 +1838,7 @@ public class GridPlacementSystem : MonoBehaviour
             {
                 deckY = slab.topY;
                 hoverSnapBase = deckY;
+                hoverSlabTile = slab;
                 return true;
             }
             // A wall's TOP FACE is elevated ground here too: the room and
@@ -2280,6 +2479,13 @@ public class GridPlacementSystem : MonoBehaviour
             CancelRoomChain();
             return;
         }
+        // Right click steps the chain back one corner; popping the anchor
+        // abandons the chain like Esc.
+        if (rightClick && roomChain.Count > 0)
+        {
+            UndoRoomChainLeg();
+            return;
+        }
 
         bool freePlace = keyboard != null && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
         bool snapAngle = keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
@@ -2319,7 +2525,17 @@ public class GridPlacementSystem : MonoBehaviour
                     hoverSnapHeight = SnapHeightOf(flankSnap.edge, flankSnap.point);
                 AdoptSnapElevation(flankSnap);
             }
-            snapTint = attach.HasValue;
+            // The slab rim, same rule as the wall tool: the chain corner
+            // pulls onto the outline inset half a thickness, mitered at
+            // the outline's corners — walls around a foundation hug its
+            // edge face-flush.
+            else if (canSnap && hoverSlabTile != null
+                && TrySlabRimSnap(hoverSlabTile, raw, out Vector3 rimPoint, out _))
+            {
+                point = rimPoint;
+                snapTint = true;
+            }
+            snapTint |= attach.HasValue;
             // Snapped hovers borrow the wall tool's presentation — the
             // existing joint highlights, or a stub leaves the face — so
             // no ghost box sits buried inside the host's masonry.
@@ -2392,6 +2608,14 @@ public class GridPlacementSystem : MonoBehaviour
             {
                 end = flankSnap.point;
                 endAttach = flankSnap;
+            }
+            // The slab rim grabs the chain's next corner too — same rule
+            // as the wall tool's drag end, and it yields to Shift's
+            // stepped bearing the same way the flank does.
+            else if (canSnap && !steppedAim && hoverSlabTile != null
+                && TrySlabRimSnap(hoverSlabTile, raw, out Vector3 rimEnd, out _))
+            {
+                end = rimEnd;
             }
             else
             {
@@ -2526,18 +2750,62 @@ public class GridPlacementSystem : MonoBehaviour
         {
             stairHost = sec.edge;
             stairHeld = false;
+            stairPerp = false;
         }
+        // R cycles the run: flip the along-wall climb, then turn it OUT
+        // from the face, then back along — every stop reachable within
+        // two presses, and each press stays latched off the camera.
         if (flipPressed)
         {
-            stairForward = !stairForward;
-            stairHeld = true;
+            if (!stairHeld)
+            {
+                stairForward = !stairForward;
+                stairHeld = true;
+            }
+            else if (!stairPerp)
+            {
+                stairPerp = true;
+            }
+            else
+            {
+                stairPerp = false;
+                stairForward = !stairForward;
+            }
         }
 
+        HandleStairRiseScroll(mouse, keyboard, sec);
         BuildStairPreview(sec, hit);
         ShowStairGhosts();
+        if (stairSpecs.Count > 0)
+            ghostTopY = stairPreviewTopY;
 
         if (mouse.leftButton.wasPressedThisFrame && pendingStair.HasValue)
             CommitStair();
+    }
+
+    // Ctrl+scroll dials the stair's CLIMB in quarter steps — a partial
+    // flight up a tall wall, for landings mid-storey and tight spaces.
+    // The wall still answers the maximum: the dial can only choose less
+    // than the hovered wall's own rise. Ignored at a doorway target —
+    // the sill IS the point there.
+    void HandleStairRiseScroll(Mouse mouse, Keyboard keyboard, WallEdgeSection sec)
+    {
+        if (keyboard == null || (!keyboard.leftCtrlKey.isPressed && !keyboard.rightCtrlKey.isPressed))
+            return;
+        float scroll = mouse.scroll.ReadValue().y;
+        if (Mathf.Abs(scroll) < 0.01f)
+            return;
+        if (Mathf.Abs(scroll) >= 100f)
+            scroll /= 120f;
+        float notches = Mathf.Clamp(scroll, -4f, 4f);
+        float wallRise = Mathf.Max(0f, sec.topY - MasonryFloorAt(sec));
+        float cur = stairRiseDial ?? wallRise;
+        // Land ON the quarter grid, then step by it (round half-up — the
+        // wall-height dial's convention).
+        cur = Mathf.Floor(cur / SlabTile.FloorStep + 0.5f) * SlabTile.FloorStep
+            + notches * SlabTile.FloorStep;
+        cur = Mathf.Clamp(cur, WallStair.TargetRise * 2f, wallRise);
+        stairRiseDial = cur >= wallRise - 0.01f ? (float?)null : cur;
     }
 
     // The wall a stair or a doorway would go on: the first thing under the
@@ -2582,6 +2850,32 @@ public class GridPlacementSystem : MonoBehaviour
         float bottomY = MasonryFloorAt(sec);
         float tCursor = host.NearestT(hit, out _);
 
+        // The stair's FOOT reads what it stands on, like a deck: the run
+        // sits offset from the wall face, so sample the highest wall top
+        // or slab plane under that offset point. Pointed at a tall wall
+        // from a half-height landing, the flight starts ON the landing —
+        // the second leg of a terraced climb — instead of reaching down
+        // for the room floor. The adopted plane is the storey too
+        // (baseFrom), so the treads sit on the landing rather than
+        // skirting down its face.
+        float baseFrom = host.baseY;
+        {
+            Vector3 centreAt = WallEdge.Evaluate(host.A, host.control, host.B, tCursor);
+            centreAt.y = 0f;
+            Vector3 tanAt = WallEdge.Tangent(host.A, host.control, host.B, tCursor);
+            tanAt.y = 0f;
+            tanAt.Normalize();
+            Vector3 footN = new Vector3(-tanAt.z, 0f, tanAt.x) * host.SideOf(hit);
+            Vector3 foot = centreAt + footN * ((host.thickness + stairWidth) * 0.5f);
+            float rest = StairFootRest(foot, bottomY,
+                sec.topY - WallStair.TargetRise);
+            if (rest > bottomY + 0.01f)
+            {
+                bottomY = rest;
+                baseFrom = rest;
+            }
+        }
+
         // Pointing at a DOORWAY's own masonry asks for steps up TO it: the
         // run climbs to that doorway's sill instead of the wall top, and
         // arrives there rather than setting off from there. A raised sill
@@ -2589,6 +2883,10 @@ public class GridPlacementSystem : MonoBehaviour
         // ground is already reachable.
         stairToDoor = TryDoorTarget(sec, bottomY, out float doorSillY, out float doorCentreArc);
         float target = stairToDoor ? doorSillY : sec.topY;
+        // The dialed climb caps the target; the wall still answers the
+        // maximum. A doorway's sill is a stated point and outranks it.
+        if (!stairToDoor && stairRiseDial.HasValue)
+            target = Mathf.Min(sec.topY, bottomY + stairRiseDial.Value);
 
         bool forward = stairHeld ? stairForward : CameraClimbForward(host, tCursor);
         // Keep the unlatched direction in sync, so the first R press flips
@@ -2602,7 +2900,15 @@ public class GridPlacementSystem : MonoBehaviour
         // EDGE, not at the cursor: the landing is the platform outside the
         // door, and one measured from the door's centre would leave half
         // the opening hanging over the drop.
-        if (stairToDoor)
+        if (stairToDoor && stairPerp)
+        {
+            // A perpendicular flight ARRIVES at the doorway, so it wants
+            // the opening's centre, not its edge — the run is the
+            // classic straight entrance stair.
+            float[] tbl = WallEdge.BuildArcTable(host.A, host.control, host.B);
+            tCursor = WallEdge.TAtArc(tbl, doorCentreArc);
+        }
+        else if (stairToDoor)
         {
             float[] tbl = WallEdge.BuildArcTable(host.A, host.control, host.B);
             float span = tbl[tbl.Length - 1];
@@ -2610,7 +2916,8 @@ public class GridPlacementSystem : MonoBehaviour
             tCursor = WallEdge.TAtArc(tbl, Mathf.Clamp(
                 forward ? doorCentreArc - half : doorCentreArc + half, 0f, span));
         }
-        var key = (host, sec.index, Mathf.Round(tCursor * 500f) / 500f, forward, sideOfTravel);
+        var key = (host, sec.index, Mathf.Round(tCursor * 500f) / 500f, forward, sideOfTravel,
+            stairPerp, stairRiseDial ?? -1f, bottomY);
         if (lastStairKey.HasValue && lastStairKey.Value.Equals(key))
             return;
         lastStairKey = key;
@@ -2628,65 +2935,128 @@ public class GridPlacementSystem : MonoBehaviour
         // Level walls with no corners settle on the first pass.
         float topY = target;
         List<WallStair.Span> spans = null;
-        float climb = 0f, reach = 0f, got = 0f, scale = 1f, covered = 0f;
-        for (int pass = 0; pass < 4; pass++)
+        float runArc = 0f;
+        if (stairPerp)
         {
-            climb = WallStair.RunFor(topY - bottomY);
-            reach = climb + WallStair.LandingRun;
-            spans = StairSpansFrom(host, tCursor, forward, sideOfTravel,
-                reach * scale, climb * scale, out covered);
-            if (spans.Count == 0)
-                break;
-            got = spans[spans.Count - 1].arcEnd;
-
-            // A doorway's sill is a fixed target — there is no wall top to
-            // finish flush with, so only the reach is left to settle.
-            float landed = stairToDoor ? float.NegativeInfinity : TopAtLanding();
-            bool topSettled = float.IsNegativeInfinity(landed) || Mathf.Abs(landed - topY) < 0.01f;
-            bool runSettled = Mathf.Abs(got - reach) < 0.05f;
-            // Out of wall: no amount of scaling conjures more, so stop
-            // rather than spin.
-            if (covered < reach * scale - 0.05f)
-                break;
-            if (topSettled && runSettled)
-                break;
-            if (!topSettled)
-                topY = landed;
-            if (!runSettled && got > 0.01f)
-                scale *= reach / got;
+            // The perpendicular flight: one straight span from its own
+            // foot to the wall face, already ordered bottom→top, arriving
+            // flush at the face at the target height — the wall top (or
+            // the doorway) IS the landing, so there is no landing run.
+            // It consumes no masonry arc, so "not enough wall" cannot
+            // happen and nothing is blocked.
+            float climb = WallStair.RunFor(topY - bottomY);
+            Vector3 centre = WallEdge.Evaluate(host.A, host.control, host.B, tCursor);
+            centre.y = 0f;
+            Vector3 tan = WallEdge.Tangent(host.A, host.control, host.B, tCursor);
+            tan.y = 0f;
+            tan.Normalize();
+            Vector3 outN = new Vector3(-tan.z, 0f, tan.x) * host.SideOf(hit);
+            Vector3 face = centre + outN * (host.thickness * 0.5f);
+            Vector3 foot = face + outN * climb;
+            var curves = new List<(Vector3 s, Vector3 c, Vector3 e)>
+                { (foot, (foot + face) * 0.5f, face) };
+            spans = WallStair.ChainSpans(curves);
+            runArc = spans.Count > 0 ? spans[spans.Count - 1].arcEnd : 0f;
+            ClearStairMeshes();
+            stairSpecs.Clear();
+            stairBlocked = spans.Count == 0;
+            stairShortfall = 0f;
         }
+        else
+        {
+            float climb = 0f, reach = 0f, got = 0f, scale = 1f, covered = 0f;
+            for (int pass = 0; pass < 4; pass++)
+            {
+                climb = WallStair.RunFor(topY - bottomY);
+                reach = climb + WallStair.LandingRun;
+                spans = StairSpansFrom(host, tCursor, forward, sideOfTravel,
+                    reach * scale, climb * scale, out covered);
+                if (spans.Count == 0)
+                    break;
+                got = spans[spans.Count - 1].arcEnd;
 
-        ClearStairMeshes();
-        stairSpecs.Clear();
-        // Arriving at a doorway means the cursor end is the TOP, so the
-        // chain is flipped: the climb ends up first and the landing last,
-        // which is the order BuildStepSpecs already expects. The landing is
-        // then the platform at the door, so it keeps its full length and
-        // any shortfall falls on the climb — which is flagged anyway.
-        if (stairToDoor && spans != null && spans.Count > 0)
-            spans = WallStair.ReverseSpans(spans);
-        // The climb is required; the landing takes what's left over. So a
-        // wall long enough to climb is never refused for being too short
-        // to stand on at the top — it just gives a shorter landing.
-        float runArc = stairToDoor
-            ? Mathf.Min(climb, Mathf.Max(0f, got - WallStair.LandingRun))
-            : Mathf.Min(climb, got);
-        // Short of masonry, the ghost still draws where it would go and
-        // runs red — a refusal is visible in place, never a vanishing act.
-        // The question is asked of the FINISHED run, after the weld.
-        stairBlocked = spans == null || spans.Count == 0 || got < climb - 0.05f;
-        stairShortfall = Mathf.Max(0f, climb - got);
+                // A doorway's sill — or a dialed climb — is a fixed
+                // target: there is no wall top to finish flush with, so
+                // only the reach is left to settle.
+                float landed = stairToDoor || stairRiseDial.HasValue
+                    ? float.NegativeInfinity : TopAtLanding();
+                bool topSettled = float.IsNegativeInfinity(landed) || Mathf.Abs(landed - topY) < 0.01f;
+                bool runSettled = Mathf.Abs(got - reach) < 0.05f;
+                // Out of wall: no amount of scaling conjures more, so stop
+                // rather than spin.
+                if (covered < reach * scale - 0.05f)
+                    break;
+                if (topSettled && runSettled)
+                    break;
+                if (!topSettled)
+                    topY = landed;
+                if (!runSettled && got > 0.01f)
+                    scale *= reach / got;
+            }
+
+            ClearStairMeshes();
+            stairSpecs.Clear();
+            // Arriving at a doorway means the cursor end is the TOP, so the
+            // chain is flipped: the climb ends up first and the landing last,
+            // which is the order BuildStepSpecs already expects. The landing is
+            // then the platform at the door, so it keeps its full length and
+            // any shortfall falls on the climb — which is flagged anyway.
+            if (stairToDoor && spans != null && spans.Count > 0)
+                spans = WallStair.ReverseSpans(spans);
+            // The climb is required; the landing takes what's left over. So a
+            // wall long enough to climb is never refused for being too short
+            // to stand on at the top — it just gives a shorter landing.
+            runArc = stairToDoor
+                ? Mathf.Min(climb, Mathf.Max(0f, got - WallStair.LandingRun))
+                : Mathf.Min(climb, got);
+            // Short of masonry, the ghost still draws where it would go and
+            // runs red — a refusal is visible in place, never a vanishing act.
+            // The question is asked of the FINISHED run, after the weld.
+            stairBlocked = spans == null || spans.Count == 0 || got < climb - 0.05f;
+            stairShortfall = Mathf.Max(0f, climb - got);
+        }
         if (spans != null && spans.Count > 0)
         {
             stairSpecs.AddRange(WallStair.BuildStepSpecs(spans, bottomY, topY,
-                runArc, host.baseY, stairWidth, baseStepSize, BaseHeight));
+                runArc, baseFrom, stairWidth, baseStepSize, BaseHeight));
             foreach (WallEdge.SectionSpec spec in stairSpecs)
                 stairMeshes.Add(spec.mesh);
         }
+        stairPreviewTopY = topY;
         pendingStair = !stairBlocked && stairSpecs.Count > 0
             ? new PendingStair { spans = spans, bottomY = bottomY, topY = topY,
-                                 runArc = runArc, baseFrom = host.baseY }
+                                 runArc = runArc, baseFrom = baseFrom }
             : null;
+    }
+
+    // The highest wall top or slab plane directly under the stair's foot
+    // point, when it stands above `floor` (the host wall's own masonry
+    // floor) and below `ceiling` (the target, less one riser — you can't
+    // start where you're going). Opening sections are skipped: a lintel's
+    // top is not a place to stand.
+    float StairFootRest(Vector3 foot, float floor, float ceiling)
+    {
+        float best = floor;
+        foreach (WallEdge e in WallEdge.All)
+        {
+            if (e == null)
+                continue;
+            float t = e.NearestT(foot, out _);
+            Vector3 on = WallEdge.Evaluate(e.A, e.control, e.B, t);
+            if (FlatDistance(foot, new Vector3(on.x, 0f, on.z))
+                > e.thickness * 0.5f + 0.05f)
+                continue;
+            foreach (WallEdgeSection s in e.SectionsInOrder())
+                if (s.openingIndex < 0
+                    && t >= s.tStart - 0.0001f && t <= s.tEnd + 0.0001f
+                    && s.topY > best && s.topY <= ceiling)
+                    best = s.topY;
+        }
+        foreach (SlabTile tile in SlabTile.All)
+            if (tile != null && SlabTile.Contains(tile.verts, foot)
+                && tile.topY > best && tile.topY <= ceiling)
+                best = tile.topY;
+        return best;
     }
 
     // The doorway this cursor is asking for steps up to: the section under
@@ -2837,7 +3207,28 @@ public class GridPlacementSystem : MonoBehaviour
         float landing = stair.TotalArc - stair.runArc;
         BuildLog.Add($"Stair — {stair.StepCount} steps, {stair.Rise:0.0}m rise,"
             + $" {landing:0.0}m landing.");
-        // A stair that arrives at a roofed deck opens its own way through.
+        // A stair built under an existing floor opens its own way through
+        // — the same stamp the floor tool makes when drawn over a stair.
+        // A well clipping the floor's edge is skipped, not forced: the
+        // stair pokes past the floor there and the hole can't be cut
+        // cleanly; redraw the floor over it to cover it properly.
+        foreach (SlabTile tile in SlabTile.All)
+        {
+            if (tile == null || tile.isFoundation)
+                continue;
+            List<Vector3> fp = StairWellFootprint(stair, tile.topY);
+            if (fp == null || PolysCross(fp, tile.verts))
+                continue;
+            int inside = 0;
+            foreach (Vector3 v in fp)
+                if (SlabTile.Contains(tile.verts, v))
+                    inside++;
+            if (inside < fp.Count)
+                continue;
+            tile.wells.Add(new SlabTile.Well(stair, fp));
+            tile.Rebuild();
+            BuildLog.Add("Stairwell opened in the floor above.");
+        }
         CancelStair();
     }
 
@@ -3109,12 +3500,37 @@ public class GridPlacementSystem : MonoBehaviour
     // chain's baked set and the live slot starts over.
     void BakeRoomLiveSegment()
     {
+        roomBakeCounts.Add((roomLiveSpecs.Count, roomLiveMeshes.Count));
         roomFixedSpecs.AddRange(roomLiveSpecs);
         roomFixedMeshes.AddRange(roomLiveMeshes);
         roomLiveSpecs.Clear();
         roomLiveMeshes.Clear();
         lastRoomKey = null;
         roomLiveBlocked = false;
+    }
+
+    // Pops the last baked segment — its vertex off the chain, its specs
+    // and meshes off the fixed ghost — so a right click walks the chain
+    // back corner by corner. An anchor with no segments cancels outright.
+    void UndoRoomChainLeg()
+    {
+        if (roomChain.Count <= 1 || roomBakeCounts.Count == 0)
+        {
+            CancelRoomChain();
+            return;
+        }
+        roomChain.RemoveAt(roomChain.Count - 1);
+        (int specs, int meshes) = roomBakeCounts[roomBakeCounts.Count - 1];
+        roomBakeCounts.RemoveAt(roomBakeCounts.Count - 1);
+        for (int i = 0; i < meshes; i++)
+        {
+            Destroy(roomFixedMeshes[roomFixedMeshes.Count - 1]);
+            roomFixedMeshes.RemoveAt(roomFixedMeshes.Count - 1);
+        }
+        roomFixedSpecs.RemoveRange(roomFixedSpecs.Count - specs, specs);
+        lastRoomKey = null;
+        roomLiveBlocked = false;
+        ShowRoomGhosts();
     }
 
     // Baked chain in preview blue, live segment gold when the next click
@@ -3181,6 +3597,7 @@ public class GridPlacementSystem : MonoBehaviour
     void CancelRoomChain()
     {
         roomChain.Clear();
+        roomBakeCounts.Clear();
         roomStartAttach = null;
         roomChainBaseY = null;
         roomLiveClosing = false;
@@ -3382,6 +3799,15 @@ public class GridPlacementSystem : MonoBehaviour
             CancelSlabChain();
             return;
         }
+        // Right click steps the outline back one corner — the anchor
+        // included, which abandons the outline like Esc.
+        if (rightClick && slabChain.Count > 0)
+        {
+            slabChain.RemoveAt(slabChain.Count - 1);
+            if (slabChain.Count == 0)
+                CancelSlabChain();
+            return;
+        }
         bool free = keyboard != null
             && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
         if (foundation)
@@ -3454,11 +3880,16 @@ public class GridPlacementSystem : MonoBehaviour
                 ? FoundationBottom(slabChain, slabChainPlane)
                 : slabChainPlane - SlabTile.Thickness;
             SlabTile.Create(splineParent, wallMaterial, slabChain,
-                slabChainPlane, bottom, foundation);
+                slabChainPlane, bottom, foundation,
+                foundation ? null : slabWells);
             BuildLog.Add((foundation ? "Foundation" : "Floor")
                 + $" — {slabChain.Count} corners,"
                 + $" {Mathf.Abs(SlabTile.SignedArea(slabChain)):0.#}m²"
-                + $" at {slabChainPlane:0.##}m.");
+                + $" at {slabChainPlane:0.##}m."
+                + (!foundation && slabWells.Count > 0
+                    ? $" {slabWells.Count} stairwell"
+                        + (slabWells.Count == 1 ? "" : "s") + " cut."
+                    : ""));
             CancelSlabChain();
         }
         else if (FlatDistance(point, slabChain[slabChain.Count - 1]) >= 0.25f)
@@ -3690,6 +4121,117 @@ public class GridPlacementSystem : MonoBehaviour
         return new Vector3(a.x + ab.x * t, 0f, a.z + ab.z * t);
     }
 
+    // How close an aim must be to grab the rim's LINE (its corners grab
+    // at endpointSnapRadius, a rim corner being a would-be node). The aim
+    // is measured against the outline AND the inset centerline both —
+    // pointing at the visible slab edge and pointing at where the wall
+    // will stand are the same intent.
+    const float RimEdgeSnapRadius = 0.45f;
+
+    // Walls hug a slab's rim: a point over the slab pulls to the outline
+    // inset half a wall thickness, so the committed wall's outer FACE
+    // lies exactly on the slab edge. Near an outline corner the pull is
+    // to the MITERED corner point — the spot where the inset lines of
+    // both adjacent edges meet — so walls drawn along adjacent edges
+    // close on ONE shared node whatever the corner's angle. Yaw reports
+    // the rim's bearing at the snap so the hover stub lies along it.
+    bool TrySlabRimSnap(SlabTile tile, Vector3 raw, out Vector3 point, out float yaw)
+    {
+        point = default;
+        yaw = 0f;
+        List<Vector3> verts = tile.verts;
+        int n = verts.Count;
+        if (n < 3)
+            return false;
+        float half = gridSize * 0.5f;
+
+        // Every vertex's inset corner. Verts are CCW (SlabTile.Create
+        // normalizes), so the interior is to the LEFT of travel.
+        var inset = new Vector3[n];
+        var valid = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            Vector3 inPrev = RimInward(verts[(i + n - 1) % n], verts[i]);
+            Vector3 inNext = RimInward(verts[i], verts[(i + 1) % n]);
+            float denom = 1f + Vector3.Dot(inPrev, inNext);
+            // A near-reversal spike would throw its miter to infinity;
+            // no drawable outline has one, but refuse rather than fling.
+            valid[i] = denom > 0.05f;
+            if (valid[i])
+                inset[i] = verts[i] + (inPrev + inNext) * (half / denom);
+        }
+
+        // Corners first — aiming at the outline vertex or at its inset
+        // corner both mean the corner.
+        int bestCorner = -1;
+        float best = endpointSnapRadius;
+        for (int i = 0; i < n; i++)
+        {
+            if (!valid[i])
+                continue;
+            float d = Mathf.Min(FlatDistance(raw, inset[i]),
+                FlatDistance(raw, verts[i]));
+            if (d < best)
+            {
+                best = d;
+                bestCorner = i;
+            }
+        }
+        if (bestCorner >= 0)
+        {
+            point = new Vector3(inset[bestCorner].x, 0f, inset[bestCorner].z);
+            // The stub lies along whichever adjacent edge the aim favours.
+            int prev = (bestCorner + n - 1) % n;
+            int next = (bestCorner + 1) % n;
+            float dPrev = FlatDistance(raw,
+                ClosestOnSegment(verts[prev], verts[bestCorner], raw));
+            float dNext = FlatDistance(raw,
+                ClosestOnSegment(verts[bestCorner], verts[next], raw));
+            Vector3 along = dNext <= dPrev
+                ? verts[next] - verts[bestCorner]
+                : verts[bestCorner] - verts[prev];
+            yaw = Mathf.Atan2(-along.z, along.x) * Mathf.Rad2Deg;
+            return true;
+        }
+
+        // Then the rim lines, corner-miter to corner-miter.
+        best = RimEdgeSnapRadius;
+        int bestEdge = -1;
+        Vector3 bestPt = default;
+        for (int i = 0; i < n; i++)
+        {
+            int j = (i + 1) % n;
+            if (!valid[i] || !valid[j])
+                continue;
+            Vector3 q = ClosestOnSegment(inset[i], inset[j], raw);
+            float d = Mathf.Min(FlatDistance(raw, q),
+                FlatDistance(raw, ClosestOnSegment(verts[i], verts[j], raw)));
+            if (d < best)
+            {
+                best = d;
+                bestEdge = i;
+                bestPt = q;
+            }
+        }
+        if (bestEdge < 0)
+            return false;
+        point = new Vector3(bestPt.x, 0f, bestPt.z);
+        Vector3 dir = verts[(bestEdge + 1) % n] - verts[bestEdge];
+        yaw = Mathf.Atan2(-dir.z, dir.x) * Mathf.Rad2Deg;
+        return true;
+    }
+
+    // Unit inward (interior-side) normal of the outline edge a→b. The
+    // prism's outward side normal is (dz, -dx) (SlabTile.BuildPrism);
+    // this is its negation.
+    static Vector3 RimInward(Vector3 a, Vector3 b)
+    {
+        Vector3 d = b - a;
+        d.y = 0f;
+        Vector3 inward = new Vector3(-d.z, 0f, d.x);
+        return inward.sqrMagnitude > 0.000001f ? inward.normalized : Vector3.zero;
+    }
+
     // A wall corner carrying masonry AT the plane — the floor outline's
     // strongest snap: flooring a room is clicking its corners. The end
     // section's top is the test (a node is an edge END here, always).
@@ -3734,6 +4276,7 @@ public class GridPlacementSystem : MonoBehaviour
     // doctrine).
     string SlabPolyRefusal(List<Vector3> poly, float plane, bool foundation)
     {
+        slabWells.Clear();
         if (SlabTile.SelfIntersects(poly))
             return "the outline crosses itself.";
         if (Mathf.Abs(SlabTile.SignedArea(poly)) < 0.25f)
@@ -3761,6 +4304,14 @@ public class GridPlacementSystem : MonoBehaviour
             if (plane - minG > SlabTile.MaxSkirt + 0.01f)
                 return $"the skirt would drop over {SlabTile.MaxSkirt:0}m"
                     + " — dial the plane down, or terrace.";
+        }
+        else
+        {
+            // Each stair the floor is drawn over demands its own well —
+            // stamped here, shown by the ghost, stored by the commit.
+            string wells = CollectStairWells(poly, plane, slabWells);
+            if (wells != null)
+                return wells;
         }
         return null;
     }
@@ -3814,6 +4365,192 @@ public class GridPlacementSystem : MonoBehaviour
         return Mathf.Min(bottom, plane - 0.25f);
     }
 
+    // ------------------------------------------------------------------
+    // Stairwells — the law WallRoom's derived decks carried, revived for
+    // drawn floors (2026-08-09): each stair demands its own well.
+    //
+    // How much CLEAR head the well guarantees under the floor's UNDERSIDE
+    // — deliberately far more than a body needs (WalkMode stands 1.8m),
+    // and deliberately not computed. Sizing this to the minimum was a
+    // mistake twice over in the old system; a stairwell bigger than it
+    // has to be costs a little deck nobody stands on, one a few
+    // centimetres too small costs a head, every single climb.
+    const float StairHeadroom = 3f;
+    // A stair butts flush against a wall's inner face, and a floor's
+    // outline runs to the wall NODES — so the well's natural footprint
+    // can touch the outline, and a keyhole bridge needs a hole that is
+    // strictly interior. The well is drawn a lip narrower than the
+    // treads; the coplanar lip over the landing's outer centimetres
+    // reads as a joint line.
+    const float WellLip = 0.05f;
+    // And the hole opens this much further down the run again, because a
+    // climber is a body, not a point: at the well's edge you stand on the
+    // tread under your leading foot with the back of your skull still
+    // under the floor. Generous for the same reason Headroom is.
+    const float WellLead = 1f;
+    const int WellSamplesPerSpan = 6;
+
+    // The well each standing stair demands through a floor at `plane`
+    // over `poly`, written into `into`. Returns a refusal instead when
+    // the outline's edge CROSSES a well — a floor may cover a stair
+    // (the well is cut) or stay clear of it, but not clip it. Run by
+    // SlabPolyRefusal, so the ghost's red and the closing click are one
+    // fact and the wells the ghost shows are the wells the commit stores.
+    string CollectStairWells(List<Vector3> poly, float plane,
+        List<SlabTile.Well> into)
+    {
+        into.Clear();
+        foreach (WallStair stair in WallStair.All)
+        {
+            if (stair == null)
+                continue;
+            List<Vector3> fp = StairWellFootprint(stair, plane);
+            if (fp == null)
+                continue;
+            // Wholly in means a well; wholly out means no business here;
+            // anything between — a proper edge crossing, or vertices on
+            // both sides (a cut that threads exactly through the well's
+            // sample points strictly crosses nothing) — is a clip.
+            int inside = 0;
+            foreach (Vector3 v in fp)
+                if (SlabTile.Contains(poly, v))
+                    inside++;
+            if (PolysCross(fp, poly) || (inside > 0 && inside < fp.Count))
+                return "the outline clips a stairwell — cover the stair"
+                    + " or draw around it.";
+            if (inside == fp.Count)
+                into.Add(new SlabTile.Well(stair, fp));
+            else if (SlabTile.Contains(fp, poly[0]))
+                return "the outline sits inside a stairwell.";
+        }
+        return null;
+    }
+
+    // A deleted stair takes its wells with it: every floor it opened
+    // heals in the same act. Explicit at the delete site (the old
+    // NotifyStairGone's job), never a destroy hook — a LOAD also destroys
+    // stairs, and healing tiles that are themselves being replaced would
+    // be wasted work at best. Ownerless wells (owner already gone, or a
+    // save predating owners) stay: delete and redraw the floor.
+    void CloseStairWells(WallStair stair)
+    {
+        foreach (SlabTile tile in SlabTile.All)
+        {
+            if (tile == null || tile.isFoundation)
+                continue;
+            if (tile.wells.RemoveAll(w => w.owner == stair) > 0)
+            {
+                tile.Rebuild();
+                BuildLog.Add("Stairwell closed — the floor healed.");
+            }
+        }
+    }
+
+    static bool PolysCross(List<Vector3> a, List<Vector3> b)
+    {
+        for (int i = 0; i < a.Count; i++)
+            for (int j = 0; j < b.Count; j++)
+                if (SlabTile.SegmentsCross(a[i], a[(i + 1) % a.Count],
+                        b[j], b[(j + 1) % b.Count]))
+                    return true;
+        return false;
+    }
+
+    // The plan footprint the climb needs open through a floor at `plane`:
+    // from the tread that first comes within Headroom of the underside,
+    // through the landing at the top. The landing matters as much as the
+    // climb — it finishes flush AT the floor plane, so left uncut it
+    // would be coplanar with the deck it is supposed to arrive on.
+    List<Vector3> StairWellFootprint(WallStair stair, float plane)
+    {
+        if (stair.spans.Count == 0)
+            return null;
+        float rise = stair.topY - stair.bottomY;
+        if (rise < 0.05f)
+            return null;
+        // The elevation a climber's feet are at when their head first
+        // needs the hole — Headroom of clear air under the SOFFIT.
+        float openAt = plane - SlabTile.Thickness - StairHeadroom;
+        // Standing on this floor, or never reaching it: no hole either way.
+        if (stair.bottomY >= plane - 0.01f || stair.topY <= openAt + 0.01f)
+            return null;
+
+        float runArc = stair.runArc > 0.01f ? stair.runArc : stair.TotalArc;
+        // Where along the run that elevation falls — counted in TREADS,
+        // not along the line between the stair's ends. A stair is not a
+        // ramp: the step you stand on is up to a whole riser above that
+        // line, and taking the line for the climb is what once let a
+        // well be cut a tread and a half too late.
+        int steps = WallStair.StepsFor(rise);
+        float riser = rise / steps;
+        float going = runArc / steps;
+        // The last tread whose TOP still leaves full Headroom under the
+        // soffit. Everything above it needs the hole.
+        int lastClear = Mathf.FloorToInt((openAt - stair.bottomY) / riser);
+        float from = Mathf.Clamp(lastClear * going - WellLead, 0f, runArc);
+        return StairStrip(stair, from, stair.TotalArc,
+            stair.width * 0.5f - WellLip);
+    }
+
+    // The stair's own curve, walked between two arc positions and given
+    // a width: the run's plan shape, corners and all, rather than a box
+    // around it. A stair that turns a corner gets a hole that turns too.
+    static List<Vector3> StairStrip(WallStair stair, float from, float to,
+        float half)
+    {
+        var left = new List<Vector3>();
+        var right = new List<Vector3>();
+        foreach (WallStair.Span sp in stair.spans)
+        {
+            float lo = Mathf.Max(from, sp.arcStart);
+            float hi = Mathf.Min(to, sp.arcEnd);
+            if (hi - lo < 0.01f)
+                continue;
+            float[] table = WallEdge.BuildArcTable(sp.s, sp.c, sp.e);
+            for (int i = 0; i <= WellSamplesPerSpan; i++)
+            {
+                float arc = Mathf.Lerp(lo, hi,
+                    (float)i / WellSamplesPerSpan) - sp.arcStart;
+                float t = WallEdge.TAtArc(table, arc);
+                Vector3 p = WallEdge.Evaluate(sp.s, sp.c, sp.e, t);
+                Vector3 d = WallEdge.Tangent(sp.s, sp.c, sp.e, t);
+                d.y = 0f;
+                if (d.sqrMagnitude < 1e-8f)
+                    continue;
+                d.Normalize();
+                Vector3 side = new Vector3(-d.z, 0f, d.x) * half;
+                left.Add(new Vector3(p.x + side.x, 0f, p.z + side.z));
+                right.Add(new Vector3(p.x - side.x, 0f, p.z - side.z));
+            }
+        }
+        if (left.Count < 2)
+            return null;
+        right.Reverse();
+        var poly = new List<Vector3>(left);
+        poly.AddRange(right);
+        poly = DedupeOutline(poly);
+        if (poly.Count < 3 || Mathf.Abs(SlabTile.SignedArea(poly)) < 0.05f)
+            return null;
+        if (SlabTile.SignedArea(poly) < 0f)
+            poly.Reverse();
+        return poly;
+    }
+
+    // Span joints repeat a point, and ear clipping treats a repeat as a
+    // zero-area ear it can never remove.
+    static List<Vector3> DedupeOutline(List<Vector3> poly)
+    {
+        var result = new List<Vector3>(poly.Count);
+        foreach (Vector3 p in poly)
+            if (result.Count == 0
+                || (result[result.Count - 1] - p).sqrMagnitude > 4e-4f)
+                result.Add(p);
+        while (result.Count > 1
+            && (result[0] - result[result.Count - 1]).sqrMagnitude <= 4e-4f)
+            result.RemoveAt(result.Count - 1);
+        return result;
+    }
+
     // The chain on screen: pooled ghost 0 is the FILL — the tentative
     // polygon as the very prism the closing click would commit — and the
     // rest are corner markers, the first corner reading larger once the
@@ -3834,8 +4571,12 @@ public class GridPlacementSystem : MonoBehaviour
         bool drewFill = false;
         if (slabTempPoly.Count >= 3)
         {
+            // A floor's ghost carries the stairwells the commit would cut
+            // (SlabPolyRefusal stamped them this frame) — the hole is
+            // visible before the closing click, not a surprise after it.
             SlabTile.BuildPrism(slabPreviewMesh, slabTempPoly,
-                plane + 0.002f, bottom, Vector3.zero);
+                plane + 0.002f, bottom, Vector3.zero,
+                foundation ? null : slabWells);
             drewFill = slabPreviewMesh.vertexCount > 0;
         }
         else if (slabTempPoly.Count == 2)
@@ -4058,6 +4799,7 @@ public class GridPlacementSystem : MonoBehaviour
         rawSurface = default;
         hoverRideHost = null;
         hoverSnapBase = null;
+        hoverSlabTile = null;
 
         RaycastHit first = default;
         bool hasHit = false;
@@ -4090,6 +4832,7 @@ public class GridPlacementSystem : MonoBehaviour
         {
             deckY = slabTile.topY;
             hoverBaseY = deckY;
+            hoverSlabTile = slabTile;
         }
         // A cut-open wall's cross-section is not a wall top: it has the
         // same upward normal, but stacking on it would build at the wall's
@@ -4151,6 +4894,20 @@ public class GridPlacementSystem : MonoBehaviour
             AdoptSnapElevation(flankSnap);
             point = flankSnap.point;
             AdoptRideHostUnder(point, slabTile != null);
+            return true;
+        }
+
+        // The slab's rim: nothing built claimed the point, so it pulls to
+        // the outline inset half a wall thickness — the wall's outer face
+        // lands exactly on the slab edge, and near an outline corner the
+        // pull is to the MITERED corner point, so walls drawn along
+        // adjacent edges meet at one shared node. Existing masonry (the
+        // snaps above) outranks the rim; Alt frees, as everywhere.
+        if (slabTile != null
+            && TrySlabRimSnap(slabTile, rawSurface, out Vector3 rimPoint, out float rimYaw))
+        {
+            hoverSnapYaw = rimYaw;
+            point = rimPoint;
             return true;
         }
 
@@ -5212,6 +5969,17 @@ public class GridPlacementSystem : MonoBehaviour
             CancelDelete();
             return;
         }
+        // Right click puts back whatever the last delete removed — the
+        // pre-delete snapshot, restored wholesale through the load path.
+        if (rightClick && deleteUndoJson != null)
+        {
+            CancelDelete();
+            string json = deleteUndoJson;
+            deleteUndoJson = null;
+            if (CastleSave.RestoreSnapshot(json, splineParent, wallMaterial))
+                BuildLog.Add("Delete undone.");
+            return;
+        }
 
         if (marqueeStart.HasValue)
         {
@@ -5242,6 +6010,7 @@ public class GridPlacementSystem : MonoBehaviour
                 {
                     if (mouse.leftButton.wasPressedThisFrame)
                     {
+                        deleteUndoJson = CastleSave.Snapshot();
                         WallEdge host = hovered.edge;
                         host.openings.RemoveAt(hovered.openingIndex);
                         host.Rebuild();
@@ -5265,6 +6034,8 @@ public class GridPlacementSystem : MonoBehaviour
                     doomedSections.Add(child);
                 if (mouse.leftButton.wasPressedThisFrame)
                 {
+                    deleteUndoJson = CastleSave.Snapshot();
+                    CloseStairWells(hoveredStair);
                     Destroy(hoveredStair.gameObject);
                     BuildLog.Add("Stair removed.");
                     doomedSections.Clear();
@@ -5277,6 +6048,7 @@ public class GridPlacementSystem : MonoBehaviour
                 doomedSections.Add(hoveredSlab.transform);
                 if (mouse.leftButton.wasPressedThisFrame)
                 {
+                    deleteUndoJson = CastleSave.Snapshot();
                     Destroy(hoveredSlab.gameObject);
                     BuildLog.Add(hoveredSlab.isFoundation
                         ? "Foundation removed." : "Floor removed.");
@@ -5305,6 +6077,8 @@ public class GridPlacementSystem : MonoBehaviour
     // exactly once — all of its doomed indices in a single graph call.
     void CommitDelete()
     {
+        if (deleteRanges.Count > 0 || marqueeSlabs.Count > 0)
+            deleteUndoJson = CastleSave.Snapshot();
         var byEdge = new Dictionary<WallEdge, HashSet<int>>();
         foreach ((WallEdge edge, int lo, int hi) in deleteRanges)
         {

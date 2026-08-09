@@ -6,7 +6,13 @@
       "mcp__UnityMCP__validate_script",
       "mcp__UnityMCP__find_gameobjects",
       "PowerShell(Start-Sleep *)",
-      "PowerShell(Get-NetTCPConnection *)"
+      "PowerShell(Get-NetTCPConnection *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Get-Content *)",
+      "Bash(git fetch)",
+      "Bash(git fetch *)",
+      "Bash(tasklist)",
+      "Bash(tasklist *)"
     ]
   }
 }

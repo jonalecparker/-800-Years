@@ -68,7 +68,7 @@ public class WallStair : MonoBehaviour
     // below this, so a stair on a deck sits ON the deck instead of
     // reaching for the ground far underneath it.
     public float baseFrom = float.NegativeInfinity;
-    public float width = 1.2f;
+    public float width = 1.8f;
 
     [HideInInspector] public Material material;
 

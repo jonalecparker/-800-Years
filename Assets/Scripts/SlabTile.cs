@@ -19,6 +19,28 @@ public class SlabTile : MonoBehaviour
 
     // The outline at the top plane, world XZ (y carries nothing), CCW.
     public readonly List<Vector3> verts = new List<Vector3>();
+    // A stairwell: a hole cut through the slab, a CCW polygon strictly
+    // inside the outline, owned by the stair that demanded it. STAMPED at
+    // commit time (floor drawn over a stair, or a stair committed under a
+    // floor) and stored — never re-derived. The OWNER is a stored
+    // relationship, not an inference: deleting the stair closes its wells
+    // and the floor heals (the delete tool's job, like the old
+    // NotifyStairGone). An ownerless well (a save that predates owners)
+    // just never heals that way — delete and redraw the floor.
+    public class Well
+    {
+        public WallStair owner;
+        public readonly List<Vector3> verts = new List<Vector3>();
+        public Well(WallStair owner, List<Vector3> verts)
+        {
+            this.owner = owner;
+            if (verts != null)
+                this.verts.AddRange(verts);
+        }
+    }
+
+    // Foundations never carry wells.
+    public readonly List<Well> wells = new List<Well>();
     public float topY;       // the plane — build surface, floor underfoot
     public float bottomY;    // foundation: skirted below ground; floor: topY - Thickness
     public bool isFoundation;
@@ -32,11 +54,16 @@ public class SlabTile : MonoBehaviour
     // ground; a deeper dip under the plane refuses placement (live on
     // the ghost — one-test doctrine). Provisional, tuned by feel.
     public const float MaxSkirt = 2f;
+    // Texture-V anchor for the side bands — WallEdge.baseWallHeight's
+    // convention (one tile of stone per this much world height), so a
+    // foundation's skirt shows the same courses as the masonry beside it.
+    public const float CourseHeight = 3.5f;
 
     static Mesh unitCube;
 
     public static SlabTile Create(Transform parent, Material material,
-        List<Vector3> outline, float topY, float bottomY, bool isFoundation)
+        List<Vector3> outline, float topY, float bottomY, bool isFoundation,
+        List<Well> wells = null)
     {
         var go = new GameObject(isFoundation ? "Foundation" : "Floor");
         go.transform.SetParent(parent, false);
@@ -45,6 +72,10 @@ public class SlabTile : MonoBehaviour
             tile.verts.Add(new Vector3(v.x, 0f, v.z));
         if (SignedArea(tile.verts) < 0f)
             tile.verts.Reverse();
+        if (wells != null)
+            foreach (Well w in wells)
+                if (w != null && w.verts.Count >= 3)
+                    tile.wells.Add(new Well(w.owner, w.verts));
         tile.topY = topY;
         tile.bottomY = bottomY;
         tile.isFoundation = isFoundation;
@@ -61,11 +92,49 @@ public class SlabTile : MonoBehaviour
         // wall top is SAME-facing coplanar with it, which z-fights. The
         // stored topY stays exact — planes match by data, not by pixels.
         BuildPrism(mesh, tile.verts, topY + 0.002f, bottomY,
-            go.transform.position);
+            go.transform.position, tile.wells);
         go.AddComponent<MeshFilter>().sharedMesh = mesh;
         go.AddComponent<MeshRenderer>().sharedMaterial = material;
         go.AddComponent<MeshCollider>().sharedMesh = mesh;
         return tile;
+    }
+
+    // Re-meshes the prism in place after the stored facts changed (a
+    // stair committed under this floor stamping a new well, or a deleted
+    // stair closing one). Immediate, not deferred: the well is cut
+    // mid-commit and the old collider would otherwise stay in the ray's
+    // way for the rest of the frame.
+    //
+    // The origin is RECOMPUTED FROM STORED FACTS, never read off the
+    // transform: the cutaway may be holding this very slab sliced or
+    // hidden right now (placing a stair inside a roofed room is exactly
+    // that), and a mesh baked against the cut-frame transform renders
+    // metres off once the cut clears. Same numbers Create used, so an
+    // unsliced rebuild is byte-identical.
+    public void Rebuild()
+    {
+        MeshFilter filter = GetComponent<MeshFilter>();
+        if (filter == null || filter.sharedMesh == null)
+            return;
+        Vector3 centroid = Centroid(verts);
+        Vector3 origin = new Vector3(
+            centroid.x, (topY + bottomY) * 0.5f, centroid.z);
+        BuildPrism(filter.sharedMesh, verts, topY + 0.002f, bottomY,
+            origin, wells);
+        MeshCollider col = GetComponent<MeshCollider>();
+        if (col != null)
+        {
+            // Re-cook ENABLED, whatever state the cutaway left it in: a
+            // disabled MeshCollider skips the re-bake silently and stays
+            // ray-transparent forever after re-enabling — the roof you
+            // can see but whose delete ghost lands on the foundation.
+            // The cutaway re-asserts its own state next frame.
+            bool was = col.enabled;
+            col.enabled = true;
+            col.sharedMesh = null;
+            col.sharedMesh = filter.sharedMesh;
+            col.enabled = was;
+        }
     }
 
     void OnDestroy()
@@ -213,7 +282,13 @@ public class SlabTile : MonoBehaviour
                 {
                     if (other == ia || other == ib || other == ic)
                         continue;
-                    if (PointInTriangle(poly[other], a, b, c))
+                    // A bridged well repeats its two seam vertices, and a
+                    // repeat sits exactly ON the ear it duplicates — count
+                    // it and no ear near the seam is ever clippable.
+                    Vector3 q = poly[other];
+                    if (Coincident(q, a) || Coincident(q, b) || Coincident(q, c))
+                        continue;
+                    if (PointInTriangle(q, a, b, c))
                     {
                         holds = true;
                         break;
@@ -253,8 +328,13 @@ public class SlabTile : MonoBehaviour
     // Fills a mesh with the outline swept from bottom to top — flat caps,
     // vertical sides, hard normals — with vertex positions relative to
     // origin. The commit and the placement ghost both build through here.
+    // Wells are holes cut through both caps (bridged into the cap polygon
+    // keyhole-style) with their own inward-facing side bands — the well
+    // shaft. A well the bridge can't reach cleanly is left uncut rather
+    // than tearing the cap along a bad seam.
     public static void BuildPrism(Mesh mesh, List<Vector3> outline,
-        float top, float bottom, Vector3 origin)
+        float top, float bottom, Vector3 origin,
+        List<Well> wells = null)
     {
         mesh.Clear();
         var poly = outline;
@@ -263,22 +343,54 @@ public class SlabTile : MonoBehaviour
             poly = new List<Vector3>(outline);
             poly.Reverse();
         }
+
+        // The cap: the outline with every well bridged in. Track which
+        // wells actually merged so only those get shaft bands.
+        List<Vector3> cap = poly;
+        var cut = new List<List<Vector3>>();
+        if (wells != null)
+            foreach (Well w in wells)
+            {
+                if (w == null || w.verts.Count < 3)
+                    continue;
+                List<Vector3> merged = BridgeHole(cap, w.verts);
+                if (merged != cap)
+                {
+                    cap = merged;
+                    cut.Add(w.verts);
+                }
+            }
+
         var tris = new List<int>();
-        if (!Triangulate(poly, tris))
-            return;
+        if (!Triangulate(cap, tris))
+        {
+            // A tangled bridged cap: fall back to the whole slab — a
+            // filled well beats no floor at all. (A tangled OUTLINE still
+            // returns empty; the placement refusal catches it first.)
+            if (cut.Count == 0)
+                return;
+            cap = poly;
+            cut.Clear();
+            if (!Triangulate(cap, tris))
+                return;
+        }
 
         var v = new List<Vector3>();
         var n = new List<Vector3>();
+        var uv = new List<Vector2>();
         var t = new List<int>();
         Vector3 At(Vector3 p, float y) =>
             new Vector3(p.x - origin.x, y - origin.y, p.z - origin.z);
 
-        // Top cap (up), then bottom cap (down, reversed winding).
+        // Top cap (up), then bottom cap (down, reversed winding). Cap UVs
+        // are world XZ in metres — the wall TOP-face density (one tile per
+        // metre both ways), world-anchored so abutting slabs pattern-match.
         int b0 = v.Count;
-        foreach (Vector3 p in poly)
+        foreach (Vector3 p in cap)
         {
             v.Add(At(p, top));
             n.Add(Vector3.up);
+            uv.Add(new Vector2(p.x, p.z));
         }
         for (int i = 0; i < tris.Count; i += 3)
         {
@@ -287,10 +399,11 @@ public class SlabTile : MonoBehaviour
             t.Add(b0 + tris[i + 1]);
         }
         b0 = v.Count;
-        foreach (Vector3 p in poly)
+        foreach (Vector3 p in cap)
         {
             v.Add(At(p, bottom));
             n.Add(Vector3.down);
+            uv.Add(new Vector2(p.x, p.z));
         }
         for (int i = 0; i < tris.Count; i += 3)
         {
@@ -299,24 +412,105 @@ public class SlabTile : MonoBehaviour
             t.Add(b0 + tris[i + 2]);
         }
 
-        for (int i = 0; i < poly.Count; i++)
+        // Side bands: the outer rim, then each cut well's shaft. A well
+        // is wound CCW like the outline, but its solid is OUTSIDE it —
+        // walking it reversed makes the same side formula face the void.
+        // Side UVs follow the wall SIDE convention: U runs along the ring
+        // in metres, V is WORLD height over CourseHeight — courses line up
+        // with adjoining masonry and never stretch with the skirt.
+        void Band(List<Vector3> ring, bool reversed)
         {
-            Vector3 a = poly[i];
-            Vector3 b = poly[(i + 1) % poly.Count];
-            Vector3 side = new Vector3(b.z - a.z, 0f, -(b.x - a.x)).normalized;
-            int s0 = v.Count;
-            v.Add(At(a, bottom));
-            v.Add(At(a, top));
-            v.Add(At(b, top));
-            v.Add(At(b, bottom));
-            for (int k = 0; k < 4; k++)
-                n.Add(side);
-            t.AddRange(new[] { s0, s0 + 1, s0 + 2, s0, s0 + 2, s0 + 3 });
+            int count = ring.Count;
+            float run = 0f;
+            float vB = bottom / CourseHeight;
+            float vT = top / CourseHeight;
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 a = reversed ? ring[(count - i) % count] : ring[i];
+                Vector3 b = reversed
+                    ? ring[count - 1 - i] : ring[(i + 1) % count];
+                Vector3 side = new Vector3(b.z - a.z, 0f, -(b.x - a.x)).normalized;
+                float len = Vector3.Distance(
+                    new Vector3(a.x, 0f, a.z), new Vector3(b.x, 0f, b.z));
+                int s0 = v.Count;
+                v.Add(At(a, bottom));
+                v.Add(At(a, top));
+                v.Add(At(b, top));
+                v.Add(At(b, bottom));
+                for (int k = 0; k < 4; k++)
+                    n.Add(side);
+                uv.Add(new Vector2(run, vB));
+                uv.Add(new Vector2(run, vT));
+                uv.Add(new Vector2(run + len, vT));
+                uv.Add(new Vector2(run + len, vB));
+                run += len;
+                t.AddRange(new[] { s0, s0 + 1, s0 + 2, s0, s0 + 2, s0 + 3 });
+            }
         }
+        Band(poly, false);
+        foreach (List<Vector3> well in cut)
+            Band(well, true);
 
         mesh.SetVertices(v);
         mesh.SetNormals(n);
+        mesh.SetUVs(0, uv);
         mesh.SetTriangles(t, 0);
+    }
+
+    static bool Coincident(Vector3 a, Vector3 b)
+    {
+        return (a - b).sqrMagnitude < 1e-6f;
+    }
+
+    // Merges a hole into a cap polygon keyhole-style: the shortest clear
+    // segment between the two rings becomes a doubled bridge edge, and
+    // the hole is walked in REVERSE (CW against the cap's CCW) so the
+    // merged polygon stays simple for the ear clipper. Returns the cap
+    // unchanged when no bridge is clear — the hole isn't cleanly inside.
+    static List<Vector3> BridgeHole(List<Vector3> outer, List<Vector3> hole)
+    {
+        int n = outer.Count, m = hole.Count;
+        if (n < 3 || m < 3)
+            return outer;
+        int bi = -1, bj = -1;
+        float best = float.MaxValue;
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < m; j++)
+            {
+                float d = (outer[i] - hole[j]).sqrMagnitude;
+                if (d >= best || !BridgeClear(outer, hole, i, j))
+                    continue;
+                best = d;
+                bi = i;
+                bj = j;
+            }
+        if (bi < 0)
+            return outer;
+
+        var merged = new List<Vector3>(n + m + 2);
+        for (int i = 0; i <= bi; i++)
+            merged.Add(outer[i]);
+        for (int k = 0; k <= m; k++)
+            merged.Add(hole[((bj - k) % m + m) % m]);
+        merged.Add(outer[bi]);
+        for (int i = bi + 1; i < n; i++)
+            merged.Add(outer[i]);
+        return merged;
+    }
+
+    static bool BridgeClear(List<Vector3> outer, List<Vector3> hole, int i, int j)
+    {
+        Vector3 a = outer[i], b = hole[j];
+        int n = outer.Count, m = hole.Count;
+        for (int k = 0; k < n; k++)
+            if (k != i && (k + 1) % n != i
+                && SegmentsCross(a, b, outer[k], outer[(k + 1) % n]))
+                return false;
+        for (int k = 0; k < m; k++)
+            if (k != j && (k + 1) % m != j
+                && SegmentsCross(a, b, hole[k], hole[(k + 1) % m]))
+                return false;
+        return true;
     }
 
     // Shared unit cube — the slab chain's vertex markers.

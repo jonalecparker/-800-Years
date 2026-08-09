@@ -445,7 +445,7 @@ MonoBehaviour:
   heightScrollRate: 0.25
   curveBulgeStep: 0.5
   endpointSnapRadius: 0.75
-  stairWidth: 1.2
+  stairWidth: 1.8
   doorWidth: 1.1
   doorHead: 2.1
   previewColor: {r: 0.3, g: 0.9, b: 1, a: 1}
