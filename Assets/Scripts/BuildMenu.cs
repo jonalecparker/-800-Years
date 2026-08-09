@@ -339,7 +339,49 @@ public class BuildMenu : MonoBehaviour
             label.alignment = TextAnchor.MiddleLeft;
             RectTransform labelRt = label.GetComponent<RectTransform>();
             labelRt.offsetMin = new Vector2(10f, 0f);
+            labelRt.offsetMax = new Vector2(-44f, 0f);
+            CreateSlotDeleteButton(row.transform, capturedSlot);
         }
+    }
+
+    // The trashcan on a slot row's right edge. Its own raycast target
+    // sits on top of the row's, so the click deletes without loading.
+    // Drawn from rects — the built-in font has no trashcan glyph.
+    void CreateSlotDeleteButton(Transform row, string slot)
+    {
+        GameObject obj = new GameObject("DeleteButton", typeof(RectTransform));
+        obj.transform.SetParent(row, false);
+        RectTransform rt = obj.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(1f, 0.5f);
+        rt.anchorMax = new Vector2(1f, 0.5f);
+        rt.pivot = new Vector2(1f, 0.5f);
+        rt.anchoredPosition = new Vector2(-6f, 0f);
+        rt.sizeDelta = new Vector2(28f, 28f);
+        Image bg = obj.AddComponent<Image>();
+        bg.color = new Color(0.45f, 0.16f, 0.16f, 1f);
+        Button button = obj.AddComponent<Button>();
+        button.targetGraphic = bg;
+        button.onClick.AddListener(() =>
+        {
+            CastleSave.DeleteSlot(slot);
+            BuildLog.Add($"Deleted save '{slot}'.");
+            RefreshSavesPanel();
+        });
+
+        void Part(string name, Vector2 pos, Vector2 size)
+        {
+            GameObject part = new GameObject(name, typeof(RectTransform));
+            part.transform.SetParent(obj.transform, false);
+            RectTransform prt = part.GetComponent<RectTransform>();
+            prt.anchoredPosition = pos;
+            prt.sizeDelta = size;
+            Image img = part.AddComponent<Image>();
+            img.color = new Color(0.95f, 0.9f, 0.9f, 1f);
+            img.raycastTarget = false;
+        }
+        Part("Body", new Vector2(0f, -3f), new Vector2(12f, 12f));
+        Part("Lid", new Vector2(0f, 5f), new Vector2(16f, 3f));
+        Part("Handle", new Vector2(0f, 8.5f), new Vector2(6f, 2f));
     }
 
     // Top-right: what the keyboard means for the tool in hand, right now.
@@ -655,8 +697,9 @@ public class BuildMenu : MonoBehaviour
         // offsetting), so the readout follows the tool. A stair takes its
         // climb from the wall it's against and a doorway takes its head
         // from a constant, so the dial says nothing in either.
-        // The slab tools dial tile size, not wall height, so their readout
-        // speaks tiles; the ghost-top elevation carries over unchanged.
+        // The slab tools draw an outline at a stated plane, so their
+        // readout speaks corners and the plane itself; the ghost-top
+        // elevation is that plane.
         bool slabTool = placementSystem.Mode == GridPlacementSystem.ToolMode.Foundation
             || placementSystem.Mode == GridPlacementSystem.ToolMode.Floor;
         bool building = !slabTool
@@ -666,11 +709,13 @@ public class BuildMenu : MonoBehaviour
         heightPanel.SetActive(building || slabTool);
         if (slabTool)
         {
-            float s = placementSystem.SlabSize;
-            float? tileTop = placementSystem.GhostTopY;
-            heightText.text = tileTop.HasValue
-                ? $"Tile {s:0.#}×{s:0.#}m  top {tileTop.Value:0.##}m"
-                : $"Tile {s:0.#}×{s:0.#}m";
+            int corners = placementSystem.SlabChainCount;
+            float? slabTop = placementSystem.GhostTopY;
+            string label = corners > 0
+                ? $"Outline · {corners} corner{(corners == 1 ? "" : "s")}"
+                : "Outline";
+            heightText.text = slabTop.HasValue
+                ? $"{label}  plane {slabTop.Value:0.##}m" : label;
         }
         if (building)
         {

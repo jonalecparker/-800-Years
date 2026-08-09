@@ -6,9 +6,9 @@ using UnityEngine;
 // Save/load for the castle: the wall graph and its riders serialized to
 // JSON, geometry rebuilt on load. WHAT is saved follows the graph's own
 // doctrine — stored facts only, never derived geometry: nodes, edges
-// (curve, heights, openings), stairs (their baked runs), and slab tiles
-// (center, size, planes). Meshes, sections and treads are all re-derived
-// on load by the same Rebuild paths a commit uses.
+// (curve, heights, openings), stairs (their baked runs), and slabs
+// (outline, planes). Meshes, sections and treads are all re-derived on
+// load by the same Rebuild paths a commit uses.
 //
 // Written-at-the-moment data (raised sills) is serialized VERBATIM and
 // restored without re-running the moments that wrote it. Those answers
@@ -35,7 +35,10 @@ public static class CastleSave
     // 2: the building rebuild (Docs/BuildingRebuild.md) — rooms left the
     // schema, slab tiles joined it. Version-1 saves refuse cleanly; the
     // user's call was to delete them, not migrate.
-    const int Version = 2;
+    // 3: slabs became drawn polygons (2026-08-08) — a SlabData carries an
+    // outline. Version-2 square tiles still load: they migrate as
+    // 4-corner outlines derived from their center/size/yaw.
+    const int Version = 3;
 
     // JSON has no -Infinity, and JsonUtility's handling of one is not
     // worth trusting across Unity versions — the graph's "-inf means
@@ -96,14 +99,18 @@ public static class CastleSave
         public float ya, yb;
     }
 
-    // A slab tile (foundation or between-storey floor) — pure stored
-    // facts, rebuilt as the same prism on load.
+    // A slab (foundation or between-storey floor) — pure stored facts,
+    // rebuilt as the same polygon prism on load. The x/z/size/yaw fields
+    // are the version-2 square-tile schema, read only to migrate: a v2
+    // tile with no verts loads as the 4-corner outline it was.
     [Serializable]
     class SlabData
     {
-        public float x, z;
-        public float size, yaw, topY, bottomY;
+        public List<Vector3> verts = new List<Vector3>();
+        public float topY, bottomY;
         public bool isFoundation;
+        public float x, z;
+        public float size, yaw;
     }
 
     [Serializable]
@@ -155,6 +162,16 @@ public static class CastleSave
             slots.Add((Path.GetFileNameWithoutExtension(file), File.GetLastWriteTime(file)));
         slots.Sort((a, b) => b.Item2.CompareTo(a.Item2));
         return slots;
+    }
+
+    // Removes a slot's file — the panel's trashcan is the only caller.
+    // A deleted CurrentSlot stays current: F5 simply writes it anew,
+    // and F9 against a missing file refuses like any bad load.
+    public static void DeleteSlot(string slot)
+    {
+        string path = PathFor(slot);
+        if (File.Exists(path))
+            File.Delete(path);
     }
 
     public static bool Save(string path)
@@ -253,22 +270,20 @@ public static class CastleSave
         {
             if (t == null)
                 continue;
-            data.slabs.Add(new SlabData
+            var sd = new SlabData
             {
-                x = t.center.x,
-                z = t.center.z,
-                size = t.size,
-                yaw = t.yaw,
                 topY = t.topY,
                 bottomY = t.bottomY,
                 isFoundation = t.isFoundation,
-            });
+            };
+            sd.verts.AddRange(t.verts);
+            data.slabs.Add(sd);
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(path));
         File.WriteAllText(path, JsonUtility.ToJson(data, true));
         BuildLog.Add($"Saved — {data.edges.Count} walls, {data.stairs.Count} stairs,"
-            + $" {data.slabs.Count} slab tiles → {Path.GetFileName(path)}.");
+            + $" {data.slabs.Count} slabs → {Path.GetFileName(path)}.");
         return true;
     }
 
@@ -280,7 +295,7 @@ public static class CastleSave
             return false;
         }
         SaveData data = JsonUtility.FromJson<SaveData>(File.ReadAllText(path));
-        if (data == null || data.version != Version)
+        if (data == null || (data.version != Version && data.version != 2))
         {
             BuildLog.Add("Save file unreadable or from a different version — not loaded.");
             return false;
@@ -364,13 +379,36 @@ public static class CastleSave
                 Unpack(sd.baseFrom), sd.width, sd.baseWallHeight, sd.baseStep, material));
         }
 
+        var outline = new List<Vector3>();
         foreach (SlabData sd in data.slabs)
-            SlabTile.Create(parent, material, new Vector3(sd.x, 0f, sd.z),
-                sd.size, sd.yaw, sd.topY, sd.bottomY, sd.isFoundation);
+        {
+            outline.Clear();
+            if (sd.verts != null && sd.verts.Count >= 3)
+            {
+                foreach (Vector3 v in sd.verts)
+                    outline.Add(new Vector3(v.x, 0f, v.z));
+            }
+            else
+            {
+                // A version-2 square tile: its outline is its corners.
+                float rad = sd.yaw * Mathf.Deg2Rad;
+                Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad))
+                    * (sd.size * 0.5f);
+                Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad))
+                    * (sd.size * 0.5f);
+                Vector3 c = new Vector3(sd.x, 0f, sd.z);
+                outline.Add(c - ax - az);
+                outline.Add(c + ax - az);
+                outline.Add(c + ax + az);
+                outline.Add(c - ax + az);
+            }
+            SlabTile.Create(parent, material, outline, sd.topY, sd.bottomY,
+                sd.isFoundation);
+        }
 
         Physics.SyncTransforms();
         BuildLog.Add($"Loaded — {data.edges.Count} walls, {stairs.Count} stairs,"
-            + $" {data.slabs.Count} slab tiles from {Path.GetFileName(path)}.");
+            + $" {data.slabs.Count} slabs from {Path.GetFileName(path)}.");
         return true;
     }
 

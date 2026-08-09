@@ -117,7 +117,7 @@ public static class CutawayView
         highest = float.NegativeInfinity;
         foreach (Renderer r in root.GetComponentsInChildren<Renderer>(true))
         {
-            if (r == null || !TrySpan(r, out _, out float bottom, out float top))
+            if (r == null || !TrySpan(r, out _, out _, out float bottom, out float top))
                 continue;
             lowest = Mathf.Min(lowest, bottom);
             highest = Mathf.Max(highest, top);
@@ -126,14 +126,19 @@ public static class CutawayView
     }
 
     // Where this renderer's masonry starts and ends in world Y with the
-    // slice undone, plus the Y its transform sits at when whole.
+    // slice undone, plus the authored transform facts the undo needs.
     //
     // Rotations in this world are yaw-only and slicing only ever touches
-    // scale.y, so a local vertex maps to world Y by adding the pivot — no
-    // matrix needed, and the answer stays true while the object is sliced.
-    static bool TrySpan(Renderer r, out float pivotY, out float bottom, out float top)
+    // scale.y, so a local vertex maps to world Y as pivot + vertex ×
+    // AUTHORED scale — no matrix needed, and the answer stays true while
+    // the object is sliced. The scale term is not optional: wall sections
+    // are world-space meshes on unit transforms, but a SlabTile's height
+    // IS its Y-scale, and treating it as 1 crushed every tall tile.
+    static bool TrySpan(Renderer r, out CutawayPivot pivot, out float meshMinY,
+        out float bottom, out float top)
     {
-        pivotY = 0f;
+        pivot = null;
+        meshMinY = 0f;
         bottom = 0f;
         top = 0f;
         MeshFilter filter = r.GetComponent<MeshFilter>();
@@ -141,15 +146,16 @@ public static class CutawayView
         if (mesh == null)
             return false;
 
-        CutawayPivot pivot = r.GetComponent<CutawayPivot>();
+        pivot = r.GetComponent<CutawayPivot>();
         if (pivot == null)
         {
             pivot = r.gameObject.AddComponent<CutawayPivot>();
             pivot.authoredY = r.transform.position.y;
+            pivot.authoredScaleY = r.transform.localScale.y;
         }
-        pivotY = pivot.authoredY;
-        bottom = pivotY + mesh.bounds.min.y;
-        top = pivotY + mesh.bounds.max.y;
+        meshMinY = mesh.bounds.min.y;
+        bottom = pivot.authoredY + mesh.bounds.min.y * pivot.authoredScaleY;
+        top = pivot.authoredY + mesh.bounds.max.y * pivot.authoredScaleY;
         return true;
     }
 
@@ -163,14 +169,15 @@ public static class CutawayView
         float cut = Level;
         foreach (Renderer r in root.GetComponentsInChildren<Renderer>(true))
         {
-            if (r == null || !TrySpan(r, out float pivotY, out float bottom, out float top))
+            if (r == null || !TrySpan(r, out CutawayPivot pivot, out float meshMinY,
+                    out float bottom, out float top))
                 continue;
 
             float height = top - bottom;
             // Whole: no cut at all, or the cut passes over its head.
             if (float.IsPositiveInfinity(cut) || cut >= top - 0.001f)
             {
-                Restore(r, pivotY);
+                Restore(r, pivot);
                 Show(r, true);
                 continue;
             }
@@ -184,25 +191,30 @@ public static class CutawayView
             // arithmetic.
             if (height <= MinSlice || slice < MinSlice)
             {
-                Restore(r, pivotY);
+                Restore(r, pivot);
                 Show(r, height <= MinSlice && slice > 0f);
                 continue;
             }
-            Slice(r, pivotY, bottom, slice / height);
+            Slice(r, pivot, meshMinY, bottom, slice / height);
             Show(r, true);
         }
     }
 
     // Scales Y about the object's own bottom: the masonry stays planted
-    // where it was built and only its top comes down.
-    static void Slice(Renderer r, float pivotY, float bottom, float k)
+    // where it was built and only its top comes down. k is the kept
+    // fraction of full height, so the live scale is k × the AUTHORED
+    // scale, and the position re-derives from the world bottom and the
+    // mesh's own (scaled) lowest vertex.
+    static void Slice(Renderer r, CutawayPivot pivot, float meshMinY,
+        float bottom, float k)
     {
         Transform t = r.transform;
-        float wantY = bottom * (1f - k) + k * pivotY;
+        float s = k * pivot.authoredScaleY;
+        float wantY = bottom - meshMinY * s;
         Vector3 scale = t.localScale;
-        if (!Mathf.Approximately(scale.y, k))
+        if (!Mathf.Approximately(scale.y, s))
         {
-            scale.y = k;
+            scale.y = s;
             t.localScale = scale;
         }
         Vector3 pos = t.position;
@@ -213,19 +225,19 @@ public static class CutawayView
         }
     }
 
-    static void Restore(Renderer r, float pivotY)
+    static void Restore(Renderer r, CutawayPivot pivot)
     {
         Transform t = r.transform;
         Vector3 scale = t.localScale;
-        if (!Mathf.Approximately(scale.y, 1f))
+        if (!Mathf.Approximately(scale.y, pivot.authoredScaleY))
         {
-            scale.y = 1f;
+            scale.y = pivot.authoredScaleY;
             t.localScale = scale;
         }
         Vector3 pos = t.position;
-        if (!Mathf.Approximately(pos.y, pivotY))
+        if (!Mathf.Approximately(pos.y, pivot.authoredY))
         {
-            pos.y = pivotY;
+            pos.y = pivot.authoredY;
             t.position = pos;
         }
     }

@@ -4,44 +4,51 @@
 > the "Near arc" (agreed 2026-08-05): save → real terrain → permanent
 > castle → economy → procedural town. Steps 1–2 are done.
 
-**Where we left off:** The builder stands on **Spiš Castle's real 1m
-LiDAR hill**, ground is shaped under a 3m deviation law (Ground tool:
-Path/Restore), every height lands on the **quarter grid** with absolute
-elevation readouts, and the room system was **rebuilt bottom-up**:
-foundation tiles → walls → floor tiles, no plane ever inferred,
-`WallRoom` deleted (`Docs/BuildingRebuild.md`). Saves are **named
-slots** with a modal panel (name + date, click to load; F5/F9 act on
-the current slot), and the menu's Room button is now the building
-category (Foundation / Wall / Floor). All machine-verified; the rebuild
-and the panel are **not yet hand-tested**.
+**Where we left off:** The slab half of the building rebuild was
+**redrawn as outlines** (late 08-08, after the tiles lost the
+hand-test): foundations and floors are now the wall-style chain gesture
+— click corners, close on the first, the polygon fills as one prism.
+The anchor states the plane, **Ctrl+scroll dials a foundation's plane
+in ¼m steps**, the burial/skirt laws refuse live (terrace where they
+do), floors anchor on wall tops and snap to wall corners, a stairwell
+is drawn around. Save schema v3; v2 tile saves migrate. The first
+hand-test batch also shipped: modal camera stand-down, slot trashcans,
+and the sunken-foundation crusher (CutawayView restoring Y-scale to 1
+every frame) found and fixed. **The user has hand-tested the outline
+tools and likes them.**
 
 ## Top priorities
 
-1. **Hand-test the building rebuild on the real hill** — the flow the
-   whole rebuild exists for: foundation tiles up a slope, walls on the
-   slab, a second storey whose floor tiles marry building A to building
-   B by dialing the same quarter-grid plane. Judge the provisional
-   knobs by feel: R 15° tile rotation, >50% burial refusal, 0.3m corner
-   snap, tile snap reach. Also exercise the Saves panel and the Room
-   category. **Watch-item**: a terrain wall drags through a slab-borne
+1. **Walls along the foundation edge** (user's declared pick-up point):
+   walls should snap to a foundation outline's edges — or auto-build
+   along the whole outline. The outline IS a stored polyline at a
+   stated plane; the wall chain wants to ride it the way it rides wall
+   tops. Design questions to settle first: snap-to-edge vs one-click
+   perimeter walls (or both), corner handling at outline vertices
+   (nodes at each corner?), and what happens where a doorway-sized gap
+   is wanted — probably just delete/door tools as usual.
+2. **Keep hand-testing the outline slab tools** while building: judge
+   the knobs by feel (>50% burial, 2m MaxSkirt, 0.5/0.4m outline
+   corner/edge snap, floor node snap ±0.2m, closure radius = node snap
+   radius). **Watch-item**: a terrain wall drags through a slab-borne
    building unimpeded (different storeys never meet) — decide whether
    that needs a new law.
-2. **Then: the permanent castle** — build and walk it (the
+3. **Then: the permanent castle** — build and walk it (the
    feel-judgement session, now on ground that means something). Decide
    whether it's also the game's Day-One inherited castle (design-doc
    tension flagged 08-05).
-3. **Graduate the briefs.** `Docs/Stairs.md`, `Docs/Doors.md`, and now
+4. **Graduate the briefs.** `Docs/Stairs.md`, `Docs/Doors.md`, and now
    `Docs/BuildingRebuild.md` fold into CLAUDE.md once playtested.
    Roofs (rebuild step 4) and support rules (~20m span, same-height
    connection) wait on that verdict.
 
 ## Backlog / open questions
 
-- **Any new stored fact must join `CastleSave`** (`WallEdge`/`WallStair`/`SlabTile`) — unserialized fields silently vanish on load. Schema is v2; v1 refused and deleted.
+- **Any new stored fact must join `CastleSave`** (`WallEdge`/`WallStair`/`SlabTile`) — unserialized fields silently vanish on load. Schema is v3 (polygon slabs); v2 tiles migrate as 4-corner outlines, v1 refused and deleted.
 - **Structural support deliberately absent** (user's call): deleting a lower wall leaves masonry hanging; `baseY` reconstructs support when the design lands. Standing rule: **no new system may assume construction is instantaneous in the world.**
 - **Roof decks/wall tops have no parapet** — you walk off the edge. Crenellations are on the procedural-detailing list.
-- Wedge/triangle foundation tiles for round footprints — later luxury.
-- The saves list has no delete/rename; slots live in `Saves/` (committed). Real slots move to persistentDataPath when the game has a front end.
+- Curved rooms floor chorded (outline edges are straight) — the answer is a trace-STAMP floor fill: `Enclosure` runs once at click time and emits an ordinary stored polygon. Deferred until the drawn outline is judged.
+- The saves list has no rename (delete shipped 08-08, a per-row trashcan); slots live in `Saves/` (committed). Real slots move to persistentDataPath when the game has a front end.
 - **A doorway with 0.6–2.2m of wall above its sill reads as a full-height gateway** — may read as damage.
 - **Circle/rect don't get the skirt** (one shared `EdgeParams` per figure) — a stacked circle on a stepped host shows gaps the wall tool doesn't.
 - **The room chain's live segment is a straight chord** when riding a curved wall top; the wall tool bends, the chain doesn't.

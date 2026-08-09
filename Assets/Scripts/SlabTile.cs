@@ -1,108 +1,325 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-// A building slab tile: a FOUNDATION (sets a building's footprint and
-// level, and IS its first storey's floor) or a between-storey FLOOR.
-// Authored one tile at a time — no plane is ever inferred
-// (Docs/BuildingRebuild.md). A tile is a plain vertical prism built by
-// transform (unit cube mesh, scaled/rotated/positioned), so the cutaway's
-// Y-scale slicing works on it unchanged, and its BoxCollider is for
-// cursor raycasts and the walker's feet — never occupancy.
+// A building slab: a FOUNDATION (sets a building's footprint and level,
+// and IS its first storey's floor) or a between-storey FLOOR. Authored
+// as a DRAWN OUTLINE — the player chains vertices exactly like the wall
+// tools and the closed polygon fills as one prism (2026-08-08; square
+// tiles shipped first and lost the playtest: squares over an irregular
+// room can't floor it). No plane is ever inferred: the outline's anchor
+// states it (Docs/BuildingRebuild.md).
+//
+// The prism is a world-space mesh on a unit transform — the wall-section
+// convention — so the cutaway's Y-scale slicing works on it unchanged.
+// Its MeshCollider is for cursor raycasts and the walker's feet — never
+// occupancy.
 public class SlabTile : MonoBehaviour
 {
     public static readonly List<SlabTile> All = new List<SlabTile>();
 
-    public Vector3 center;   // XZ; y carries nothing (tops are topY)
-    public float size;       // edge length
-    public float yaw;        // degrees, world bearing of the tile's edges
+    // The outline at the top plane, world XZ (y carries nothing), CCW.
+    public readonly List<Vector3> verts = new List<Vector3>();
     public float topY;       // the plane — build surface, floor underfoot
     public float bottomY;    // foundation: skirted below ground; floor: topY - Thickness
     public bool isFoundation;
 
     public const float Thickness = 0.3f;   // between-storey floor slab
-    public const float MinSize = 1f;
-    public const float MaxSize = 5f;
-    public const float SizeStep = 0.5f;
     // The game's one vertical lattice: slab planes seat on it, and the
     // wall-height dial lands on it (GridPlacementSystem.CurrentWallHeight),
     // so planes and wall tops can rendezvous exactly.
     public const float FloorStep = 0.25f;
+    // A foundation's skirt may reach down at most this far to find
+    // ground; a deeper dip under the plane refuses placement (live on
+    // the ghost — one-test doctrine). Provisional, tuned by feel.
+    public const float MaxSkirt = 2f;
 
     static Mesh unitCube;
 
     public static SlabTile Create(Transform parent, Material material,
-        Vector3 center, float size, float yaw, float topY, float bottomY,
-        bool isFoundation)
+        List<Vector3> outline, float topY, float bottomY, bool isFoundation)
     {
-        var go = new GameObject(isFoundation ? "FoundationTile" : "FloorTile");
+        var go = new GameObject(isFoundation ? "Foundation" : "Floor");
         go.transform.SetParent(parent, false);
         SlabTile tile = go.AddComponent<SlabTile>();
-        tile.center = new Vector3(center.x, 0f, center.z);
-        tile.size = size;
-        tile.yaw = yaw;
+        foreach (Vector3 v in outline)
+            tile.verts.Add(new Vector3(v.x, 0f, v.z));
+        if (SignedArea(tile.verts) < 0f)
+            tile.verts.Reverse();
         tile.topY = topY;
         tile.bottomY = bottomY;
         tile.isFoundation = isFoundation;
 
-        // Rendered a hair proud of the stored plane: a floor tile crossing
-        // a wall top is SAME-facing coplanar with it, which z-fights. The
+        // The transform sits at the centroid so screen-space tests (the
+        // delete marquee) have a sensible point; the mesh is world-space
+        // relative to it on unit scale, which is what the cutaway slices.
+        Vector3 centroid = Centroid(tile.verts);
+        go.transform.position = new Vector3(
+            centroid.x, (topY + bottomY) * 0.5f, centroid.z);
+
+        var mesh = new Mesh { name = go.name + "Mesh" };
+        // Rendered a hair proud of the stored plane: a floor crossing a
+        // wall top is SAME-facing coplanar with it, which z-fights. The
         // stored topY stays exact — planes match by data, not by pixels.
-        float renderTop = topY + 0.002f;
-        go.transform.SetPositionAndRotation(
-            new Vector3(center.x, (renderTop + bottomY) * 0.5f, center.z),
-            Quaternion.Euler(0f, yaw, 0f));
-        go.transform.localScale = new Vector3(size, renderTop - bottomY, size);
-        go.AddComponent<MeshFilter>().sharedMesh = SharedCube();
+        BuildPrism(mesh, tile.verts, topY + 0.002f, bottomY,
+            go.transform.position);
+        go.AddComponent<MeshFilter>().sharedMesh = mesh;
         go.AddComponent<MeshRenderer>().sharedMaterial = material;
-        go.AddComponent<BoxCollider>();
+        go.AddComponent<MeshCollider>().sharedMesh = mesh;
         return tile;
     }
 
-    // The tile's four corners at its top plane, world space.
-    public void Corners(Vector3[] into)
+    void OnDestroy()
     {
-        float rad = yaw * Mathf.Deg2Rad;
-        Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad)) * (size * 0.5f);
-        Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad)) * (size * 0.5f);
-        Vector3 c = new Vector3(center.x, topY, center.z);
-        into[0] = c - ax - az;
-        into[1] = c + ax - az;
-        into[2] = c + ax + az;
-        into[3] = c - ax + az;
+        MeshFilter filter = GetComponent<MeshFilter>();
+        if (filter != null && filter.sharedMesh != null)
+            Destroy(filter.sharedMesh);
     }
 
-    // Do two square tiles overlap in plan (both squares, arbitrary yaw)?
-    // Separating-axis test over both squares' edge normals, shrunk by a
-    // hair so abutting edges — the whole point of snapping — don't count.
-    public static bool Overlaps(Vector3 aCenter, float aSize, float aYaw,
-        Vector3 bCenter, float bSize, float bYaw)
+    // ------------------------------------------------------------------
+    // Polygon geometry — XZ, y ignored. Static so the placement ghost and
+    // the laws run the same math as the committed slab (one-test doctrine).
+
+    public static float SignedArea(List<Vector3> poly)
     {
-        const float shrink = 0.02f;
-        foreach (float deg in new[] { aYaw, aYaw + 90f, bYaw, bYaw + 90f })
+        float a = 0f;
+        for (int i = 0; i < poly.Count; i++)
         {
-            float rad = deg * Mathf.Deg2Rad;
-            Vector3 axis = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad));
-            float ca = Vector3.Dot(aCenter, axis);
-            float cb = Vector3.Dot(bCenter, axis);
-            float ra = Radius(aSize - shrink, aYaw, axis);
-            float rb = Radius(bSize - shrink, bYaw, axis);
-            if (Mathf.Abs(ca - cb) > ra + rb)
+            Vector3 p = poly[i];
+            Vector3 q = poly[(i + 1) % poly.Count];
+            a += p.x * q.z - q.x * p.z;
+        }
+        return a * 0.5f;
+    }
+
+    public static Vector3 Centroid(List<Vector3> poly)
+    {
+        Vector3 c = Vector3.zero;
+        foreach (Vector3 v in poly)
+            c += v;
+        return poly.Count > 0 ? c / poly.Count : c;
+    }
+
+    // Even-odd rule; points exactly on the boundary are not reliably
+    // classified, which every caller here tolerates.
+    public static bool Contains(List<Vector3> poly, Vector3 p)
+    {
+        bool inside = false;
+        for (int i = 0, j = poly.Count - 1; i < poly.Count; j = i++)
+        {
+            Vector3 a = poly[i];
+            Vector3 b = poly[j];
+            if (a.z > p.z != b.z > p.z
+                && p.x < (b.x - a.x) * (p.z - a.z) / (b.z - a.z) + a.x)
+                inside = !inside;
+        }
+        return inside;
+    }
+
+    // Does any pair of non-adjacent outline edges properly cross?
+    public static bool SelfIntersects(List<Vector3> poly)
+    {
+        int n = poly.Count;
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++)
+            {
+                // Adjacent edges share a vertex; the wrap pair (last,
+                // first) is adjacent too.
+                if (j == i || j == (i + 1) % n || (j + 1) % n == i)
+                    continue;
+                if (SegmentsCross(poly[i], poly[(i + 1) % n],
+                        poly[j], poly[(j + 1) % n]))
+                    return true;
+            }
+        return false;
+    }
+
+    // Strict crossing: shared endpoints and collinear touching (abutting
+    // outlines — the whole point of vertex snapping) don't count.
+    public static bool SegmentsCross(Vector3 a, Vector3 b, Vector3 c, Vector3 d)
+    {
+        float d1 = Cross2(c, d, a);
+        float d2 = Cross2(c, d, b);
+        float d3 = Cross2(a, b, c);
+        float d4 = Cross2(a, b, d);
+        return ((d1 > 0f && d2 < 0f) || (d1 < 0f && d2 > 0f))
+            && ((d3 > 0f && d4 < 0f) || (d3 < 0f && d4 > 0f));
+    }
+
+    static float Cross2(Vector3 o, Vector3 a, Vector3 p)
+    {
+        return (a.x - o.x) * (p.z - o.z) - (a.z - o.z) * (p.x - o.x);
+    }
+
+    // Do two outlines overlap in AREA? Abutting along an edge or sharing
+    // vertices is legal contact; a proper edge crossing or a vertex
+    // strictly inside the other is a burial.
+    public static bool PolyOverlaps(List<Vector3> a, List<Vector3> b)
+    {
+        for (int i = 0; i < a.Count; i++)
+            for (int j = 0; j < b.Count; j++)
+                if (SegmentsCross(a[i], a[(i + 1) % a.Count],
+                        b[j], b[(j + 1) % b.Count]))
+                    return true;
+        foreach (Vector3 v in a)
+            if (Contains(b, v) && DistToBoundary(b, v) > 0.02f)
+                return true;
+        foreach (Vector3 v in b)
+            if (Contains(a, v) && DistToBoundary(a, v) > 0.02f)
+                return true;
+        return false;
+    }
+
+    static float DistToBoundary(List<Vector3> poly, Vector3 p)
+    {
+        float best = float.MaxValue;
+        for (int i = 0; i < poly.Count; i++)
+        {
+            Vector3 a = poly[i];
+            Vector3 b = poly[(i + 1) % poly.Count];
+            Vector3 ab = b - a;
+            float len2 = ab.x * ab.x + ab.z * ab.z;
+            float t = len2 > 0.000001f
+                ? Mathf.Clamp01(((p.x - a.x) * ab.x + (p.z - a.z) * ab.z) / len2)
+                : 0f;
+            Vector3 q = a + ab * t;
+            float dx = p.x - q.x, dz = p.z - q.z;
+            best = Mathf.Min(best, Mathf.Sqrt(dx * dx + dz * dz));
+        }
+        return best;
+    }
+
+    // Ear clipping over a CCW simple polygon. Returns false on a tangled
+    // outline (the placement refusal should have caught it first).
+    public static bool Triangulate(List<Vector3> poly, List<int> into)
+    {
+        into.Clear();
+        var idx = new List<int>();
+        for (int i = 0; i < poly.Count; i++)
+            idx.Add(i);
+        int guard = poly.Count * poly.Count + 8;
+        while (idx.Count > 3 && guard-- > 0)
+        {
+            bool clipped = false;
+            for (int i = 0; i < idx.Count; i++)
+            {
+                int ia = idx[(i + idx.Count - 1) % idx.Count];
+                int ib = idx[i];
+                int ic = idx[(i + 1) % idx.Count];
+                Vector3 a = poly[ia], b = poly[ib], c = poly[ic];
+                if (Cross2(a, b, c) <= 0.0001f)
+                    continue;   // reflex or degenerate corner — not an ear
+                bool holds = false;
+                foreach (int other in idx)
+                {
+                    if (other == ia || other == ib || other == ic)
+                        continue;
+                    if (PointInTriangle(poly[other], a, b, c))
+                    {
+                        holds = true;
+                        break;
+                    }
+                }
+                if (holds)
+                    continue;
+                into.Add(ia);
+                into.Add(ib);
+                into.Add(ic);
+                idx.RemoveAt(i);
+                clipped = true;
+                break;
+            }
+            if (!clipped)
                 return false;
         }
-        return true;
+        if (idx.Count == 3)
+        {
+            into.Add(idx[0]);
+            into.Add(idx[1]);
+            into.Add(idx[2]);
+        }
+        return idx.Count == 3 && guard > 0;
     }
 
-    // Half-extent of a yawed square projected onto an axis.
-    static float Radius(float size, float yaw, Vector3 axis)
+    static bool PointInTriangle(Vector3 p, Vector3 a, Vector3 b, Vector3 c)
     {
-        float rad = yaw * Mathf.Deg2Rad;
-        Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad));
-        Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad));
-        return (Mathf.Abs(Vector3.Dot(ax, axis)) + Mathf.Abs(Vector3.Dot(az, axis)))
-            * size * 0.5f;
+        float d1 = Cross2(a, b, p);
+        float d2 = Cross2(b, c, p);
+        float d3 = Cross2(c, a, p);
+        bool neg = d1 < 0f || d2 < 0f || d3 < 0f;
+        bool pos = d1 > 0f || d2 > 0f || d3 > 0f;
+        return !(neg && pos);
     }
 
-    // Shared unit cube — also the ghost mesh for the slab tools.
+    // Fills a mesh with the outline swept from bottom to top — flat caps,
+    // vertical sides, hard normals — with vertex positions relative to
+    // origin. The commit and the placement ghost both build through here.
+    public static void BuildPrism(Mesh mesh, List<Vector3> outline,
+        float top, float bottom, Vector3 origin)
+    {
+        mesh.Clear();
+        var poly = outline;
+        if (SignedArea(poly) < 0f)
+        {
+            poly = new List<Vector3>(outline);
+            poly.Reverse();
+        }
+        var tris = new List<int>();
+        if (!Triangulate(poly, tris))
+            return;
+
+        var v = new List<Vector3>();
+        var n = new List<Vector3>();
+        var t = new List<int>();
+        Vector3 At(Vector3 p, float y) =>
+            new Vector3(p.x - origin.x, y - origin.y, p.z - origin.z);
+
+        // Top cap (up), then bottom cap (down, reversed winding).
+        int b0 = v.Count;
+        foreach (Vector3 p in poly)
+        {
+            v.Add(At(p, top));
+            n.Add(Vector3.up);
+        }
+        for (int i = 0; i < tris.Count; i += 3)
+        {
+            t.Add(b0 + tris[i]);
+            t.Add(b0 + tris[i + 2]);
+            t.Add(b0 + tris[i + 1]);
+        }
+        b0 = v.Count;
+        foreach (Vector3 p in poly)
+        {
+            v.Add(At(p, bottom));
+            n.Add(Vector3.down);
+        }
+        for (int i = 0; i < tris.Count; i += 3)
+        {
+            t.Add(b0 + tris[i]);
+            t.Add(b0 + tris[i + 1]);
+            t.Add(b0 + tris[i + 2]);
+        }
+
+        for (int i = 0; i < poly.Count; i++)
+        {
+            Vector3 a = poly[i];
+            Vector3 b = poly[(i + 1) % poly.Count];
+            Vector3 side = new Vector3(b.z - a.z, 0f, -(b.x - a.x)).normalized;
+            int s0 = v.Count;
+            v.Add(At(a, bottom));
+            v.Add(At(a, top));
+            v.Add(At(b, top));
+            v.Add(At(b, bottom));
+            for (int k = 0; k < 4; k++)
+                n.Add(side);
+            t.AddRange(new[] { s0, s0 + 1, s0 + 2, s0, s0 + 2, s0 + 3 });
+        }
+
+        mesh.SetVertices(v);
+        mesh.SetNormals(n);
+        mesh.SetTriangles(t, 0);
+    }
+
+    // Shared unit cube — the slab chain's vertex markers.
     public static Mesh SharedCube()
     {
         if (unitCube != null)

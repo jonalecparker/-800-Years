@@ -50,8 +50,10 @@ public class FreeFlyCamera : MonoBehaviour
     void Update()
     {
         // Walking is not flying. The mode owns the camera outright while
-        // it's on, including the scroll wheel.
-        if (WalkMode.Active)
+        // it's on, including the scroll wheel. The Saves panel owns the
+        // keyboard the same way — WASD under someone's typing steers the
+        // camera with their spelling.
+        if (WalkMode.Active || BuildMenu.ModalOpen)
             return;
 
         var mouse = Mouse.current;

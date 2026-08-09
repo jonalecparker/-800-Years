@@ -281,12 +281,22 @@ public class GridPlacementSystem : MonoBehaviour
     private Transform splineParent;
     private float currentYRotation;
     private float heightMultiplier = 1f;
-    // The slab tools (Foundation / Floor): tile edge length, dialed by
-    // Ctrl+scroll like the Ground tool's brush, and the free tile's
-    // bearing, stepped by R. Snapped tiles adopt the host's yaw instead.
-    private float slabSize = 2f;
-    private float slabYaw;
-    public float SlabSize => slabSize;
+    // The slab tools (Foundation / Floor): a drawn outline, chained
+    // vertex by vertex like the room chain and filled as one polygon
+    // prism on closure. The chain's PLANE is stated at the anchor (seated
+    // from ground / adopted from a snap) and held for the whole outline;
+    // Ctrl+scroll dials it in quarter steps (foundations only — a floor's
+    // plane IS the wall top it connects to).
+    private readonly List<Vector3> slabChain = new List<Vector3>();
+    private float slabChainPlane;
+    // Pre-anchor plane dial, quarter steps off the seated plane; folded
+    // into slabChainPlane at the anchor click and reset on cancel/commit.
+    private float slabPlaneDial;
+    public int SlabChainCount => slabChain.Count;
+    // The chain's fill ghost — one mesh, refilled in place each frame.
+    private Mesh slabPreviewMesh;
+    private readonly List<Vector3> slabTempPoly = new List<Vector3>();
+    private readonly List<Vector3> slabBladePoly = new List<Vector3>();
     private float curveBulge;
     private float curveApexT = 0.5f;
     private Vector3? splineStart;
@@ -599,7 +609,8 @@ public class GridPlacementSystem : MonoBehaviour
         // Ground has one gesture for both jobs: drag a line on terrain.
         else if (Mode == ToolMode.Ground)
             UpdateGround(mouse, ray, overUI);
-        // The slab tools place one tile per click — no drag, no shapes.
+        // The slab tools draw an outline — a vertex chain, closed on its
+        // own first corner, filled as one prism.
         else if (Mode == ToolMode.Foundation || Mode == ToolMode.Floor)
             UpdateSlab(mouse, keyboard, ray, overUI);
         else if (Shape == BuildShape.Circle || Shape == BuildShape.Rect)
@@ -647,6 +658,7 @@ public class GridPlacementSystem : MonoBehaviour
         CancelStair();
         CancelDoor();
         CancelGround();
+        CancelSlabChain();
     }
 
     // Everything the tool has on screen or half-finished, put away — run
@@ -663,6 +675,7 @@ public class GridPlacementSystem : MonoBehaviour
         CancelStair();
         CancelDoor();
         CancelGround();
+        CancelSlabChain();
         HideGhosts();
         ClearPreviewMeshes();
 
@@ -772,20 +785,33 @@ public class GridPlacementSystem : MonoBehaviour
         }
         else if (Mode == ToolMode.Foundation)
         {
-            context = "Foundation";
-            lines.Add("Click — place a tile (snaps to the patch, adopts its level)");
-            lines.Add($"Ctrl + scroll — tile size ({slabSize:0.#}m)");
-            lines.Add("R — turn a free tile");
-            lines.Add("Alt — break the snap, start a new level");
-            lines.Add("Red — mostly buried, or overlapping a tile");
+            context = slabChain.Count > 0
+                ? $"Foundation · outline ({slabChain.Count})" : "Foundation";
+            lines.Add(slabChain.Count == 0
+                ? "Click — start the outline (snapping an edge extends its level)"
+                : "Click — add a corner; close on the first corner to fill");
+            lines.Add("Ctrl + scroll — plane up/down (¼m)");
+            lines.Add("Alt — ignore snaps");
+            if (slabChain.Count > 0)
+                lines.Add("Esc — abandon the outline");
+            lines.Add("Red — mostly buried, skirt too deep, or overlapping");
         }
         else if (Mode == ToolMode.Floor)
         {
-            context = "Floor";
-            lines.Add("Point at a wall top — seed a floor at its plane");
-            lines.Add("Point at a floor tile — grow it edge to edge");
-            lines.Add($"Ctrl + scroll — tile size ({slabSize:0.#}m)");
-            lines.Add("Red — nothing to connect to, or overlapping");
+            context = slabChain.Count > 0
+                ? $"Floor · outline ({slabChain.Count})" : "Floor";
+            if (slabChain.Count == 0)
+            {
+                lines.Add("Start on a wall top or a floor's edge — the plane is theirs");
+            }
+            else
+            {
+                lines.Add("Click — add a corner; close on the first corner to fill");
+                lines.Add("Corners snap to wall corners at this plane");
+                lines.Add("A stairwell is drawn AROUND — leave it out of the outline");
+                lines.Add("Esc — abandon the outline");
+            }
+            lines.Add("Alt — ignore snaps");
         }
         else if (Mode == ToolMode.Ground)
         {
@@ -3332,58 +3358,129 @@ public class GridPlacementSystem : MonoBehaviour
     }
 
     // ------------------------------------------------------------------
-    // The slab tools (Docs/BuildingRebuild.md): FOUNDATION tiles author a
+    // The slab tools (Docs/BuildingRebuild.md; redrawn as outlines
+    // 2026-08-08 — square tiles lost the playtest, squares over an
+    // irregular room can't floor it): FOUNDATION outlines author a
     // building's footprint and level on the terrain — the first storey's
-    // floor, placed first, never derived. FLOOR tiles author a
-    // between-storey plane, legal only connected to a wall top or to
-    // another floor tile. One tile per click, edge-snapped to its own
-    // kind with the host's plane and bearing adopted; Ctrl+scroll sizes
-    // the tile, R turns a free tile, Alt breaks the foundation snap to
-    // start a new level (a floor with nothing to connect to just
-    // refuses — there is no free-floating floor).
+    // floor, drawn first, never derived. FLOOR outlines author a
+    // between-storey plane, legal only ANCHORED to a wall top or an
+    // existing floor. Both are the chain gesture the walls taught: click
+    // corners, close on the first one, and the polygon fills as ONE
+    // prism.
+    //
+    // ONE outline, ONE plane: the anchor states it and the whole chain
+    // holds it. Ctrl+scroll dials a foundation's plane in quarter steps;
+    // the laws (burial, skirt) bound how far the dial can be abused, and
+    // where the hill outruns them you terrace — a second foundation at
+    // its own plane. A stairwell is drawn AROUND — omission survives as
+    // shape, not as a missing tile.
     void UpdateSlab(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
-        HandleSlabSizeScroll(mouse, keyboard);
+        bool foundation = Mode == ToolMode.Foundation;
+        if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
+        {
+            CancelSlabChain();
+            return;
+        }
         bool free = keyboard != null
             && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
-        if (keyboard != null && keyboard.rKey.wasPressedThisFrame)
-            slabYaw = Mathf.Repeat(slabYaw + 15f, 360f);
+        if (foundation)
+            HandleSlabPlaneScroll(mouse, keyboard);
 
-        bool foundation = Mode == ToolMode.Foundation;
         bool has = foundation
-            ? ResolveFoundationTile(ray, free, out Vector3 center, out float plane,
-                out float yaw, out bool attached)
-            : ResolveFloorTile(ray, out center, out plane, out yaw, out attached);
-        if (overUI || !has)
+            ? ResolveFoundationPoint(ray, free, overUI, out Vector3 point,
+                out float plane, out bool snapped)
+            : ResolveFloorPoint(ray, free, overUI, out point, out plane,
+                out snapped);
+        if (!has)
         {
-            HideGhosts();
+            // Off-target frames (HUD, sky, nothing to anchor to) keep
+            // the chain visible where it stands.
+            if (slabChain.Count > 0)
+            {
+                slabTempPoly.Clear();
+                slabTempPoly.AddRange(slabChain);
+                ghostTopY = slabChainPlane;
+                ShowSlabChainGhost(null, slabChainPlane, foundation,
+                    slabTempPoly.Count >= 3 && SlabPolyRefusal(slabTempPoly,
+                        slabChainPlane, foundation) != null, false);
+            }
+            else
+            {
+                HideGhosts();
+            }
             return;
         }
 
-        float bottom = foundation
-            ? FoundationBottom(center, yaw, plane)
-            : plane - SlabTile.Thickness;
-        // The refusals, run live on the ghost — the click runs the SAME
-        // tests, so red is never a surprise (one-test doctrine).
-        bool refused = SlabOverlapsExisting(center, plane, yaw, foundation)
-            || (foundation && FoundationBuried(center, plane, yaw))
-            || (!foundation && !attached);
+        bool closing = slabChain.Count >= 3
+            && FlatDistance(point, slabChain[0]) < endpointSnapRadius;
+        if (closing)
+            point = slabChain[0];
+
+        // The tentative polygon: the chain closed through the cursor. The
+        // refusal below IS the commit test run on it, so red at any
+        // moment answers "what if you closed here" (one-test doctrine).
+        slabTempPoly.Clear();
+        slabTempPoly.AddRange(slabChain);
+        if (!closing && (slabChain.Count == 0
+            || FlatDistance(point, slabChain[slabChain.Count - 1]) >= 0.05f))
+            slabTempPoly.Add(point);
+        string refusal = slabTempPoly.Count >= 3
+            ? SlabPolyRefusal(slabTempPoly, plane, foundation)
+            : null;
 
         ghostTopY = plane;
-        guideCenter = center;
-        ShowSlabGhost(center, plane, bottom, yaw,
-            refused ? deletePreviewColor : attached ? snapColor : previewColor);
+        guideCenter = point;
+        snapTint = snapped || closing;
+        ShowSlabChainGhost(point, plane, foundation, refusal != null,
+            snapped || closing);
 
-        if (!refused && mouse.leftButton.wasPressedThisFrame)
+        if (!mouse.leftButton.wasPressedThisFrame || overUI)
+            return;
+        if (slabChain.Count == 0)
         {
-            SlabTile.Create(splineParent, wallMaterial, center, slabSize, yaw,
-                plane, bottom, foundation);
+            slabChain.Add(point);
+            slabChainPlane = plane;
+            slabPlaneDial = 0f;
+        }
+        else if (closing)
+        {
+            if (refusal != null)
+            {
+                BuildLog.Add("Refused: " + refusal);
+                return;
+            }
+            float bottom = foundation
+                ? FoundationBottom(slabChain, slabChainPlane)
+                : slabChainPlane - SlabTile.Thickness;
+            SlabTile.Create(splineParent, wallMaterial, slabChain,
+                slabChainPlane, bottom, foundation);
             BuildLog.Add((foundation ? "Foundation" : "Floor")
-                + $" tile {slabSize:0.#}×{slabSize:0.#}m at {plane:0.##}m.");
+                + $" — {slabChain.Count} corners,"
+                + $" {Mathf.Abs(SlabTile.SignedArea(slabChain)):0.#}m²"
+                + $" at {slabChainPlane:0.##}m.");
+            CancelSlabChain();
+        }
+        else if (FlatDistance(point, slabChain[slabChain.Count - 1]) >= 0.25f)
+        {
+            slabChain.Add(point);
         }
     }
 
-    void HandleSlabSizeScroll(Mouse mouse, Keyboard keyboard)
+    void CancelSlabChain()
+    {
+        slabChain.Clear();
+        slabPlaneDial = 0f;
+        HideGhosts();
+    }
+
+    // Ctrl+scroll: the foundation's plane, in quarter steps — the same
+    // lattice the wall-height dial lands on, so a dialed plane can meet
+    // a dialed wall top exactly. Before the anchor it offsets the seated
+    // plane; while chaining it moves the stated plane itself. The laws
+    // bound it: dial down and the outline buries, up and the skirt
+    // refuses.
+    void HandleSlabPlaneScroll(Mouse mouse, Keyboard keyboard)
     {
         if (keyboard == null
             || (!keyboard.leftCtrlKey.isPressed && !keyboard.rightCtrlKey.isPressed))
@@ -3394,53 +3491,128 @@ public class GridPlacementSystem : MonoBehaviour
         if (Mathf.Abs(scroll) >= 100f)
             scroll /= 120f;
         float notches = Mathf.Clamp(scroll, -4f, 4f);
-        slabSize = Mathf.Clamp(
-            Mathf.Round((slabSize + notches * SlabTile.SizeStep) / SlabTile.SizeStep)
-                * SlabTile.SizeStep,
-            SlabTile.MinSize, SlabTile.MaxSize);
+        if (slabChain.Count > 0)
+            slabChainPlane = Mathf.Round((slabChainPlane
+                + notches * SlabTile.FloorStep) / SlabTile.FloorStep)
+                * SlabTile.FloorStep;
+        else
+            slabPlaneDial = Mathf.Round((slabPlaneDial
+                + notches * SlabTile.FloorStep) / SlabTile.FloorStep)
+                * SlabTile.FloorStep;
     }
 
-    // A foundation tile lives where the terrain is: the cursor names a
+    // A foundation corner lives where the terrain is: the cursor names a
     // ground point (the terrain-only ray sees straight through existing
-    // tiles, so hovering the patch still works), the nearest same-kind
-    // tile edge captures the ghost, and a captured tile adopts the
-    // host's plane and bearing. A free tile seats like a floor slab
-    // does: top at the highest ground under it, stepped to the quarter
-    // grid.
-    bool ResolveFoundationTile(Ray ray, bool free, out Vector3 center,
-        out float plane, out float yaw, out bool attached)
+    // slabs, so drawing over the patch still works), snapping onto
+    // existing foundation outlines so a new outline extends a level
+    // exactly. The ANCHOR names the plane — a snapped anchor adopts its
+    // host's (matching a neighbour IS alignment and beats the grid), a
+    // free anchor seats at its own ground ceiled to the quarter grid,
+    // plus whatever the dial says.
+    bool ResolveFoundationPoint(Ray ray, bool free, bool overUI,
+        out Vector3 point, out float plane, out bool snapped)
     {
-        center = default;
+        point = default;
         plane = 0f;
-        yaw = slabYaw;
-        attached = false;
-        if (!TryGetTerrainPoint(ray, out Vector3 p))
+        snapped = false;
+        if (overUI || !TryGetTerrainPoint(ray, out Vector3 p))
             return false;
-        if (!free && TrySlabSnap(p, true, out center, out plane, out yaw))
+        point = new Vector3(p.x, 0f, p.z);
+
+        float hostPlane = 0f;
+        if (!free && TrySlabOutlineSnap(true, ref point, ref hostPlane))
+            snapped = true;
+
+        if (slabChain.Count > 0)
         {
-            attached = true;
+            plane = slabChainPlane;
             return true;
         }
-        center = new Vector3(p.x, 0f, p.z);
-        SampleTileGround(center, yaw, slabSize, out _, out float maxG);
-        plane = Mathf.Ceil(maxG / SlabTile.FloorStep) * SlabTile.FloorStep;
+        plane = snapped
+            ? hostPlane
+            : Mathf.Ceil(p.y / SlabTile.FloorStep) * SlabTile.FloorStep
+                + slabPlaneDial;
         return true;
     }
 
-    // A floor tile exists only by connection: hovering a wall's top face
-    // seeds one at that wall's plane and bearing, hovering an existing
-    // floor tile abuts one to its nearest edge. Anything else has
-    // nothing to connect to and shows nothing.
-    bool ResolveFloorTile(Ray ray, out Vector3 center, out float plane,
-        out float yaw, out bool attached)
+    // A floor outline exists only by CONNECTION: the anchor must take its
+    // plane from a wall top or an existing floor. After the anchor the
+    // cursor maps onto the PLANE itself (the ray meets y = plane), so the
+    // outline can cross open air — a stairwell is drawn around, not tiled
+    // around. Corners snap to wall nodes carrying masonry at the plane,
+    // and to existing floor outlines at it.
+    bool ResolveFloorPoint(Ray ray, bool free, bool overUI,
+        out Vector3 point, out float plane, out bool snapped)
     {
-        center = default;
-        plane = 0f;
-        yaw = slabYaw;
-        attached = false;
+        point = default;
+        plane = slabChain.Count > 0 ? slabChainPlane : 0f;
+        snapped = false;
+        if (overUI)
+            return false;
 
+        if (slabChain.Count == 0)
+        {
+            if (!TryGetFirstHit(ray, out RaycastHit best))
+                return false;
+            SlabTile tile = best.collider.GetComponent<SlabTile>();
+            if (tile != null && !tile.isFoundation)
+            {
+                point = new Vector3(best.point.x, 0f, best.point.z);
+                plane = tile.topY;
+                float hostPlane = plane;
+                if (!free)
+                    TrySlabOutlineSnap(false, ref point, ref hostPlane);
+                snapped = true;
+                return true;
+            }
+            WallEdgeSection section = best.collider.GetComponent<WallEdgeSection>();
+            if (section != null && section.edge != null && best.normal.y > 0.7f
+                && !CutawayView.IsCutSurface(best.point))
+            {
+                point = new Vector3(best.point.x, 0f, best.point.z);
+                plane = section.topY;
+                if (!free && TryFloorNodeSnap(point, plane, out Vector3 nodePoint))
+                    point = nodePoint;
+                snapped = true;
+                return true;
+            }
+            return false;
+        }
+
+        if (Mathf.Abs(ray.direction.y) < 0.0001f)
+            return false;
+        float t = (plane - ray.origin.y) / ray.direction.y;
+        if (t <= 0f)
+            return false;
+        Vector3 onPlane = ray.origin + ray.direction * t;
+        point = new Vector3(onPlane.x, 0f, onPlane.z);
+        if (!free)
+        {
+            if (TryFloorNodeSnap(point, plane, out Vector3 nodePoint))
+            {
+                point = nodePoint;
+                snapped = true;
+            }
+            else
+            {
+                Vector3 snapPt = point;
+                float hostPlane = plane;
+                if (TrySlabOutlineSnap(false, ref snapPt, ref hostPlane)
+                    && Mathf.Abs(hostPlane - plane) < 0.25f)
+                {
+                    point = snapPt;
+                    snapped = true;
+                }
+            }
+        }
+        return true;
+    }
+
+    // The nearest non-trigger hit under the cursor, whatever it is.
+    bool TryGetFirstHit(Ray ray, out RaycastHit best)
+    {
         RaycastHit[] hits = Physics.RaycastAll(ray, 3000f);
-        RaycastHit best = default;
+        best = default;
         float bestDist = float.MaxValue;
         foreach (RaycastHit h in hits)
         {
@@ -3452,193 +3624,267 @@ public class GridPlacementSystem : MonoBehaviour
                 best = h;
             }
         }
-        if (bestDist == float.MaxValue)
-            return false;
-
-        SlabTile tile = best.collider.GetComponent<SlabTile>();
-        if (tile != null && !tile.isFoundation)
-        {
-            plane = tile.topY;
-            yaw = tile.yaw;
-            center = AbutTile(tile, best.point);
-            attached = true;
-            return true;
-        }
-
-        WallEdgeSection section = best.collider.GetComponent<WallEdgeSection>();
-        if (section != null && section.edge != null && best.normal.y > 0.7f
-            && !CutawayView.IsCutSurface(best.point))
-        {
-            plane = section.topY;
-            Vector3 d = section.edge.B - section.edge.A;
-            yaw = Mathf.Atan2(-d.z, d.x) * Mathf.Rad2Deg;
-            center = new Vector3(best.point.x, 0f, best.point.z);
-            attached = true;
-            return true;
-        }
-        return false;
+        return bestDist != float.MaxValue;
     }
 
-    // The nearest same-kind tile whose edge zone holds this point:
-    // the ghost abuts that edge, sliding along it, corners snapping
-    // into alignment when close. Plane and bearing come from the host.
-    bool TrySlabSnap(Vector3 point, bool foundations, out Vector3 center,
-        out float plane, out float yaw)
+    // Snap a chain corner onto an existing outline of the same kind — its
+    // corners first (weld exactly), then its edges (slide onto the line).
+    // Reports the host's plane so a foundation ANCHOR can adopt the level
+    // it is extending.
+    bool TrySlabOutlineSnap(bool foundations, ref Vector3 point, ref float hostPlane)
     {
-        center = default;
-        plane = 0f;
-        yaw = 0f;
         SlabTile bestTile = null;
-        float bestEdge = float.MaxValue;
+        Vector3 bestPt = default;
+        float best = 0.5f;
         foreach (SlabTile t in SlabTile.All)
         {
             if (t == null || t.isFoundation != foundations)
                 continue;
-            float rad = t.yaw * Mathf.Deg2Rad;
-            Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad));
-            Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad));
-            Vector3 local = new Vector3(point.x, 0f, point.z) - t.center;
-            float a = Mathf.Abs(Vector3.Dot(local, ax));
-            float b = Mathf.Abs(Vector3.Dot(local, az));
-            float outside = Mathf.Max(a, b) - t.size * 0.5f;
-            // Inside the tile counts (face placement off the near edge);
-            // outside it, the reach scales with the ghost so a big tile
-            // is as easy to extend as a small one.
-            if (outside > slabSize * 0.75f + 0.75f)
-                continue;
-            if (Mathf.Min(a, b) > t.size * 0.5f + slabSize * 0.5f)
-                continue;
-            if (outside < bestEdge)
+            foreach (Vector3 v in t.verts)
             {
-                bestEdge = outside;
-                bestTile = t;
+                float d = FlatDistance(point, v);
+                if (d < best)
+                {
+                    best = d;
+                    bestTile = t;
+                    bestPt = v;
+                }
+            }
+        }
+        if (bestTile == null)
+        {
+            best = 0.4f;
+            foreach (SlabTile t in SlabTile.All)
+            {
+                if (t == null || t.isFoundation != foundations)
+                    continue;
+                for (int i = 0; i < t.verts.Count; i++)
+                {
+                    Vector3 q = ClosestOnSegment(t.verts[i],
+                        t.verts[(i + 1) % t.verts.Count], point);
+                    float d = FlatDistance(point, q);
+                    if (d < best)
+                    {
+                        best = d;
+                        bestTile = t;
+                        bestPt = q;
+                    }
+                }
             }
         }
         if (bestTile == null)
             return false;
-        plane = bestTile.topY;
-        yaw = bestTile.yaw;
-        center = AbutTile(bestTile, point);
+        point = new Vector3(bestPt.x, 0f, bestPt.z);
+        hostPlane = bestTile.topY;
         return true;
     }
 
-    // Place the ghost flush against the host edge nearest this point,
-    // sliding along that edge; slide snaps to centered and to
-    // corner-aligned within 0.3m.
-    Vector3 AbutTile(SlabTile host, Vector3 point)
+    static Vector3 ClosestOnSegment(Vector3 a, Vector3 b, Vector3 p)
     {
-        float rad = host.yaw * Mathf.Deg2Rad;
-        Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad));
-        Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad));
-        Vector3 local = new Vector3(point.x, 0f, point.z) - host.center;
-        float a = Vector3.Dot(local, ax);
-        float b = Vector3.Dot(local, az);
-        Vector3 normal;
-        float slide;
-        if (Mathf.Abs(a) >= Mathf.Abs(b))
-        {
-            normal = ax * Mathf.Sign(a);
-            slide = b;
-        }
-        else
-        {
-            normal = az * Mathf.Sign(b);
-            slide = a;
-        }
-        Vector3 along = Vector3.Cross(Vector3.up, normal);
-        float cornerAt = (host.size - slabSize) * 0.5f;
-        if (Mathf.Abs(slide) < 0.3f)
-            slide = 0f;
-        else if (Mathf.Abs(Mathf.Abs(slide) - Mathf.Abs(cornerAt)) < 0.3f)
-            slide = Mathf.Abs(cornerAt) * Mathf.Sign(slide);
-        slide = Mathf.Clamp(slide,
-            -(host.size + slabSize) * 0.5f + 0.5f,
-            (host.size + slabSize) * 0.5f - 0.5f);
-        return host.center + normal * ((host.size + slabSize) * 0.5f) + along * slide;
+        Vector3 ab = b - a;
+        ab.y = 0f;
+        float len2 = ab.sqrMagnitude;
+        float t = len2 > 0.000001f
+            ? Mathf.Clamp01(((p.x - a.x) * ab.x + (p.z - a.z) * ab.z) / len2)
+            : 0f;
+        return new Vector3(a.x + ab.x * t, 0f, a.z + ab.z * t);
     }
 
-    // Ground extremes under a yawed square, sampled on a grid.
-    void SampleTileGround(Vector3 center, float yaw, float size,
-        out float minG, out float maxG)
+    // A wall corner carrying masonry AT the plane — the floor outline's
+    // strongest snap: flooring a room is clicking its corners. The end
+    // section's top is the test (a node is an edge END here, always).
+    bool TryFloorNodeSnap(Vector3 point, float plane, out Vector3 snapped)
+    {
+        snapped = default;
+        WallNode bestNode = null;
+        float best = endpointSnapRadius;
+        foreach (WallNode n in WallNode.All)
+        {
+            if (n == null)
+                continue;
+            float d = FlatDistance(point, n.point);
+            if (d >= best)
+                continue;
+            foreach (WallNode.Member m in n.members)
+            {
+                if (m.edge == null)
+                    continue;
+                var sections = m.edge.SectionsInOrder();
+                if (sections.Count == 0)
+                    continue;
+                WallEdgeSection end = m.atStart
+                    ? sections[0] : sections[sections.Count - 1];
+                if (end != null && Mathf.Abs(end.topY - plane) < 0.2f)
+                {
+                    best = d;
+                    bestNode = n;
+                    break;
+                }
+            }
+        }
+        if (bestNode == null)
+            return false;
+        snapped = new Vector3(bestNode.point.x, 0f, bestNode.point.z);
+        return true;
+    }
+
+    // THE commit test, run live on the tentative polygon every frame —
+    // the returned string doubles as the refusal log line, so what the
+    // red ghost means and what the click says are one fact (one-test
+    // doctrine).
+    string SlabPolyRefusal(List<Vector3> poly, float plane, bool foundation)
+    {
+        if (SlabTile.SelfIntersects(poly))
+            return "the outline crosses itself.";
+        if (Mathf.Abs(SlabTile.SignedArea(poly)) < 0.25f)
+            return "the outline is too small to be a slab.";
+        foreach (SlabTile t in SlabTile.All)
+        {
+            if (t == null || t.isFoundation != foundation)
+                continue;
+            if (Mathf.Abs(t.topY - plane) > 0.25f)
+                continue;
+            if (SlabTile.PolyOverlaps(poly, t.verts))
+                return foundation
+                    ? "the outline overlaps a foundation at this level."
+                    : "the outline overlaps a floor at this plane.";
+        }
+        if (foundation)
+        {
+            SamplePolyGround(poly, plane, out float minG, out float buriedFrac);
+            // Mostly clipping through terrain is buried, not built; dips
+            // never refuse — the skirt spans them (down to MaxSkirt,
+            // past which a plane is a stilt). Together the two laws bound
+            // the plane dial, and where the hill outruns them, terrace.
+            if (buriedFrac > 0.5f)
+                return "mostly buried — dial the plane up, or terrace.";
+            if (plane - minG > SlabTile.MaxSkirt + 0.01f)
+                return $"the skirt would drop over {SlabTile.MaxSkirt:0}m"
+                    + " — dial the plane down, or terrace.";
+        }
+        return null;
+    }
+
+    // Ground extremes and the buried fraction under an outline: a grid
+    // over the bounding box clipped to the polygon, plus the vertices
+    // themselves so a sliver never goes unsampled.
+    void SamplePolyGround(List<Vector3> poly, float plane,
+        out float minG, out float buriedFrac)
     {
         minG = float.MaxValue;
-        maxG = float.MinValue;
-        float rad = yaw * Mathf.Deg2Rad;
-        Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad));
-        Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad));
-        const int N = 6;
-        for (int i = 0; i < N; i++)
-            for (int j = 0; j < N; j++)
+        int total = 0, buried = 0;
+        float minX = float.MaxValue, maxX = float.MinValue;
+        float minZ = float.MaxValue, maxZ = float.MinValue;
+        foreach (Vector3 v in poly)
+        {
+            minX = Mathf.Min(minX, v.x);
+            maxX = Mathf.Max(maxX, v.x);
+            minZ = Mathf.Min(minZ, v.z);
+            maxZ = Mathf.Max(maxZ, v.z);
+            float g = GroundYAt(v);
+            minG = Mathf.Min(minG, g);
+            total++;
+            if (g > plane + 0.05f)
+                buried++;
+        }
+        float step = Mathf.Max(0.5f,
+            Mathf.Max(maxX - minX, maxZ - minZ) / 14f);
+        for (float x = minX + step * 0.5f; x < maxX; x += step)
+            for (float z = minZ + step * 0.5f; z < maxZ; z += step)
             {
-                float u = (i / (float)(N - 1) - 0.5f) * size;
-                float v = (j / (float)(N - 1) - 0.5f) * size;
-                float g = GroundYAt(center + ax * u + az * v);
+                Vector3 p = new Vector3(x, 0f, z);
+                if (!SlabTile.Contains(poly, p))
+                    continue;
+                float g = GroundYAt(p);
                 minG = Mathf.Min(minG, g);
-                maxG = Mathf.Max(maxG, g);
-            }
-    }
-
-    // The foundation refusal: a tile whose top is MOSTLY clipping
-    // through terrain (ground above the plane over more than half its
-    // area) is buried, not built. Dips never refuse — the skirt spans
-    // them. Tile-local and self-scaling with the adopted plane; this is
-    // what stops one level marching up a hill.
-    bool FoundationBuried(Vector3 center, float plane, float yaw)
-    {
-        float rad = yaw * Mathf.Deg2Rad;
-        Vector3 ax = new Vector3(Mathf.Cos(rad), 0f, -Mathf.Sin(rad));
-        Vector3 az = new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad));
-        const int N = 6;
-        int buried = 0;
-        for (int i = 0; i < N; i++)
-            for (int j = 0; j < N; j++)
-            {
-                float u = (i / (float)(N - 1) - 0.5f) * slabSize;
-                float v = (j / (float)(N - 1) - 0.5f) * slabSize;
-                if (GroundYAt(center + ax * u + az * v) > plane + 0.05f)
+                total++;
+                if (g > plane + 0.05f)
                     buried++;
             }
-        return buried * 2 > N * N;
+        buriedFrac = total > 0 ? buried / (float)total : 0f;
     }
 
     // A foundation reaches down past the lowest ground under it so dips
-    // near its edges stay closed — the floor-slab skirt convention.
-    float FoundationBottom(Vector3 center, float yaw, float plane)
+    // near its edges stay closed — the skirt convention, unchanged from
+    // the tiles.
+    float FoundationBottom(List<Vector3> poly, float plane)
     {
-        SampleTileGround(center, yaw, slabSize, out float minG, out _);
+        SamplePolyGround(poly, plane, out float minG, out _);
         float bottom = Mathf.Floor(minG / baseStepSize) * baseStepSize - 0.5f;
         return Mathf.Min(bottom, plane - 0.25f);
     }
 
-    // Same-kind tiles at the same plane must not overlap — abutting is
-    // the point, burying one tile in another is a redraw.
-    bool SlabOverlapsExisting(Vector3 center, float plane, float yaw, bool foundations)
+    // The chain on screen: pooled ghost 0 is the FILL — the tentative
+    // polygon as the very prism the closing click would commit — and the
+    // rest are corner markers, the first corner reading larger once the
+    // outline can close on it. One corner plus the cursor draws a thin
+    // blade of slab instead: the outline has no area yet, but the plane
+    // and the line it will grow from are already honest.
+    void ShowSlabChainGhost(Vector3? cursor, float plane, bool foundation,
+        bool refused, bool snapped)
     {
-        foreach (SlabTile t in SlabTile.All)
-        {
-            if (t == null || t.isFoundation != foundations)
-                continue;
-            if (Mathf.Abs(t.topY - plane) > 0.25f)
-                continue;
-            if (SlabTile.Overlaps(center, slabSize, yaw, t.center, t.size, t.yaw))
-                return true;
-        }
-        return false;
-    }
+        Color tint = refused ? deletePreviewColor
+            : snapped ? snapColor : previewColor;
+        if (slabPreviewMesh == null)
+            slabPreviewMesh = new Mesh { name = "SlabChainPreview" };
 
-    void ShowSlabGhost(Vector3 center, float top, float bottom, float yaw, Color tint)
-    {
-        GameObject ghost = GetPooled(ghostPool, 0, tint, "PlacementPreview");
-        ghost.SetActive(true);
-        SetGhostMesh(ghost, SlabTile.SharedCube());
-        SetGhostTint(ghost, tint);
-        ghost.transform.SetPositionAndRotation(
-            new Vector3(center.x, (top + bottom) * 0.5f, center.z),
-            Quaternion.Euler(0f, yaw, 0f));
-        ghost.transform.localScale =
-            new Vector3(slabSize, Mathf.Max(0.05f, top - bottom), slabSize);
-        for (int i = 1; i < ghostPool.Count; i++)
-            ghostPool[i].SetActive(false);
+        float bottom = foundation && slabTempPoly.Count >= 3
+            ? FoundationBottom(slabTempPoly, plane)
+            : plane - SlabTile.Thickness;
+        bool drewFill = false;
+        if (slabTempPoly.Count >= 3)
+        {
+            SlabTile.BuildPrism(slabPreviewMesh, slabTempPoly,
+                plane + 0.002f, bottom, Vector3.zero);
+            drewFill = slabPreviewMesh.vertexCount > 0;
+        }
+        else if (slabTempPoly.Count == 2)
+        {
+            Vector3 d = slabTempPoly[1] - slabTempPoly[0];
+            d.y = 0f;
+            if (d.sqrMagnitude > 0.0001f)
+            {
+                Vector3 s = new Vector3(d.z, 0f, -d.x).normalized * 0.05f;
+                slabBladePoly.Clear();
+                slabBladePoly.Add(slabTempPoly[0] - s);
+                slabBladePoly.Add(slabTempPoly[0] + s);
+                slabBladePoly.Add(slabTempPoly[1] + s);
+                slabBladePoly.Add(slabTempPoly[1] - s);
+                SlabTile.BuildPrism(slabPreviewMesh, slabBladePoly,
+                    plane + 0.002f, plane - SlabTile.Thickness, Vector3.zero);
+                drewFill = slabPreviewMesh.vertexCount > 0;
+            }
+        }
+        GameObject fill = GetPooled(ghostPool, 0, tint, "PlacementPreview");
+        fill.SetActive(drewFill);
+        if (drewFill)
+        {
+            SetGhostMesh(fill, slabPreviewMesh);
+            SetGhostTint(fill, tint);
+            fill.transform.SetPositionAndRotation(Vector3.zero,
+                Quaternion.identity);
+            fill.transform.localScale = Vector3.one;
+        }
+
+        int idx = 1;
+        void Marker(Vector3 at, Color c, float side)
+        {
+            GameObject m = GetPooled(ghostPool, idx++, c, "PlacementPreview");
+            m.SetActive(true);
+            SetGhostMesh(m, SlabTile.SharedCube());
+            SetGhostTint(m, c);
+            m.transform.SetPositionAndRotation(
+                new Vector3(at.x, plane + 0.1f, at.z), Quaternion.identity);
+            m.transform.localScale = new Vector3(side, 0.2f, side);
+        }
+        for (int i = 0; i < slabChain.Count; i++)
+            Marker(slabChain[i],
+                i == 0 && slabChain.Count >= 3 ? snapColor : tint,
+                i == 0 ? 0.4f : 0.28f);
+        if (cursor.HasValue)
+            Marker(cursor.Value, tint, 0.28f);
+        for (; idx < ghostPool.Count; idx++)
+            ghostPool[idx].SetActive(false);
     }
 
     // The terrain under the cursor and nothing else: not a wall, not a
@@ -5033,7 +5279,7 @@ public class GridPlacementSystem : MonoBehaviour
                 {
                     Destroy(hoveredSlab.gameObject);
                     BuildLog.Add(hoveredSlab.isFoundation
-                        ? "Foundation tile removed." : "Floor tile removed.");
+                        ? "Foundation removed." : "Floor removed.");
                     doomedSections.Clear();
                 }
             }
@@ -5078,7 +5324,7 @@ public class GridPlacementSystem : MonoBehaviour
                 continue;
             Destroy(slab.gameObject);
             BuildLog.Add(slab.isFoundation
-                ? "Foundation tile removed." : "Floor tile removed.");
+                ? "Foundation removed." : "Floor removed.");
         }
         CancelDelete();
     }
