@@ -40,7 +40,16 @@ public static class CastleSave
     // 4-corner outlines derived from their center/size/yaw.
     // 4: floors carry stairwells (2026-08-09) — stamped holes, stored on
     // the slab. Versions 2–3 load unchanged: no wells means no wells.
-    const int Version = 4;
+    // 5: the economy's first slice (2026-08-09) — the treasury travels,
+    // and each edge carries its WallKind. Versions 2–4 load unchanged:
+    // kind defaults to Stone (what every old wall was), and a save with
+    // no treasury grants the fresh-start inheritance.
+    // 6: the income side (2026-08-10) — the survey's parcels, the
+    // calendar's elapsed days and the household count travel. A pre-v6
+    // save has no parcels, so the survey regenerates fresh after load
+    // (LandParcels.EnsureGenerated), the clock restarts at Lady Day and
+    // households take the starting dozen.
+    const int Version = 6;
 
     // JSON has no -Infinity, and JsonUtility's handling of one is not
     // worth trusting across Unity versions — the graph's "-inf means
@@ -70,6 +79,9 @@ public static class CastleSave
         public Vector3 control;
         public float height, thickness, baseWallHeight, targetSectionLength, baseStep;
         public float fixedTopY, baseY, skirt;
+        // WallKind as int — 0 (Stone) is both the enum default and what
+        // every pre-v5 wall was, so missing fields mean what they meant.
+        public int kind;
         public List<OpeningData> openings = new List<OpeningData>();
     }
 
@@ -129,15 +141,30 @@ public static class CastleSave
     }
 
     [Serializable]
+    class PlotData
+    {
+        public List<Vector3> verts = new List<Vector3>();
+        public int type, owner, gx, gz;
+    }
+
+    [Serializable]
     class SaveData
     {
         public int version;
         public string terrainName;
+        // The treasury in pence — a stored fact like any other, so the
+        // delete tool's snapshot undo rolls money back with the masonry.
+        public long treasury;
+        // The calendar and the manor: days since Lady Day 1220, and the
+        // one population number.
+        public double clockDays;
+        public int households;
         public List<PadData> pads = new List<PadData>();
         public List<NodeData> nodes = new List<NodeData>();
         public List<EdgeData> edges = new List<EdgeData>();
         public List<StairData> stairs = new List<StairData>();
         public List<SlabData> slabs = new List<SlabData>();
+        public List<PlotData> plots = new List<PlotData>();
     }
 
     // Project-root /Saves, next to Assets — visible, diffable saves.
@@ -206,6 +233,23 @@ public static class CastleSave
         var data = new SaveData { version = Version };
         Terrain terrain = Terrain.activeTerrain;
         data.terrainName = terrain != null ? terrain.name : "";
+        data.treasury = Estate.TreasuryPence;
+        data.clockDays = GameClock.DaysElapsed;
+        data.households = Estate.Households;
+        foreach (LandPlot p in LandPlot.All)
+        {
+            if (p == null)
+                continue;
+            var pd = new PlotData
+            {
+                type = (int)p.type,
+                owner = (int)p.owner,
+                gx = p.gx,
+                gz = p.gz,
+            };
+            pd.verts.AddRange(p.verts);
+            data.plots.Add(pd);
+        }
 
         foreach (TerrainPads.Op op in TerrainPads.All)
             data.pads.Add(new PadData
@@ -252,6 +296,7 @@ public static class CastleSave
                 fixedTopY = Pack(e.fixedTopY),
                 baseY = Pack(e.baseY),
                 skirt = e.skirt,
+                kind = (int)e.kind,
             };
             foreach (WallEdge.Opening o in e.openings)
                 ed.openings.Add(new OpeningData
@@ -326,18 +371,20 @@ public static class CastleSave
         return JsonUtility.ToJson(Capture());
     }
 
-    public static bool RestoreSnapshot(string json, Transform parent, Material material)
+    public static bool RestoreSnapshot(string json, Transform parent, Material material,
+        Material palisadeMaterial = null)
     {
         if (string.IsNullOrEmpty(json))
             return false;
         SaveData data = JsonUtility.FromJson<SaveData>(json);
         if (data == null)
             return false;
-        Apply(data, parent, material);
+        Apply(data, parent, material, palisadeMaterial);
         return true;
     }
 
-    public static bool Load(string path, Transform parent, Material material)
+    public static bool Load(string path, Transform parent, Material material,
+        Material palisadeMaterial = null)
     {
         if (!File.Exists(path))
         {
@@ -345,8 +392,7 @@ public static class CastleSave
             return false;
         }
         SaveData data = JsonUtility.FromJson<SaveData>(File.ReadAllText(path));
-        if (data == null || (data.version != Version && data.version != 2
-            && data.version != 3))
+        if (data == null || data.version < 2 || data.version > Version)
         {
             BuildLog.Add("Save file unreadable or from a different version — not loaded.");
             return false;
@@ -358,7 +404,7 @@ public static class CastleSave
             BuildLog.Add($"Save was made on terrain '{data.terrainName}' — footings"
                 + $" will re-foot on '{terrain.name}'.");
 
-        Apply(data, parent, material);
+        Apply(data, parent, material, palisadeMaterial);
         BuildLog.Add($"Loaded — {data.edges.Count} walls, {data.stairs.Count} stairs,"
             + $" {data.slabs.Count} slabs from {Path.GetFileName(path)}.");
         return true;
@@ -366,9 +412,25 @@ public static class CastleSave
 
     // The restore itself: tear the world down and rebuild it from data.
     // The load's body, shared with the snapshot undo.
-    static void Apply(SaveData data, Transform parent, Material material)
+    static void Apply(SaveData data, Transform parent, Material material,
+        Material palisadeMaterial = null)
     {
         Clear();
+
+        // The treasury is part of the world's state: a v5 save restores
+        // its balance exactly (the snapshot undo depends on this); an
+        // older save predates money and grants the fresh inheritance.
+        Estate.TreasuryPence = data.version >= 5 ? data.treasury : Estate.StartingPence;
+        // The calendar, the manor and the survey travel from v6. No
+        // back-payments for skipped quarters — the saved run settled its
+        // own. A pre-v6 save has no parcels; the caller's
+        // EnsureGenerated pass will survey fresh ground.
+        GameClock.SetElapsed(data.version >= 6 ? data.clockDays : 0);
+        Estate.Households = data.version >= 6 ? data.households : 12;
+        foreach (PlotData pd in data.plots)
+            if (pd.verts != null && pd.verts.Count >= 3)
+                LandPlot.Create(pd.verts, (LandType)pd.type,
+                    (LandOwner)pd.owner, pd.gx, pd.gz);
 
         // Earth before masonry: pristine ground back first, then the
         // saved pads reapply in order — every wall created below re-foots
@@ -400,10 +462,14 @@ public static class CastleSave
                 edges.Add(null);
                 continue;
             }
+            WallKind kind = ed.kind == (int)WallKind.Palisade
+                ? WallKind.Palisade : WallKind.Stone;
+            Material edgeMaterial = kind == WallKind.Palisade && palisadeMaterial != null
+                ? palisadeMaterial : material;
             WallEdge edge = WallEdge.Create(parent, nodes[ed.a], nodes[ed.b], ed.control,
-                ed.height, ed.thickness, ed.baseWallHeight, material,
+                ed.height, ed.thickness, ed.baseWallHeight, edgeMaterial,
                 ed.targetSectionLength, ed.baseStep, Unpack(ed.fixedTopY),
-                Unpack(ed.baseY), ed.skirt);
+                Unpack(ed.baseY), ed.skirt, kind);
             if (ed.openings.Count > 0)
             {
                 foreach (OpeningData od in ed.openings)
@@ -502,5 +568,8 @@ public static class CastleSave
         foreach (SlabTile t in new List<SlabTile>(SlabTile.All))
             if (t != null)
                 UnityEngine.Object.DestroyImmediate(t.gameObject);
+        foreach (LandPlot p in new List<LandPlot>(LandPlot.All))
+            if (p != null)
+                UnityEngine.Object.DestroyImmediate(p.gameObject);
     }
 }

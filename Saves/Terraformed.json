@@ -1,6 +1,7 @@
 {
-    "version": 2,
+    "version": 5,
     "terrainName": "Terrain",
+    "treasury": 24000,
     "pads": [
         {
             "kind": 1,

@@ -25,6 +25,10 @@ public static class WallGraph
         // safe default (see WallEdge.skirt).
         public float skirt;
         public Material material;
+        // What the wall is built of (material + price, never geometry).
+        // The struct default is Stone, which every pre-existing caller
+        // already meant.
+        public WallKind kind;
     }
 
     // Where a proposed curve crosses an existing edge. reuseNode is set
@@ -401,7 +405,7 @@ public static class WallGraph
             SubCurve(s, c, e, t0, t1, out _, out Vector3 subC, out _);
             WallEdge made = WallEdge.Create(parent, n0, n1, subC, p.height, p.thickness,
                 p.baseWallHeight, p.material, p.targetSectionLength, p.baseStep, p.fixedTopY,
-                p.baseY, p.skirt);
+                p.baseY, p.skirt, p.kind);
             created.Add(made);
             touched.Add(n0);
             touched.Add(n1);
@@ -465,7 +469,7 @@ public static class WallGraph
             SubCurve(s, c, e, lo, hi, out _, out Vector3 subC, out _);
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
-                edge.fixedTopY, edge.baseY, edge.skirt);
+                edge.fixedTopY, edge.baseY, edge.skirt, edge.kind);
             WallEdge.CarryOpenings(edge, sub, lo, hi);
             touched.Add(n0);
             touched.Add(n1);
@@ -524,7 +528,7 @@ public static class WallGraph
             SubCurve(s, c, e, t0, t1, out _, out Vector3 subC, out _);
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
-                edge.fixedTopY, edge.baseY, edge.skirt);
+                edge.fixedTopY, edge.baseY, edge.skirt, edge.kind);
             WallEdge.CarryOpenings(edge, sub, t0, t1);
             orderedSubs.Add(sub);
             touched.Add(n0);

@@ -25,6 +25,10 @@ public class WallEdge : MonoBehaviour
     public Vector3 control;
     public float height;
     public float thickness;
+    // What this wall is built OF (palisade, stone — the cost ladder).
+    // Decides material and price, never geometry: surgery copies it, no
+    // query filters on it, and a save carries it (CastleSave v5).
+    public WallKind kind = WallKind.Stone;
     // Texture-V anchor: one tile of stone per this much world height, so
     // every wall shares aligned masonry lines.
     public float baseWallHeight = 3.5f;
@@ -118,7 +122,8 @@ public class WallEdge : MonoBehaviour
     public static WallEdge Create(Transform parent, WallNode a, WallNode b, Vector3 control,
         float height, float thickness, float baseWallHeight, Material material,
         float targetSectionLength, float baseStep, float fixedTopY = float.NegativeInfinity,
-        float baseY = float.NegativeInfinity, float skirt = 0f)
+        float baseY = float.NegativeInfinity, float skirt = 0f,
+        WallKind kind = WallKind.Stone)
     {
         GameObject obj = new GameObject("WallEdge");
         obj.transform.SetParent(parent, false);
@@ -128,6 +133,7 @@ public class WallEdge : MonoBehaviour
         edge.control = control;
         edge.height = height;
         edge.thickness = thickness;
+        edge.kind = kind;
         edge.baseWallHeight = baseWallHeight;
         edge.targetSectionLength = targetSectionLength;
         edge.baseStep = baseStep;

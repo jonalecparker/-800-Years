@@ -79,8 +79,19 @@ public class GridPlacementSystem : MonoBehaviour
     // instead of the top riding the ground section by section.
     public bool lockTopHeight;
 
-    public enum ToolMode { Build, Delete, Offset, Room, Stair, Door, Ground, Foundation, Floor }
+    public enum ToolMode { Build, Delete, Offset, Room, Stair, Door, Ground, Foundation, Floor, Land }
     public ToolMode Mode { get; private set; } = ToolMode.Build;
+
+    // What the wall-family tools build OF (the menu's Walls items pick
+    // it): decides the committed edges' material and price, nothing else.
+    // Stone is the default because every wall before the ladder existed
+    // was stone.
+    public WallKind CurrentWallKind { get; private set; } = WallKind.Stone;
+
+    public void SetWallKind(WallKind kind)
+    {
+        CurrentWallKind = kind;
+    }
 
     // The Ground tool's two jobs. Path benches a graded walkable band
     // along a drag (Shift holds the anchor's height instead — a level
@@ -198,6 +209,30 @@ public class GridPlacementSystem : MonoBehaviour
         }
     }
 
+    // What the active preview will COST, priced from the same specs the
+    // ghosts show (ghost = commit extends to the price tag). The commit
+    // re-prices from the created edges' real sections, which can differ
+    // by the pennies of re-sectioning across splits — a readout, not a
+    // gate, so pennies are fine.
+    public long ActiveDragCost
+    {
+        get
+        {
+            if (Mode == ToolMode.Delete)
+                return 0;
+            if (Shape == BuildShape.Circle || Shape == BuildShape.Rect)
+                return shapeBlocked ? 0
+                    : Estate.CostOfSpecs(shapeSpecs, gridSize, CurrentWallKind);
+            if (Mode == ToolMode.Room)
+                return Estate.CostOfSpecs(roomFixedSpecs, gridSize, CurrentWallKind)
+                    + (roomLiveBlocked ? 0
+                        : Estate.CostOfSpecs(roomLiveSpecs, gridSize, CurrentWallKind));
+            if (previewBlocked)
+                return 0;
+            return Estate.CostOfSpecs(splineSpecs, gridSize, CurrentWallKind);
+        }
+    }
+
     // Slightly larger than the section it covers so the overlay shell
     // draws over the section's own surface instead of z-fighting with it.
     const float DeleteOverlayScale = 1.02f;
@@ -282,6 +317,7 @@ public class GridPlacementSystem : MonoBehaviour
     private LineRenderer angleLine;
     private Mesh prefabMesh;
     private Material wallMaterial;
+    private Material palisadeMaterial;
     private Transform splineParent;
     private float currentYRotation;
     private float heightMultiplier = 1f;
@@ -479,6 +515,10 @@ public class GridPlacementSystem : MonoBehaviour
     // half a wall thickness, so the wall's outer face lies exactly on the
     // slab edge (TrySlabRimSnap).
     private SlabTile hoverSlabTile;
+    // The Survey tool's hover: the parcel under the cursor and the line
+    // the inspect panel shows for it.
+    private LandPlot hoveredPlot;
+    private string landInspect;
     // The host the CURRENT preview is riding — the gesture's own host
     // while the run stays on it, cleared the moment Alt frees the run so
     // the ghost stops inheriting a curve it no longer follows.
@@ -582,7 +622,19 @@ public class GridPlacementSystem : MonoBehaviour
         prefabMesh = prefabFilter != null ? prefabFilter.sharedMesh : null;
         MeshRenderer prefabRenderer = piecePrefab != null ? piecePrefab.GetComponent<MeshRenderer>() : null;
         wallMaterial = prefabRenderer != null ? prefabRenderer.sharedMaterial : null;
+        // Palisade timber is the stone material warmed brown — a graybox
+        // stand-in until the wall-type detailing pass; the tint keeps the
+        // two kinds tellable at a glance.
+        if (wallMaterial != null)
+        {
+            palisadeMaterial = new Material(wallMaterial) { name = "PalisadeTimber" };
+            palisadeMaterial.color = new Color(0.52f, 0.36f, 0.22f, 1f);
+        }
     }
+
+    Material MaterialForKind(WallKind kind)
+        => kind == WallKind.Palisade && palisadeMaterial != null
+            ? palisadeMaterial : wallMaterial;
 
     void Update()
     {
@@ -676,6 +728,8 @@ public class GridPlacementSystem : MonoBehaviour
 
         if (Mode == ToolMode.Delete)
             UpdateDelete(mouse, keyboard, ray, overUI);
+        else if (Mode == ToolMode.Land)
+            UpdateLand(mouse, ray, overUI);
         else if (Mode == ToolMode.Offset)
             UpdateOffset(mouse, keyboard, ray, overUI);
         // Stairs have no gesture either — same reason as Designate below,
@@ -699,7 +753,10 @@ public class GridPlacementSystem : MonoBehaviour
         else
             UpdateBuild(mouse, keyboard, ray, overUI);
 
-        InspectLine = overUI ? null : InspectElevations(ray);
+        // In Survey mode the inspect line reads the parcel under the
+        // cursor instead of elevations — same panel, the tool's facts.
+        InspectLine = overUI ? null
+            : Mode == ToolMode.Land ? landInspect : InspectElevations(ray);
 
         // A scrolled height override lives as long as its context — the
         // active drag, or the hovered snap it was scrolled against.
@@ -725,6 +782,13 @@ public class GridPlacementSystem : MonoBehaviour
         if (Mode == mode)
             return;
         Mode = mode;
+        // The survey map exists exactly while the Survey tool is in
+        // hand — its colliders must never catch another tool's ray.
+        LandPlot.ShowAll(mode == ToolMode.Land);
+        if (hoveredPlot != null)
+            hoveredPlot.SetHighlight(false);
+        hoveredPlot = null;
+        landInspect = null;
         // Entering the Ground tool always starts on Path — restoring is
         // a deliberate pick, exactly like Designate.
         if (mode == ToolMode.Ground)
@@ -776,6 +840,13 @@ public class GridPlacementSystem : MonoBehaviour
         heightOverride = false;
         deleteUndoJson = null;
         ClaimingScrollWheel = false;
+        // The survey map stands down too — the walker must not collide
+        // with a draped overlay, and its colliders must not linger.
+        LandPlot.ShowAll(false);
+        if (hoveredPlot != null)
+            hoveredPlot.SetHighlight(false);
+        hoveredPlot = null;
+        landInspect = null;
         // Walk mode hides the HUD, but the Saves panel doesn't — a stale
         // inspect line or ghost-top under the open panel would report a
         // hover that no longer exists.
@@ -803,7 +874,8 @@ public class GridPlacementSystem : MonoBehaviour
     public void LoadSlot(string slot)
     {
         StandDown();
-        if (CastleSave.Load(CastleSave.PathFor(slot), splineParent, wallMaterial))
+        if (CastleSave.Load(CastleSave.PathFor(slot), splineParent, wallMaterial,
+            palisadeMaterial))
             CastleSave.CurrentSlot = slot;
     }
 
@@ -824,6 +896,12 @@ public class GridPlacementSystem : MonoBehaviour
             if (deleteUndoJson != null)
                 lines.Add("Right-click — undo the last delete");
             lines.Add("Esc — clear the selection");
+        }
+        else if (Mode == ToolMode.Land)
+        {
+            context = "Survey";
+            lines.Add("Hover — read a parcel");
+            lines.Add("Click frontier land — clear or buy it");
         }
         else if (Mode == ToolMode.Offset)
         {
@@ -1079,6 +1157,83 @@ public class GridPlacementSystem : MonoBehaviour
         CancelCurve();
         CancelShape();
         CancelRoomChain();
+    }
+
+    // The Survey: the countryside's parcels as a draped map, shown only
+    // while this tool is in hand. Hover reads a parcel into the inspect
+    // panel; a click on the frontier takes it — bandit land cleared, a
+    // neighbor's bought — through the ordinary treasury door. Owned
+    // land answers to nothing here yet; the manor dials come later.
+    void UpdateLand(Mouse mouse, Ray ray, bool overUI)
+    {
+        LandPlot plot = null;
+        if (!overUI)
+        {
+            float best = float.MaxValue;
+            foreach (RaycastHit h in Physics.RaycastAll(ray, 1000f))
+            {
+                if (h.collider.isTrigger || h.distance >= best)
+                    continue;
+                LandPlot p = h.collider.GetComponent<LandPlot>();
+                if (p != null)
+                {
+                    best = h.distance;
+                    plot = p;
+                }
+            }
+        }
+        if (hoveredPlot != null && hoveredPlot != plot)
+            hoveredPlot.SetHighlight(false);
+        hoveredPlot = plot;
+        if (plot == null)
+        {
+            landInspect = null;
+            return;
+        }
+        plot.SetHighlight(true);
+
+        string kind = plot.type switch
+        {
+            LandType.Farm => "Farmland",
+            LandType.Pasture => "Pasture",
+            LandType.Timber => "Timber",
+            _ => "Village land",
+        };
+        float acres = plot.AreaM2 / 4047f;
+        bool frontier = plot.owner != LandOwner.Player
+            && LandParcels.TouchesPlayerLand(plot);
+        landInspect = plot.owner switch
+        {
+            LandOwner.Player =>
+                $"{kind} · {acres:0.0} acres · yours —"
+                + $" {Estate.Format(Estate.AnnualYieldOf(plot))} a year",
+            LandOwner.Bandits =>
+                $"{kind} · {acres:0.0} acres · bandit-held — clear for"
+                + $" {Estate.Format(Estate.PriceOf(plot))}"
+                + (frontier ? "" : " (beyond your borders)"),
+            _ =>
+                $"{kind} · {acres:0.0} acres · a neighbor's — buy for"
+                + $" {Estate.Format(Estate.PriceOf(plot))}"
+                + (frontier ? "" : " (beyond your borders)"),
+        };
+
+        if (mouse.leftButton.wasPressedThisFrame
+            && plot.owner != LandOwner.Player)
+        {
+            // The frontier rule, commit-side: the same adjacency the
+            // hover line warns about (one-test doctrine).
+            if (!frontier)
+            {
+                BuildLog.Add("Refused: the frontier moves outward from"
+                    + " your own lands.");
+                return;
+            }
+            Estate.Pay(Estate.PriceOf(plot), plot.owner == LandOwner.Bandits
+                ? $"Drove the bandits off {acres:0.0} acres of {kind.ToLower()}"
+                : $"Bought {acres:0.0} acres of {kind.ToLower()}");
+            plot.owner = LandOwner.Player;
+            plot.Retint();
+        }
     }
 
     void UpdateBuild(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
@@ -1735,6 +1890,7 @@ public class GridPlacementSystem : MonoBehaviour
                 chainHeight = height;
             }
         }
+        Estate.Pay(Estate.CostOfEdges(created), Estate.KindLabel(CurrentWallKind));
 
         // The straight wall tool CHAINS like the room chain: the commit
         // re-anchors the gesture on its own end node, so the next click
@@ -1776,6 +1932,8 @@ public class GridPlacementSystem : MonoBehaviour
     {
         WallChainLeg leg = wallChainLegs[wallChainLegs.Count - 1];
         wallChainLegs.RemoveAt(wallChainLegs.Count - 1);
+        // The leg's price comes back in full — an undo is not a salvage.
+        Estate.Refund(Estate.CostOfEdges(leg.created), "Leg undone");
         foreach (WallEdge e in leg.created)
         {
             if (e == null)
@@ -1810,14 +1968,15 @@ public class GridPlacementSystem : MonoBehaviour
             fixedTopY = topY,
             baseY = baseY,
             skirt = skirt,
-            material = wallMaterial,
+            material = MaterialForKind(CurrentWallKind),
+            kind = CurrentWallKind,
         };
     }
 
     // Cursor surface for the room/shape tools: the first non-trigger hit
     // flattened, plus the slab top when that hit is a room's roof deck or
     // floor — elevated ground the gesture builds on.
-    bool TryGetBuildSurface(Ray ray, out Vector3 point, out float? deckY)
+    bool TryGetBuildSurface(Ray ray, bool freePlace, out Vector3 point, out float? deckY)
     {
         point = default;
         deckY = null;
@@ -1832,8 +1991,13 @@ public class GridPlacementSystem : MonoBehaviour
                 continue;
             point = new Vector3(hit.point.x, 0f, hit.point.z);
             // A slab tile is elevated ground: building on it is
-            // free-form (no ride lock).
+            // free-form (no ride lock). A terrain hit within rim reach
+            // of an outline adopts the slab the same way — a near-grade
+            // pad exposes no skirt to catch the ray just past its rim
+            // (RimSlabFromTerrain has the why); Alt keeps terrain free.
             SlabTile slab = hit.collider.GetComponent<SlabTile>();
+            if (slab == null && !freePlace && hit.collider is TerrainCollider)
+                slab = RimSlabFromTerrain(point, hit.point.y);
             if (slab != null)
             {
                 deckY = slab.topY;
@@ -1912,7 +2076,7 @@ public class GridPlacementSystem : MonoBehaviour
         bool shiftHeld = keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
         Vector3 raw = default;
         float? deckY = null;
-        bool hasPoint = !overUI && TryGetBuildSurface(ray, out raw, out deckY);
+        bool hasPoint = !overUI && TryGetBuildSurface(ray, freePlace, out raw, out deckY);
         // Snapping works on decks too, filtered to that deck's own walls
         // — the masonry a storey down never grabs the gesture.
         bool canSnap = !freePlace;
@@ -2417,6 +2581,7 @@ public class GridPlacementSystem : MonoBehaviour
     {
         WallEdge lastEdge = null;
         int reused = 0;
+        var allCreated = new List<WallEdge>();
         WallGraph.EdgeParams p = EdgeParamsNow(ShapeHeight(), shapeTopY,
             shapeBaseY ?? float.NegativeInfinity);
         foreach ((Vector3 s, Vector3 c, Vector3 e) in shapeEdgesLive)
@@ -2429,9 +2594,11 @@ public class GridPlacementSystem : MonoBehaviour
                 continue;
             }
             List<WallEdge> created = WallGraph.CommitEdge(splineParent, s, c, e, p);
+            allCreated.AddRange(created);
             if (created.Count > 0)
                 lastEdge = created[created.Count - 1];
         }
+        Estate.Pay(Estate.CostOfEdges(allCreated), Estate.KindLabel(CurrentWallKind));
         if (reused > 0)
             BuildLog.Add(reused == 1
                 ? "Reused an existing wall as a side."
@@ -2491,7 +2658,7 @@ public class GridPlacementSystem : MonoBehaviour
         bool snapAngle = keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
         Vector3 raw = default;
         float? deckY = null;
-        bool hasPoint = !overUI && TryGetBuildSurface(ray, out raw, out deckY);
+        bool hasPoint = !overUI && TryGetBuildSurface(ray, freePlace, out raw, out deckY);
         // Snapping works on decks too, filtered to that deck's own walls
         // — the masonry a storey down never grabs the gesture. A snap
         // onto an elevated wall adopts its storey (AdoptSnapElevation),
@@ -3207,6 +3374,7 @@ public class GridPlacementSystem : MonoBehaviour
         float landing = stair.TotalArc - stair.runArc;
         BuildLog.Add($"Stair — {stair.StepCount} steps, {stair.Rise:0.0}m rise,"
             + $" {landing:0.0}m landing.");
+        Estate.Pay(Estate.CostOfStair(stair), "Stair");
         // A stair built under an existing floor opens its own way through
         // — the same stamp the floor tool makes when drawn over a stair.
         // A well clipping the floor's edge is skipped, not forced: the
@@ -3305,6 +3473,8 @@ public class GridPlacementSystem : MonoBehaviour
                     ? $" Its sill is {doorStep:0.0}m above the ground outside —"
                         + " point the stair tool at the stone under it to build up."
                     : ""));
+            // Cutting a doorway is labor, not masonry — a flat mason's fee.
+            Estate.Pay(Estate.DoorFee, "Doorway cut");
             // The rebuild destroyed the section the ghost was measured
             // against, so the next frame re-reads the wall from scratch.
             CancelDoor();
@@ -3572,6 +3742,7 @@ public class GridPlacementSystem : MonoBehaviour
     void CommitRoomChain()
     {
         WallEdge lastEdge = null;
+        var allCreated = new List<WallEdge>();
         for (int i = 0; i + 1 < roomChain.Count; i++)
         {
             Vector3 a = roomChain[i];
@@ -3583,9 +3754,11 @@ public class GridPlacementSystem : MonoBehaviour
             StackFit(null, a, b, roomChainHeight, segBase, out float segSkirt, ref segTop);
             List<WallEdge> created = WallGraph.CommitEdge(splineParent, a, (a + b) * 0.5f, b,
                 EdgeParamsNow(roomChainHeight, segTop, segBase, segSkirt));
+            allCreated.AddRange(created);
             if (created.Count > 0)
                 lastEdge = created[created.Count - 1];
         }
+        Estate.Pay(Estate.CostOfEdges(allCreated), Estate.KindLabel(CurrentWallKind));
         // Chain wound counter-clockwise → its interior is on the left of
         // travel, which is the side TraceFace walks — trace the last edge
         // along the gesture. Clockwise → trace it reversed.
@@ -3879,7 +4052,7 @@ public class GridPlacementSystem : MonoBehaviour
             float bottom = foundation
                 ? FoundationBottom(slabChain, slabChainPlane)
                 : slabChainPlane - SlabTile.Thickness;
-            SlabTile.Create(splineParent, wallMaterial, slabChain,
+            SlabTile made = SlabTile.Create(splineParent, wallMaterial, slabChain,
                 slabChainPlane, bottom, foundation,
                 foundation ? null : slabWells);
             BuildLog.Add((foundation ? "Foundation" : "Floor")
@@ -3890,6 +4063,7 @@ public class GridPlacementSystem : MonoBehaviour
                     ? $" {slabWells.Count} stairwell"
                         + (slabWells.Count == 1 ? "" : "s") + " cut."
                     : ""));
+            Estate.Pay(Estate.CostOfSlab(made), foundation ? "Foundation" : "Floor");
             CancelSlabChain();
         }
         else if (FlatDistance(point, slabChain[slabChain.Count - 1]) >= 0.25f)
@@ -4135,6 +4309,41 @@ public class GridPlacementSystem : MonoBehaviour
     // both adjacent edges meet — so walls drawn along adjacent edges
     // close on ONE shared node whatever the corner's angle. Yaw reports
     // the rim's bearing at the snap so the hover stub lies along it.
+    // A ray that lands on TERRAIN just past a slab's rim still means that
+    // slab. A raised pad's skirt catches those rays, but a near-grade pad
+    // (the free-anchor default: plane a fraction above ground) exposes no
+    // skirt, and a terraced pad's uphill rim can sit flush with or under
+    // the hillside — so without this, the grab zone OUTSIDE the outline
+    // simply doesn't exist exactly where foundations usually stand. The
+    // nearest-plane outline within rim reach adopts the hover, making
+    // the terrain hit a slab hit wholesale. The vertical band is
+    // MaxSkirt plus a metre: the skirt law bounds ground under the
+    // FOOTPRINT, and the hillside just outside a legal pad can drop
+    // past it within the grab radius (verified: a lawful rim missed at
+    // dy 2.7). A slab a real storey away still stays out of reach, and
+    // where terraces crowd, nearest-plane wins.
+    const float RimAdoptBand = SlabTile.MaxSkirt + 1f;
+
+    SlabTile RimSlabFromTerrain(Vector3 raw, float hitY)
+    {
+        SlabTile best = null;
+        float bestDy = float.MaxValue;
+        foreach (SlabTile s in SlabTile.All)
+        {
+            if (s == null)
+                continue;
+            float dy = Mathf.Abs(s.topY - hitY);
+            if (dy > RimAdoptBand || dy >= bestDy)
+                continue;
+            if (TrySlabRimSnap(s, raw, out _, out _))
+            {
+                best = s;
+                bestDy = dy;
+            }
+        }
+        return best;
+    }
+
     bool TrySlabRimSnap(SlabTile tile, Vector3 raw, out Vector3 point, out float yaw)
     {
         point = default;
@@ -4824,6 +5033,12 @@ public class GridPlacementSystem : MonoBehaviour
         // a deck). Snaps below stay live but filter to that base's own
         // walls — the masonry a storey down never grabs the gesture.
         SlabTile slabTile = first.collider.GetComponent<SlabTile>();
+        // A terrain hit within rim reach of a slab's outline adopts the
+        // slab wholesale — same storey flip as pointing at its top face
+        // (RimSlabFromTerrain has the why). Alt keeps terrain meaning
+        // terrain: a free-placed point beside a pad is a terrain wall.
+        if (slabTile == null && !freePlace && first.collider is TerrainCollider)
+            slabTile = RimSlabFromTerrain(rawSurface, first.point.y);
         WallEdgeSection hitSection = first.collider.GetComponent<WallEdgeSection>();
         float? deckY = null;
         // A slab tile is a deck: elevated ground, free-form building,
@@ -5867,10 +6082,11 @@ public class GridPlacementSystem : MonoBehaviour
         if (mouse.leftButton.wasPressedThisFrame && !previewBlocked && splineSpecs.Count > 0)
         {
             float srcBase = offsetSource.baseY;
-            WallGraph.CommitEdge(splineParent, s2, c2, e2,
+            List<WallEdge> created = WallGraph.CommitEdge(splineParent, s2, c2, e2,
                 EdgeParamsNow(CurrentWallHeight,
                     float.IsNegativeInfinity(srcBase) ? LockedTopFor(s2) : float.NegativeInfinity,
                     srcBase));
+            Estate.Pay(Estate.CostOfEdges(created), Estate.KindLabel(CurrentWallKind));
             splineSpecs.Clear();
             ClearPreviewMeshes();
             lastOffsetKey = null;
@@ -5976,7 +6192,8 @@ public class GridPlacementSystem : MonoBehaviour
             CancelDelete();
             string json = deleteUndoJson;
             deleteUndoJson = null;
-            if (CastleSave.RestoreSnapshot(json, splineParent, wallMaterial))
+            if (CastleSave.RestoreSnapshot(json, splineParent, wallMaterial,
+                palisadeMaterial))
                 BuildLog.Add("Delete undone.");
             return;
         }
@@ -6015,6 +6232,7 @@ public class GridPlacementSystem : MonoBehaviour
                         host.openings.RemoveAt(hovered.openingIndex);
                         host.Rebuild();
                         BuildLog.Add("Doorway filled in.");
+                        Estate.Pay(Estate.DoorFee, "Doorway filled");
                         doomedSections.Clear();
                     }
                 }
@@ -6035,9 +6253,11 @@ public class GridPlacementSystem : MonoBehaviour
                 if (mouse.leftButton.wasPressedThisFrame)
                 {
                     deleteUndoJson = CastleSave.Snapshot();
+                    // Refund's own line announces the removal with the
+                    // money coming back — no second log line needed.
+                    Estate.Refund(Estate.CostOfStair(hoveredStair), "Stair removed");
                     CloseStairWells(hoveredStair);
                     Destroy(hoveredStair.gameObject);
-                    BuildLog.Add("Stair removed.");
                     doomedSections.Clear();
                 }
             }
@@ -6049,9 +6269,9 @@ public class GridPlacementSystem : MonoBehaviour
                 if (mouse.leftButton.wasPressedThisFrame)
                 {
                     deleteUndoJson = CastleSave.Snapshot();
+                    Estate.Refund(Estate.CostOfSlab(hoveredSlab),
+                        hoveredSlab.isFoundation ? "Foundation removed" : "Floor removed");
                     Destroy(hoveredSlab.gameObject);
-                    BuildLog.Add(hoveredSlab.isFoundation
-                        ? "Foundation removed." : "Floor removed.");
                     doomedSections.Clear();
                 }
             }
@@ -6089,6 +6309,16 @@ public class GridPlacementSystem : MonoBehaviour
             for (int i = lo; i <= hi; i++)
                 set.Add(i);
         }
+        // The demolition's worth comes back in full (v1: no salvage loss),
+        // priced from the doomed sections BEFORE the surgery consumes them.
+        long refund = 0;
+        foreach (KeyValuePair<WallEdge, HashSet<int>> pair in byEdge)
+            if (pair.Key != null)
+                refund += Estate.CostOfSections(pair.Key, pair.Value);
+        foreach (SlabTile slab in marqueeSlabs)
+            if (slab != null)
+                refund += Estate.CostOfSlab(slab);
+        Estate.Refund(refund, "Demolition");
         foreach (KeyValuePair<WallEdge, HashSet<int>> pair in byEdge)
             if (pair.Key != null)
                 WallGraph.DeleteSections(splineParent, pair.Key, pair.Value);

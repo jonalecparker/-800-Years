@@ -11,6 +11,9 @@ public class BuildMenu : MonoBehaviour
     {
         public string itemName;
         public GameObject prefab;
+        // What kind of wall this item builds — picking the item hands the
+        // kind to the placement system (material + price, never geometry).
+        public WallKind kind;
     }
 
     [System.Serializable]
@@ -62,6 +65,10 @@ public class BuildMenu : MonoBehaviour
     private Text heightText;
     private GameObject inspectPanel;
     private Text inspectText;
+    private Text treasuryText;
+    private Image surveyButtonImage;
+    private Text clockText;
+    private Text speedText;
     private GameObject logBody;
     private Text logText;
     private Text logHeaderText;
@@ -96,9 +103,16 @@ public class BuildMenu : MonoBehaviour
             new MenuCategory
             {
                 categoryName = "Walls",
-                // The bottom of the wall-type ladder. One type exists so
-                // far; stronger walls join this list as they're designed.
-                items = new[] { new MenuItem { itemName = "Palisade", prefab = wallPrefab } }
+                // The wall-type cost ladder, cheap rung first: palisade
+                // timber at a fraction of stone's price (Estate rates).
+                // Fortified joins the list when it's designed.
+                items = new[]
+                {
+                    new MenuItem { itemName = "Palisade", prefab = wallPrefab,
+                        kind = WallKind.Palisade },
+                    new MenuItem { itemName = "Stone", prefab = wallPrefab,
+                        kind = WallKind.Stone },
+                }
             }
         };
     }
@@ -148,6 +162,7 @@ public class BuildMenu : MonoBehaviour
         stairButtonImage = CreateButton(categoryRow, "Stairs", ToggleStairMode).GetComponent<Image>();
         doorButtonImage = CreateButton(categoryRow, "Doors", ToggleDoorMode).GetComponent<Image>();
         groundButtonImage = CreateButton(categoryRow, "Ground", ToggleGroundMode).GetComponent<Image>();
+        surveyButtonImage = CreateButton(categoryRow, "Survey", ToggleSurveyMode).GetComponent<Image>();
         deleteButtonImage = CreateButton(categoryRow, "Delete", ToggleDeleteMode).GetComponent<Image>();
         savesButtonImage = CreateButton(categoryRow, "Saves", ToggleSavesPanel).GetComponent<Image>();
 
@@ -166,6 +181,13 @@ public class BuildMenu : MonoBehaviour
         inspectPanel = CreateReadout(canvasObj.transform, "InspectPanel",
             new Vector2(-8f, 112f), new Vector2(290f, 40f), out inspectText);
         inspectPanel.SetActive(false);
+        // The treasury, always on while building: money is the estate's
+        // one number, and every commit's log line ends with it.
+        CreateReadout(canvasObj.transform, "TreasuryPanel",
+            new Vector2(-8f, 156f), new Vector2(200f, 40f), out treasuryText);
+        // The calendar above it: today's date, the next quarter day,
+        // and the speed dial — the seasonal rhythm made visible.
+        CreateClockPanel(canvasObj.transform);
 
         CreateOptionsPanel(canvasObj.transform);
         CreateLogPanel(canvasObj.transform);
@@ -626,6 +648,134 @@ public class BuildMenu : MonoBehaviour
         return toggle;
     }
 
+    // The calendar panel: date and countdown on the top line, the speed
+    // slider below with its multiplier label. The slider maps its 0–1
+    // travel exponentially onto 1×–120× so the low end has room — the
+    // difference between 1× and 4× matters more than 80× vs 120×.
+    void CreateClockPanel(Transform parent)
+    {
+        GameObject panel = new GameObject("ClockPanel", typeof(RectTransform));
+        panel.transform.SetParent(parent, false);
+        RectTransform rt = panel.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(1f, 0f);
+        rt.anchorMax = new Vector2(1f, 0f);
+        rt.pivot = new Vector2(1f, 0f);
+        rt.anchoredPosition = new Vector2(-8f, 200f);
+        rt.sizeDelta = new Vector2(300f, 64f);
+        panel.AddComponent<Image>().color = barColor;
+
+        clockText = CreatePanelText(panel.transform, "Date",
+            new Vector2(10f, 34f), new Vector2(-10f, -4f), 16,
+            TextAnchor.MiddleCenter);
+
+        speedText = CreatePanelText(panel.transform, "Speed",
+            new Vector2(-58f, 6f), new Vector2(-10f, 30f), 16,
+            TextAnchor.MiddleRight);
+        RectTransform st = speedText.rectTransform;
+        st.anchorMin = new Vector2(1f, 0f);
+        st.anchorMax = new Vector2(1f, 0f);
+        st.offsetMin = new Vector2(-58f, 6f);
+        st.offsetMax = new Vector2(-10f, 30f);
+
+        Slider slider = CreateBareSlider(panel.transform,
+            new Vector2(10f, 6f), new Vector2(-64f, 30f));
+        slider.onValueChanged.AddListener(v =>
+            GameClock.Speed = Mathf.Pow(GameClock.MaxSpeed, v));
+    }
+
+    Text CreatePanelText(Transform parent, string name, Vector2 offMin,
+        Vector2 offMax, int size, TextAnchor align)
+    {
+        GameObject obj = new GameObject(name, typeof(RectTransform));
+        obj.transform.SetParent(parent, false);
+        RectTransform rt = obj.GetComponent<RectTransform>();
+        rt.anchorMin = Vector2.zero;
+        rt.anchorMax = Vector2.one;
+        rt.offsetMin = offMin;
+        rt.offsetMax = offMax;
+        Text text = obj.AddComponent<Text>();
+        text.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        text.alignment = align;
+        text.color = Color.white;
+        text.fontSize = size;
+        return text;
+    }
+
+    // A Slider from raw parts — the HUD is code-built cloth, and Unity
+    // ships no runtime default. Track, fill and handle only.
+    Slider CreateBareSlider(Transform parent, Vector2 offMin, Vector2 offMax)
+    {
+        GameObject obj = new GameObject("SpeedSlider", typeof(RectTransform));
+        obj.transform.SetParent(parent, false);
+        RectTransform rt = obj.GetComponent<RectTransform>();
+        rt.anchorMin = Vector2.zero;
+        rt.anchorMax = Vector2.one;
+        rt.offsetMin = offMin;
+        rt.offsetMax = offMax;
+
+        GameObject track = new GameObject("Track", typeof(RectTransform));
+        track.transform.SetParent(obj.transform, false);
+        RectTransform trackRt = track.GetComponent<RectTransform>();
+        trackRt.anchorMin = new Vector2(0f, 0.35f);
+        trackRt.anchorMax = new Vector2(1f, 0.65f);
+        trackRt.offsetMin = Vector2.zero;
+        trackRt.offsetMax = Vector2.zero;
+        track.AddComponent<Image>().color = buttonColor;
+
+        GameObject fillArea = new GameObject("FillArea", typeof(RectTransform));
+        fillArea.transform.SetParent(obj.transform, false);
+        RectTransform faRt = fillArea.GetComponent<RectTransform>();
+        faRt.anchorMin = new Vector2(0f, 0.35f);
+        faRt.anchorMax = new Vector2(1f, 0.65f);
+        faRt.offsetMin = new Vector2(0f, 0f);
+        faRt.offsetMax = new Vector2(-8f, 0f);
+        GameObject fill = new GameObject("Fill", typeof(RectTransform));
+        fill.transform.SetParent(fillArea.transform, false);
+        RectTransform fillRt = fill.GetComponent<RectTransform>();
+        fillRt.sizeDelta = new Vector2(8f, 0f);
+        fill.AddComponent<Image>().color = selectedColor;
+
+        GameObject handleArea = new GameObject("HandleArea", typeof(RectTransform));
+        handleArea.transform.SetParent(obj.transform, false);
+        RectTransform haRt = handleArea.GetComponent<RectTransform>();
+        haRt.anchorMin = Vector2.zero;
+        haRt.anchorMax = Vector2.one;
+        haRt.offsetMin = new Vector2(8f, 0f);
+        haRt.offsetMax = new Vector2(-8f, 0f);
+        GameObject handle = new GameObject("Handle", typeof(RectTransform));
+        handle.transform.SetParent(handleArea.transform, false);
+        RectTransform handleRt = handle.GetComponent<RectTransform>();
+        handleRt.sizeDelta = new Vector2(16f, 0f);
+        Image handleImage = handle.AddComponent<Image>();
+        handleImage.color = Color.white;
+
+        Slider slider = obj.AddComponent<Slider>();
+        slider.fillRect = fillRt;
+        slider.handleRect = handleRt;
+        slider.targetGraphic = handleImage;
+        slider.minValue = 0f;
+        slider.maxValue = 1f;
+        slider.value = 0f;
+        return slider;
+    }
+
+    // Survey: the land tool — the parcel map, hover to read, click to
+    // clear or buy frontier land. A world tool like Ground, so it lives
+    // on the bar, not in a category.
+    void ToggleSurveyMode()
+    {
+        if (placementSystem == null)
+            return;
+
+        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Land;
+        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Land : GridPlacementSystem.ToolMode.Build);
+        if (entering)
+        {
+            itemRow.gameObject.SetActive(false);
+            openCategory = null;
+        }
+    }
+
     GameObject CreateReadout(Transform parent, string name, Vector2 anchoredPosition, Vector2 size, out Text text)
     {
         GameObject panel = new GameObject(name, typeof(RectTransform));
@@ -660,6 +810,14 @@ public class BuildMenu : MonoBehaviour
 
     void Update()
     {
+        // The survey exists from the first frame (a no-op once made or
+        // loaded), and the calendar runs through EVERYTHING — walk
+        // mode, the Saves panel, all of it. Time passing while you walk
+        // your lands is the point; standing down is deliberately not
+        // done here.
+        LandParcels.EnsureGenerated();
+        GameClock.Tick(Time.deltaTime);
+
         // Walking has no tools, so it has no tool HUD. Switching the
         // canvas off takes its GraphicRaycaster with it, which is what
         // stops a locked cursor parked over a button from "hovering" one
@@ -690,8 +848,26 @@ public class BuildMenu : MonoBehaviour
 
         int count = placementSystem.ActiveDragCount;
         if (count > 0)
-            dragCountText.text = count == 1 ? "1 wall" : count + " walls";
+        {
+            // The price rides the counter — what the click will cost,
+            // priced from the same specs the ghosts show.
+            long cost = placementSystem.ActiveDragCost;
+            string walls = count == 1 ? "1 wall" : count + " walls";
+            dragCountText.text = cost > 0
+                ? walls + " · " + Estate.Format(cost) : walls;
+        }
         dragCountPanel.SetActive(count > 0);
+
+        // The treasury readout, red in debt — the masons build on credit.
+        treasuryText.text = "Treasury " + Estate.Format(Estate.TreasuryPence);
+        treasuryText.color = Estate.TreasuryPence < 0
+            ? new Color(1f, 0.45f, 0.4f, 1f) : Color.white;
+
+        // The calendar: today, the countdown to the next payday, and
+        // what the dial is doing.
+        clockText.text = GameClock.DateLine() + " · " + GameClock.NextQuarterLine();
+        speedText.text = "×" + (GameClock.Speed < 10f
+            ? GameClock.Speed.ToString("0.0") : GameClock.Speed.ToString("0"));
 
         // Height only means anything while placing walls (building or
         // offsetting), so the readout follows the tool. A stair takes its
@@ -788,6 +964,8 @@ public class BuildMenu : MonoBehaviour
                 image.color = groundTool && placementSystem.GroundTask == task
                     ? selectedColor : buttonColor;
         savesButtonImage.color = ModalOpen ? selectedColor : buttonColor;
+        surveyButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Land
+            ? selectedColor : buttonColor;
         stairButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Stair
             ? selectedColor : buttonColor;
         doorButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Door
@@ -1017,6 +1195,7 @@ public class BuildMenu : MonoBehaviour
         {
             if (item.prefab != null)
                 placementSystem.piecePrefab = item.prefab;
+            placementSystem.SetWallKind(item.kind);
 
             // Picking something to build always disarms the other tools
             // (the bar and checkboxes re-sync from state in Update).

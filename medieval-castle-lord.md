@@ -109,15 +109,101 @@ What the people under you demanded in return, historically:
 
 ## Vassals & Economy
 
-- **Most vassals are farmers.** You direct what crops are grown and what animals are raised — this is the foundation the mercantile system is built on later (you sell what your land produces).
+- **Most vassals are farmers.** You direct what crops are grown and what animals are raised — this is the foundation the mercantile system is built on later (you sell what your land produces). *(Refined 2026-08-09: direction happens per manor through the steward — a posture, not per-field placement. See "The Estate Economy.")*
 - **Specialist vassals:** blacksmiths, stable masters, and a steward who runs your holdings while you're away. (The steward is load-bearing: it's what frees the player to wander Europe in first person without the castle falling apart.)
 - **Stewards (decided):** stewards vary in competence and are priced accordingly. A steward can manage imperfectly (leaks, losses, slow decline) — and can outright **rebel and attempt to seize your estate if you're gone too long or your renown is too low**. Absence and reputation are real risks; hiring cheap has consequences.
 - **Renown** (new stat, introduced by the steward mechanic): a measure of your standing that gates loyalty. How it's earned/lost is undefined — see Open Questions.
 - **Housing loop:** building houses costs resources and money, but yields a better working population. Spend → better workers → more production → more money.
-- **Vassal attraction (decided in principle):** a wealthier, better place to live attracts more (and better) vassals — quality of life is a recruiting mechanic, the flip side of the housing loop. Vassals **can leave** if conditions are poor (historically grounded: peasants ran away to better lords). Exact mechanics of leaving/underperforming still being thought through.
+- **Vassal attraction (decided in principle):** a wealthier, better place to live attracts more (and better) vassals — quality of life is a recruiting mechanic, the flip side of the housing loop. Vassals **can leave** if conditions are poor (historically grounded: peasants ran away to better lords). **Mechanics resolved 2026-08-09:** no per-person simulation — each manor has a **population (households) and a growth rate**, which can be negative. Leaving, arriving, attraction, and the housing loop are all facets of that one scalar. (See "The Estate Economy.")
 - **Gear progression = wealth progression.** Better gear comes from hiring better blacksmiths, and blacksmiths must be paid. Money is the universal currency of power — it buys armies, land, *and* personal equipment, which keeps the merchant path viable even for eventual conquest.
 - **Non-money gear mechanics (decided):** all three candidates are in the vision — **loot from captured castles** (warlord path), **gifts/tribute from allies** (diplomat path), and **tournament prizes**. Nicely, each one feeds a different playstyle.
 - **Depth target:** castle and land management should be *full-bodied but not a full city-builder*. Meaningful choices, not Banished-level simulation. (Good scope guardrail — recorded below too.)
+
+## The Estate Economy (designed 2026-08-09)
+
+*The economy design session, fed by the c. 1220 landowner research pass
+(`Docs/Economy1220.md` — historical grounding, worked examples, and the
+price book live there). Governing principle, the user's call: **a fun,
+high-level activity, not a simulator of medieval management tasks.** The
+player never sows a field or places a house — which is also the historical
+truth: the lord acted through people (pillar 5 extended to the economy).
+The player does the lord's verbs; the estate's people do the rest.*
+
+- **Land is plots with fixed natures** (arable, pasture, woodland, marsh, a
+  river bend that can take a mill, a village site). The player never decides
+  what land *is* — the land tells you what it's good for. This kills
+  farm-placement micromanagement and makes acquisition the interesting
+  question: *which plot do you want next?*
+- **The player's economic controls are roughly three dials**, mapped from
+  the research's three income families:
+  1. **Demesne posture — PER MANOR** (decided): how much of a manor is kept
+     "in hand" vs. rented out, plus a once-a-year posture call made through
+     the steward (grain year / wool year). Rented = safe, low, runs itself;
+     in hand = more income, more risk, and only as good as the steward
+     running it. (This is the real strategic choice lords of exactly 1220
+     were making — the leasing-vs-direct-management turn.)
+  2. **The customs dial**: the tax rate — one harsh↔generous setting
+     covering the whole bundle of dues. Raising it pays now and drains the
+     growth rate later.
+  3. **Franchises**: mills, markets, ovens, eventually a borough — income
+     assets the player **builds**, with real capex and multi-year payback.
+     The bridge between the castle-builder and the economy: the mill is a
+     building on a river plot *and* an income line.
+- **Population is ONE number per manor** (decided — the user's call,
+  choosing simplicity over person-type simulation): a count of households
+  plus a **growth rate that can be negative**. It absorbs four previously
+  separate mechanics — workers leaving, vassal attraction, the housing
+  loop (spend on housing → capacity → growth), and the manorial bargain
+  (the growth rate's inputs: customs dial, protection from bandits, famine
+  handling, housing quality, later renown). Production = population working
+  the plots, modified by steward competence and posture. Named specialists
+  (steward, blacksmith, head builder) remain individuals — they were always
+  content, not population.
+- **The growth rate is reported diegetically, never as a bar**: it's a line
+  in the steward's account — "three families gone to Lord Baldric's new
+  town this winter" — and it's visible on the walk (new houses rising,
+  or standing empty). The procedural town (roadmap near-arc step 5) is
+  rendered *from* population + housing spend.
+- **Money arrives in seasonal beats, not a trickle** (decided): rents at
+  the quarter-days, wool money after June shearing, the produce settlement
+  after harvest — and **Michaelmas (29 Sep) is the annual climax**: the
+  steward renders the account to your face, in the hall. That scene is the
+  results screen done diegetically, the venue for a bad steward's lies, and
+  Phase 1's opening beat (you inherit at Michaelmas; your father's steward
+  reads you the books of a shabby estate).
+- **Harvests are constant for now** (decided): variance — the historical
+  1-in-8 bad year, dearth price spikes, and the famine-relief choice that
+  hangs off them — is a designed-later feature, not part of v1.
+- **The land ladder** (how you get more): (1) **bandit-held plots** early —
+  the land around you is dead until cleared, so acquisition feels like
+  lordship, not a menu (matches "early threats are bandits only");
+  (2) **assarting** — clearing your own waste/woodland into new plots,
+  the period's real expansion frontier, cheap land that needs settlers;
+  (3) **buying** from neighbors — plots, then whole manors (indebted AI
+  lords have a reason to sell); (4) **windfalls** — wardships, marriages,
+  escheats as events, the period's lottery tickets; (5) **conquest**, late,
+  per the decided pressure arc.
+- **Currency is real £/s/d** (decided 2026-08-09): £1 = 20s = 240d, and
+  the research price book's real magnitudes ARE the game balance — a penny
+  is a laborer's day, £20/year a knight's whole living, £1,000 a small
+  stone castle; a shabby lord starts around £30–50/year and climbs toward
+  the £200+ that supports real stone. Display gently: mostly the dominant
+  unit ("about £3"), not "£2 17s 4d" everywhere.
+- **Wall types are the cost ladder** (decided 2026-08-09): palisade
+  (~£10–30 a circuit + labor; rots), stone curtain (~£2–4 per meter —
+  ~40× palisade, historically true and gameplay-meaningful), fortified
+  (£1,000+ projects). Build SPEED is a spending decision, not a fixed
+  timer (Gaillard: money compresses time nearly linearly), and stone work
+  pauses each winter (mortar can't cure in frost) — visible seasons.
+  **Implementation note (user's call): construction completes INSTANTLY
+  for now** — testing comes first; build time arrives later as a feature.
+  The standing rule stands in design (no system may *assume* instant
+  construction), and instant-build is an acknowledged temporary violation
+  of it in the implementation, not a design decision.
+- **Open threads for this design** (not yet settled): steward leak/audit
+  mechanics in detail; how selling produce works (automatic at market
+  prices vs. the merchant path's active trading); spending tiers beyond
+  construction (household, hires, status).
 
 ## Progression & Pressure (decided in part)
 
@@ -176,7 +262,7 @@ Needs a robust way to build stone walls, designate rooms, and dig moats.
 4. ~~Is there time pressure / a life span?~~ **Resolved:** lifespan/aging/death by old age is a **hard-mode feature**; default mode stays sandbox. (See "Time, Lifespan & Difficulty.") Still open: what death means in hard mode (game over vs. heir), and whether default mode has any win state at all.
 5. ~~How historical is it?~~ **Resolved as a principle:** as realistic as possible without sacrificing fun; deep research pass into real landowners' lives planned. (See "Historical Grounding.") Still open: is your liege actually in the game as a mechanic (fealty, taxes, levies)?
 6. ~~Multiplayer or solo?~~ **Resolved: completely solo.** Other castles are AI nobles. Still open: how much do AI lords actually simulate (do they play your game — buying land, raising armies — or just appear to)?
-7. ~~Who are your vassals?~~ **Resolved:** mostly farmers, plus specialists (blacksmiths, stable masters, steward). **Also resolved in principle:** a wealthier, nicer estate attracts vassals, and unhappy vassals can leave. Still open: the exact demands/leave/underperform mechanics — user is still thinking on this.
+7. ~~Who are your vassals?~~ **Resolved:** mostly farmers, plus specialists (blacksmiths, stable masters, steward). **Also resolved in principle:** a wealthier, nicer estate attracts vassals, and unhappy vassals can leave. **Leave/underperform mechanics resolved 2026-08-09:** one population number per manor with a growth rate that can go negative — no per-person simulation. (See "The Estate Economy.")
 8. **How do alliances work?** ⏸ **Tabled by choice** — full alliance systems get very complex and easy to break. Current lean: one-time alliances formed for one specific goal, dissolved when it's met. Revisit after core loop exists.
 9. ~~What are the non-money gear mechanics?~~ **Resolved:** all three — loot from captured castles, gifts/tribute from allies, tournament prizes. Each feeds a different path (warlord/diplomat/renown?).
 10. ~~How does the steward actually work?~~ **Resolved:** competence tiers priced accordingly; can mismanage; can rebel and attempt to seize the estate if you're absent too long or renown is too low. (See Vassals & Economy.)
@@ -185,7 +271,7 @@ Needs a robust way to build stone walls, designate rooms, and dig moats.
 13. ~~Castle building fidelity?~~ **Resolved 2026-07-21 as grid-based, revised 2026-08-05: full freeform** — free walls, designated rooms, derived roofs. (See "Castle Building.")
 14. **What are the special rooms and what do they do?** Functional rooms are decided in principle; the list (armory? chapel? treasury? great hall? dungeon?) and their game effects are undefined. Historical research pass should feed this.
 15. **How do you edit an inhabited castle without being homeless during the rebuild?** Recorded 2026-08-05, **deferred by choice** until time, household, and siege systems impose real constraints. Likely shape: builder = plan layer, head builder executes over in-game time. Standing rule meanwhile: nothing may assume instant in-world construction. (See "Castle Building.")
-16. **How does a lord make money from the land and people around his castle?** Demesne produce he sells vs. rents and fees on everyone else's — historically both, and the split is the structure (demesne farming, rents in cash and kind, labor services, mill/oven monopoly fees, court fines, market tolls). Needs a design session; triggers the planned 1220 landowner research pass. (Roadmap near arc, step 4.)
+16. ~~How does a lord make money from the land and people around his castle?~~ **Resolved 2026-08-09** (research pass in `Docs/Economy1220.md`, design in "The Estate Economy"): three income families — produce (demesne posture per manor), dues (the customs dial), franchises (built assets: mill, market, oven, borough) — over plots with fixed natures, worked by a per-manor population scalar, paid out in seasonal beats with the Michaelmas account as the annual climax. Still open within it: spending tiers/costs, period currency or not, steward audit detail, produce-selling mechanics.
 
 ## Build Phases (draft)
 
