@@ -4862,8 +4862,7 @@ public class GridPlacementSystem : MonoBehaviour
 
     float GroundYAt(Vector3 p)
     {
-        Terrain t = Terrain.activeTerrain;
-        return t == null ? 0f : t.transform.position.y + t.SampleHeight(p);
+        return Ground.Any ? Ground.HeightAt(p) : 0f;
     }
 
     float ClampToLaw(Vector3 p, float y)
@@ -6550,16 +6549,15 @@ public class GridPlacementSystem : MonoBehaviour
     // leaving a floating corner. Falls back to y = 0 with no terrain.
     float SampleCellGroundY(float x, float z)
     {
-        Terrain terrain = Terrain.activeTerrain;
-        if (terrain == null)
+        if (!Ground.Any)
             return 0f;
 
         float half = gridSize * 0.5f;
-        float h0 = terrain.SampleHeight(new Vector3(x - half, 0f, z - half));
-        float h1 = terrain.SampleHeight(new Vector3(x + half, 0f, z - half));
-        float h2 = terrain.SampleHeight(new Vector3(x - half, 0f, z + half));
-        float h3 = terrain.SampleHeight(new Vector3(x + half, 0f, z + half));
-        float ground = terrain.transform.position.y + Mathf.Min(Mathf.Min(h0, h1), Mathf.Min(h2, h3));
+        float h0 = Ground.HeightAt(x - half, z - half);
+        float h1 = Ground.HeightAt(x + half, z - half);
+        float h2 = Ground.HeightAt(x - half, z + half);
+        float h3 = Ground.HeightAt(x + half, z + half);
+        float ground = Mathf.Min(Mathf.Min(h0, h1), Mathf.Min(h2, h3));
 
         if (baseStepSize > 0f)
             ground = Mathf.Floor(ground / baseStepSize) * baseStepSize;
@@ -6664,10 +6662,9 @@ public class GridPlacementSystem : MonoBehaviour
     // Guides hover just above the terrain so they read against it.
     float GuideY(Vector3 point)
     {
-        Terrain terrain = Terrain.activeTerrain;
-        if (terrain == null)
+        if (!Ground.Any)
             return point.y + 0.3f;
-        return terrain.transform.position.y + terrain.SampleHeight(point) + 0.3f;
+        return Ground.HeightAt(point) + 0.3f;
     }
 
     // A point being placed sits on the EXTENSION of an existing straight

@@ -51,25 +51,22 @@ public static class LandParcels
     {
         if (LandPlot.All.Count > 0)
             return;
-        Terrain terrain = Terrain.activeTerrain;
-        if (terrain == null)
+        if (!Ground.Any)
             return;
 
-        Vector3 origin = terrain.transform.position;
-        Vector3 size = terrain.terrainData.size;
-        Vector2 center = new Vector2(origin.x + size.x * 0.5f,
-            origin.z + size.z * 0.5f);
-        int nx = Mathf.FloorToInt((size.x - Margin * 2f) / CellSize);
-        int nz = Mathf.FloorToInt((size.z - Margin * 2f) / CellSize);
+        Rect bounds = Ground.Bounds();
+        Vector2 center = bounds.center;
+        int nx = Mathf.FloorToInt((bounds.width - Margin * 2f) / CellSize);
+        int nz = Mathf.FloorToInt((bounds.height - Margin * 2f) / CellSize);
 
         // Jittered corner lattice, one more than the cell count each way.
         var corners = new Vector3[nx + 1, nz + 1];
         for (int i = 0; i <= nx; i++)
             for (int j = 0; j <= nz; j++)
             {
-                float x = origin.x + Margin + i * CellSize
+                float x = bounds.xMin + Margin + i * CellSize
                     + (Hash01(i, j, 1) - 0.5f) * 2f * Jitter * CellSize;
-                float z = origin.z + Margin + j * CellSize
+                float z = bounds.yMin + Margin + j * CellSize
                     + (Hash01(i, j, 2) - 0.5f) * 2f * Jitter * CellSize;
                 corners[i, j] = new Vector3(x, 0f, z);
             }
@@ -95,7 +92,7 @@ public static class LandParcels
                 float lo = float.MaxValue, hi = float.MinValue;
                 void Sample(Vector3 p)
                 {
-                    float y = terrain.SampleHeight(p) + origin.y;
+                    float y = Ground.HeightAt(p);
                     lo = Mathf.Min(lo, y);
                     hi = Mathf.Max(hi, y);
                 }

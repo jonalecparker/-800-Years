@@ -285,10 +285,9 @@ public class WalkMode : MonoBehaviour
             return true;
         }
 
-        Terrain terrain = Terrain.activeTerrain;
-        if (terrain != null)
+        if (Ground.Any)
         {
-            y = terrain.transform.position.y + terrain.SampleHeight(from);
+            y = Ground.HeightAt(from);
             return true;
         }
 

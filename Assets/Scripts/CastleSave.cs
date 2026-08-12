@@ -231,8 +231,7 @@ public static class CastleSave
     static SaveData Capture()
     {
         var data = new SaveData { version = Version };
-        Terrain terrain = Terrain.activeTerrain;
-        data.terrainName = terrain != null ? terrain.name : "";
+        data.terrainName = Ground.Any ? Ground.BaseName : "";
         data.treasury = Estate.TreasuryPence;
         data.clockDays = GameClock.DaysElapsed;
         data.households = Estate.Households;
@@ -398,11 +397,10 @@ public static class CastleSave
             return false;
         }
 
-        Terrain terrain = Terrain.activeTerrain;
-        if (terrain != null && !string.IsNullOrEmpty(data.terrainName)
-            && data.terrainName != terrain.name)
+        if (Ground.Any && !string.IsNullOrEmpty(data.terrainName)
+            && data.terrainName != Ground.BaseName)
             BuildLog.Add($"Save was made on terrain '{data.terrainName}' — footings"
-                + $" will re-foot on '{terrain.name}'.");
+                + $" will re-foot on '{Ground.BaseName}'.");
 
         Apply(data, parent, material, palisadeMaterial);
         BuildLog.Add($"Loaded — {data.edges.Count} walls, {data.stairs.Count} stairs,"

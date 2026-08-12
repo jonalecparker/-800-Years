@@ -464,8 +464,7 @@ public class WallEdge : MonoBehaviour
     public static float SampleSliceGround(Vector3 s, Vector3 c, Vector3 e,
         float t0, float t1, float thickness, float baseStep)
     {
-        Terrain terrain = Terrain.activeTerrain;
-        if (terrain == null)
+        if (!Ground.Any)
             return 0f;
 
         float min = float.MaxValue;
@@ -475,10 +474,10 @@ public class WallEdge : MonoBehaviour
             Vector3 p = Evaluate(s, c, e, t);
             Vector3 side = Tangent(s, c, e, t).normalized;
             side = new Vector3(-side.z, 0f, side.x) * (thickness * 0.5f);
-            min = Mathf.Min(min, Mathf.Min(terrain.SampleHeight(p + side), terrain.SampleHeight(p - side)));
+            min = Mathf.Min(min, Mathf.Min(Ground.HeightAt(p + side), Ground.HeightAt(p - side)));
         }
 
-        float ground = terrain.transform.position.y + min;
+        float ground = min;
         if (baseStep > 0f)
             ground = Mathf.Floor(ground / baseStep) * baseStep;
         return ground;

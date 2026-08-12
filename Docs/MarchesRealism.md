@@ -69,6 +69,30 @@ hedge in Britain, dynamic seasons.
 - **No colliders on ribbons** (the walker must never trip on a road);
   tree trunks DO collide (you shouldn't walk through an oak).
 
+## Shipped 2026-08-12: rivers carved + two-tier water; road ribbons retired
+
+Docs/Rivers.md is the brief of record. The road ribbons are DELETED (the
+user's call — the splat paint alone is the road); waterways are carved
+into the tiles (idempotent bake, bank refs from the pre-split source) and
+water ribbons sit flat at bed + fill, chunked by 300 m cell so
+`RiverWaterLOD` swaps the near chunks for HDRP custom-mesh water surfaces
+(vertex heights respected — HDRP treats world space as water space for
+custom meshes) and back. `roadLift`/`waterLift` died with the road
+ribbons; pixelError 2 still pinned for the water ribbons.
+
+## Shipped 2026-08-11 evening: road splat (tier B's first slice)
+
+The terrain became a 4×4 tile grid (Docs/TerrainTiles.md) and roads got
+their ground: a third terrain layer (RoadLayer — the dirt layer's real
+textures, warm-tinted; a flat white diffuse reads alpha=1 as FULL
+smoothness in HDRP TerrainLit and shines like wet sand) painted along
+every road corridor into the tiles' 1024 alphamaps — full strength over
+roadbed + 1m, fading over 2.5m, the control map's bilinear blur adding
+the rest of the softness. The ribbon stays on top for the crisp edge;
+the halo reads as trampled verge. TerrainPads.RefreshSurface preserves
+layers past grass/dirt, so earthworks under a lane keep its paint.
+`splatResolution` is the dial for the day a corridor earns denser paint.
+
 ## Shipped 2026-08-11 (same day)
 
 Tier A + D are in `Assets/Marches.unity`: 1,872 road ribbons, 438 water

@@ -168,13 +168,11 @@ public class LandPlot : MonoBehaviour
             (tris[i + 1], tris[i + 2]) = (tris[i + 2], tris[i + 1]);
         var pts = new List<Vector3>(verts);
         Subdivide(pts, tris);
-        Terrain terrain = Terrain.activeTerrain;
+        bool ground = Ground.Any;
         var final = new Vector3[pts.Count];
         for (int i = 0; i < pts.Count; i++)
         {
-            float y = terrain != null
-                ? terrain.SampleHeight(pts[i]) + terrain.transform.position.y
-                : 0f;
+            float y = ground ? Ground.HeightAt(pts[i]) : 0f;
             final[i] = new Vector3(pts[i].x, y + Drape, pts[i].z);
         }
         if (ownedMesh == null)
