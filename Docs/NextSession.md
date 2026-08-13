@@ -6,61 +6,69 @@
 > **real Britain, real castle sites, Europe-ready** (memory +
 > `Docs/MarchesRealism.md`).
 
-**Where we left off:** The 08-11/12 stretch rebuilt the Marches terrain
-as a 4×4 TILE GRID behind the new `Ground` facade (seams verified
-bit-perfect, `Docs/TerrainTiles.md`), made roads splat paint on the
-tiles' 1024 alphamaps (ribbons deleted — the user's eye), and shipped
-the rivers pass (`Docs/Rivers.md`): carved beds sized by river width,
-riverbed mud paint, two-tier water — ribbons everywhere, HDRP
-custom-mesh water within 260m, brook-scale waves scaled per river.
-Three user screenshot rounds drove real fixes (cross-slope terrace
-carve, near-grade water, distance-scaled far lift). The user approved
-roads and the water look; **the rivers haven't been re-walked since the
-last fix**.
+**Where we left off:** The 08-12/13 session made the countryside three
+LORDSHIPS (`Docs/Territories.md`, four passes): `CastleSite` markers
+(Grosmont = home, Skenfrith + White Castle = neighbors), nearest-site
+territories, relative per-territory classification, ownership by
+lordship, `LandLaw` (build only on your own Castle parcels), CastleSave
+v7. Parcel boundaries snap to roads and rivers, the road network is
+filtered to the three castle routes of 1220, timber parcels grow real
+oaks. The castles round then shipped: terrain-fitted castle grounds
+(`CastleGrounds`, 36 rays, dials on LandSurvey), roads trimmed at the
+gate, villages settled ON the road before the gate, and graybox
+Skenfrith + White Castle built from the real plans as untouchable
+scenery. **None of the castles round has been hand-tested** — Unity
+crashed overnight right after the final save (recovery verified
+redundant and discarded at wrap).
 
-## Top priority: judge the rivers, then territories
+## Top priority: judge the castles round
 
-1. **Walk the Monnow and a hill stream** — bank feel changed (water now
-   ~0.55m below the Monnow's banks), far visibility fixed, waves calmed.
-   Known deferred: the HDRP↔ribbon seam visible from altitude (dials
-   and candidates in `Docs/Rivers.md`).
-2. **Castle territories** (the design successor the survey waits on):
-   castle sites → territories → land types per territory → **bandits at
-   the seams between lordships**. Replaces `MaxSurveyRadius` 1500m and
-   the center-distance ownership rings in `LandParcels`.
-3. **One manor = one contiguous town by the castle** (user-confirmed;
-   scattered living plots are wrong) — probably lands with territories.
+1. **Walk/fly Grosmont, Skenfrith and White Castle**: do the grounds
+   shapes read right (60–140m, terrain-fitted)? Does the road end
+   convincingly at the gate? Are the villages on the road where a
+   village would be? Do the two graybox castles hold up at walking
+   distance? Dials: `castleGroundsMin/Max/Relief` on Land Survey
+   Settings; Resurvey re-runs in play mode (resets ownership).
+2. **Income rebalance** — ~11× hot at 200m cells; recalibrate
+   `Estate` rates once the cell size feels settled.
+3. **Procedural houses on Living land** (the economy's visible face,
+   population-driven): the survey now hands them parcels; they must
+   keep out of Castle parcels by stored type.
 
 ## Second lane: the economy's remaining halves
 
-- Procedural **houses on living land**, population-driven — the visible
-  face of `Estate.Households`.
 - **Manor decision dials** (taxes/customs per the design doc).
-- Build time / afford-gating / salvage losses — arrives as one package.
+- Build time / afford-gating / salvage losses — one package.
+- The land ladder past rung one: clearing bandit land plot by plot
+  works; what makes it worth doing (yield? renown?).
 
 ## Realism backlog (briefs: `MarchesRealism.md`, `Rivers.md`)
 
 - Tier B remainder: grass/scrub detail meshes, landuse splat variation,
-  **hedgerows along parcel boundaries**, height detail noise.
+  **hedgerows along parcel boundaries** (parcels exist now), height
+  detail noise.
 - Tier C: **Welsh 1m LIDAR at the castle sites** (per-tile resolution
-  raise — the tile grid exists for exactly this; brings Grosmont's real
-  moat into the heightmap).
-- Rivers later: flow-direction currents, foam, the altitude LOD seam.
+  raise — brings Grosmont's real moat into the heightmap).
+- Rivers "good enough for now" (user, 08-12): flow currents, foam, the
+  altitude LOD seam stay deferred.
 - Re-bake order on the Marches source Terrain: Generate → Split →
-  **Carve Rivers** → Dress (Split is the un-carve; features local).
+  **Carve Rivers** → Dress (Split is the un-carve).
 
 ## Backlog / open questions (carried)
 
-- **Any new stored fact must join `CastleSave`** — schema v6; v2+
+- **Any new stored fact must join `CastleSave`** — schema v7; v2+
   load, v1 refuses.
 - **Structural support deliberately absent**; nothing may assume
   construction is instantaneous in the world.
+- Deferred by design this round: river-weighted territory seams,
+  bandit camps at the seams (waits for combat), edge OWNER field (only
+  needed if neighbor castles become real wall-graph builds).
 - Hand-test debt from 08-09: right-click undo forms, wall chaining
   feel, stair rework. Folded/switchback stair agreed, not speced.
 - Watch-item: terrain wall drags through slab-borne buildings.
 - Graduate playtested briefs into CLAUDE.md (`Stairs.md`, `Doors.md`,
-  `BuildingRebuild.md`, `MarchesRealism.md`, now `TerrainTiles.md` +
-  `Rivers.md`).
+  `BuildingRebuild.md`, `MarchesRealism.md`, `TerrainTiles.md`,
+  `Rivers.md`, now `Territories.md`).
 - Curved rooms floor chorded — trace-STAMP fill deferred.
 - Britain-scale when leaving 15km: tile streaming, floating origin,
   simulation LOD — additive on the tile grid, deliberately later.
@@ -69,12 +77,14 @@ last fix**.
 - Design queue after territories: renown (#11), special rooms (#14),
   AI-prop bake-off, walking liveliness (#12), hard-mode death (#4),
   liege (#5), AI nobles (#6), vassal departure (#7).
-- Editor gotchas: wall graph is play-mode only; `execute_code` is a
-  method body (no class declarations — reflect on private types, and
+- Editor gotchas: wall graph is play-mode only; STOP PLAY before
+  editing scripts (mid-play recompile husks runtime objects);
+  `execute_code` is a method body (no class declarations; reflection
   GetField needs `Public` for public fields of private classes); public
-  fields are scene-serialized (the `stairWidth`/`roadLift` trap); a
-  draped mesh fights the terrain's LOD and that error is SCREEN-space
-  (grows with distance); read baked normals back before trusting a
-  winding probe; `Terrain.activeTerrain` is FORBIDDEN outside
-  Ground/TerrainPads; the MCP bridge drops during multi-minute bakes —
-  reconnects; verify bakes by STATE, not by the (identical) log line.
+  fields are scene-serialized (the `stairWidth` trap); draped meshes
+  fight the terrain LOD and its error is SCREEN-space;
+  `Terrain.activeTerrain` is FORBIDDEN outside Ground/TerrainPads; the
+  MCP bridge drops during multi-minute bakes — verify by STATE or an
+  Editor.log watcher, never re-run; edit-mode code never sees
+  `LandSurvey.Instance` — use the `CastleGrounds.Survey` fallback
+  pattern.

@@ -1,7 +1,10 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-public enum LandType { Farm = 0, Pasture = 1, Timber = 2, Living = 3 }
+// Castle: the lord's own building ground — the ONLY land the player
+// may build masonry on (LandLaw), and the land the future procedural
+// village keeps out of. Changes hands with the castle, never by sale.
+public enum LandType { Farm = 0, Pasture = 1, Timber = 2, Living = 3, Castle = 4 }
 public enum LandOwner { Player = 0, Bandits = 1, Neighbor = 2 }
 
 // A parcel of the countryside: a stored polygon with a nature, an owner
@@ -25,6 +28,11 @@ public class LandPlot : MonoBehaviour
     // Survey-grid coords; adjacency (one step apart) is what the
     // frontier rule reads. Stored, not re-derived from geometry.
     public int gx, gz;
+    // The lordship this parcel belongs to: an index into the
+    // name-sorted castle-site list (CastleSite.Ordered — or the Spiš
+    // fallback site). Stored (CastleSave v7), never re-derived; pre-v7
+    // saves migrate once at load by nearest site.
+    public int territory;
 
     // The overlay floats this far above the sampled ground so it reads
     // through grass without hovering.
@@ -45,7 +53,7 @@ public class LandPlot : MonoBehaviour
     public float AreaM2 => Mathf.Abs(SlabTile.SignedArea(verts));
 
     public static LandPlot Create(List<Vector3> outline, LandType type,
-        LandOwner owner, int gx, int gz)
+        LandOwner owner, int gx, int gz, int territory)
     {
         var go = new GameObject("Plot " + gx + "," + gz);
         go.transform.SetParent(Root(), false);
@@ -58,6 +66,7 @@ public class LandPlot : MonoBehaviour
         plot.owner = owner;
         plot.gx = gx;
         plot.gz = gz;
+        plot.territory = territory;
         plot.filter = go.AddComponent<MeshFilter>();
         plot.rend = go.AddComponent<MeshRenderer>();
         plot.rend.sharedMaterial = OverlayMaterial();
@@ -131,6 +140,7 @@ public class LandPlot : MonoBehaviour
             LandType.Farm => new Color(0.86f, 0.72f, 0.28f),
             LandType.Pasture => new Color(0.42f, 0.72f, 0.32f),
             LandType.Timber => new Color(0.16f, 0.42f, 0.24f),
+            LandType.Castle => new Color(0.55f, 0.58f, 0.68f),
             _ => new Color(0.80f, 0.55f, 0.35f),
         };
         float a = owner == LandOwner.Player ? 0.5f : 0.18f;

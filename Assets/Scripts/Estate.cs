@@ -236,7 +236,9 @@ public static class Estate
                 case LandType.Farm: produce += p.AreaM2 * FarmQuarterRate; break;
                 case LandType.Pasture: produce += p.AreaM2 * PastureQuarterRate; break;
                 case LandType.Timber: produce += p.AreaM2 * TimberQuarterRate; break;
-                default: anyLiving = true; break;
+                // Castle grounds yield nothing — only a VILLAGE brings
+                // the households' dues.
+                case LandType.Living: anyLiving = true; break;
             }
         }
         long dues = anyLiving ? Households * HouseholdQuarterDues : 0;
@@ -268,6 +270,9 @@ public static class Estate
             LandType.Farm => plot.AreaM2 * FarmQuarterRate * 4,
             LandType.Pasture => plot.AreaM2 * PastureQuarterRate * 4,
             LandType.Timber => plot.AreaM2 * TimberQuarterRate * 4,
+            // Castle grounds earn nothing and are priced by nothing —
+            // they change hands with the castle (the click refuses).
+            LandType.Castle => 0,
             _ => Households * HouseholdQuarterDues * 4.0,
         };
         return (long)System.Math.Round(year);

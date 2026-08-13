@@ -35,6 +35,13 @@ public class MarchesDressing : MonoBehaviour
     public float[] roadWidths = { 4f, 3f, 1.8f };
     public float sampleStep = 5f;
 
+    [Header("Roads of 1220")]
+    // Keep only the routes that CONNECT the castles (CastleRoads —
+    // pairwise shortest paths over the stitched network). The modern
+    // density is the lie, not the geometry; kept routes paint as
+    // through-roads (class 0) whatever class their pieces were.
+    public bool castleRoadsOnly = true;
+
     [Header("Road Splat")]
     // The road IS this paint now (the ribbons are gone): a third terrain
     // layer along every corridor, full-strength over the roadbed and
@@ -108,6 +115,8 @@ public class MarchesDressing : MonoBehaviour
         foreach (Terrain t in tiles)
             t.heightmapPixelError = 2f;
         FeaSet set = JsonUtility.FromJson<FeaSet>(features.text);
+        if (castleRoadsOnly)
+            set.roads = FilterToCastleRoutes(set.roads);
 
         Transform root = new GameObject(RootName).transform;
 
@@ -490,6 +499,38 @@ public class MarchesDressing : MonoBehaviour
         chunk.minWaterY = b.minY;
         chunk.maxWaterY = b.maxY;
         chunk.maxWidth = b.maxW;
+    }
+
+    // The 1220 filter applied: castle-connecting routes only, painted
+    // as through-roads. CastleSite markers are read directly (their
+    // play-mode registry doesn't run in edit mode); fewer than two
+    // castles means nothing to connect — keep the full network and say
+    // so rather than bake an empty countryside silently.
+    Fea[] FilterToCastleRoutes(Fea[] roads)
+    {
+        var sites = FindObjectsByType<CastleSite>(FindObjectsSortMode.None);
+        if (roads == null || sites.Length < 2)
+        {
+            Debug.LogWarning("MarchesDressing: castleRoadsOnly needs 2+"
+                + " CastleSite markers — keeping the full road network.");
+            return roads;
+        }
+        var polylines = new List<float[]>(roads.Length);
+        foreach (Fea r in roads)
+            polylines.Add(r.p);
+        var castles = new List<Vector2>(sites.Length);
+        foreach (CastleSite s in sites)
+            castles.Add(s.PositionXZ);
+        // Trimmed at each castle's grounds boundary — the painted road
+        // ends at the gate, same outlines the runtime survey uses.
+        List<float[]> routes = CastleRoads.Routes(polylines, castles,
+            CastleGrounds.Outlines(castles));
+        var kept = new Fea[routes.Count];
+        for (int i = 0; i < routes.Count; i++)
+            kept[i] = new Fea { c = 0, w = roadWidths[0], p = routes[i] };
+        Debug.Log($"CastleRoads: {roads.Length} ways filtered to"
+            + $" {routes.Count} castle routes.");
+        return kept;
     }
 
     static List<Vector3> Unflatten(float[] p)

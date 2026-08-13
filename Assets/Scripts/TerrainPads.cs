@@ -107,6 +107,14 @@ public static class TerrainPads
 
     static Tile StateAt(float x, float z) => StateFor(Ground.TileAt(x, z));
 
+    // The timber planter's door: a tile's session clone, created on
+    // first use exactly like an earthwork's. Anything that WRITES
+    // terrain data at runtime (heights, alphas, trees) must come
+    // through here — play-mode writes to the authored asset silently
+    // persist, and that asset is never touched.
+    public static TerrainData SessionData(Terrain terrain)
+        => StateFor(terrain).runtime;
+
     // Reshaped ground changes its slopes, and the surface paint is
     // slope-derived (grass flat, dirt steep — TerrainGenerator's rule).
     // Recompute it over the touched region so a cut face shows worn

@@ -1170,7 +1170,9 @@ public class GridPlacementSystem : MonoBehaviour
         if (!overUI)
         {
             float best = float.MaxValue;
-            foreach (RaycastHit h in Physics.RaycastAll(ray, 1000f))
+            // Unbounded range: the survey is read from altitude, and a
+            // 1000m cap silently dropped every far parcel's hover.
+            foreach (RaycastHit h in Physics.RaycastAll(ray, float.PositiveInfinity))
             {
                 if (h.collider.isTrigger || h.distance >= best)
                     continue;
@@ -1197,29 +1199,49 @@ public class GridPlacementSystem : MonoBehaviour
             LandType.Farm => "Farmland",
             LandType.Pasture => "Pasture",
             LandType.Timber => "Timber",
+            LandType.Castle => "Castle grounds",
             _ => "Village land",
         };
         float acres = plot.AreaM2 / 4047f;
-        bool frontier = plot.owner != LandOwner.Player
-            && LandParcels.TouchesPlayerLand(plot);
+        // The frontier rule gates bandit CLEARING only — buying a
+        // neighbor's parcel is negotiation, not conquest, and with
+        // lordships kilometres apart adjacency would forbid it forever
+        // (Docs/Territories.md).
+        bool frontier = plot.owner != LandOwner.Bandits
+            || LandParcels.TouchesPlayerLand(plot);
+        // Castle grounds change hands with the castle, never by sale —
+        // the hover says so and the click refuses on the same test.
+        bool castleGrounds = plot.type == LandType.Castle
+            && plot.owner != LandOwner.Player;
         landInspect = plot.owner switch
         {
             LandOwner.Player =>
                 $"{kind} · {acres:0.0} acres · yours —"
-                + $" {Estate.Format(Estate.AnnualYieldOf(plot))} a year",
+                + (plot.type == LandType.Castle ? " build here"
+                    : $" {Estate.Format(Estate.AnnualYieldOf(plot))} a year"),
             LandOwner.Bandits =>
                 $"{kind} · {acres:0.0} acres · bandit-held — clear for"
                 + $" {Estate.Format(Estate.PriceOf(plot))}"
                 + (frontier ? "" : " (beyond your borders)"),
+            _ when castleGrounds =>
+                $"{kind} · {acres:0.0} acres ·"
+                + $" {LandParcels.TerritoryName(plot.territory)}'s —"
+                + " changes hands with the castle",
             _ =>
-                $"{kind} · {acres:0.0} acres · a neighbor's — buy for"
-                + $" {Estate.Format(Estate.PriceOf(plot))}"
-                + (frontier ? "" : " (beyond your borders)"),
+                $"{kind} · {acres:0.0} acres ·"
+                + $" {LandParcels.TerritoryName(plot.territory)}'s — buy for"
+                + $" {Estate.Format(Estate.PriceOf(plot))}",
         };
 
         if (mouse.leftButton.wasPressedThisFrame
             && plot.owner != LandOwner.Player)
         {
+            if (castleGrounds)
+            {
+                BuildLog.Add("Refused: a castle's grounds change hands"
+                    + " with the castle.");
+                return;
+            }
             // The frontier rule, commit-side: the same adjacency the
             // hover line warns about (one-test doctrine).
             if (!frontier)
@@ -2547,6 +2569,8 @@ public class GridPlacementSystem : MonoBehaviour
                 continue;
             if (coverage > 0.05f)
                 shapeBlocked = true;
+            if (LandLaw.SpanOutside(s, c, e))
+                shapeBlocked = true;
             // Terrain figures preview fitted to the real ground — rooms
             // never move earth, so the slope the ghost stands on is the
             // slope the commit builds on.
@@ -3631,7 +3655,8 @@ public class GridPlacementSystem : MonoBehaviour
         foreach (WallEdge.SectionSpec spec in roomLiveSpecs)
             roomLiveMeshes.Add(spec.mesh);
         roomLiveBlocked = WallGraph.OverlapsExisting(a, (a + b) * 0.5f, b,
-            roomChainBaseY ?? float.NegativeInfinity);
+            roomChainBaseY ?? float.NegativeInfinity)
+            || LandLaw.SpanOutside(a, (a + b) * 0.5f, b);
     }
 
     // One chain segment's section specs at the chain's plane. Terrain
@@ -4490,6 +4515,11 @@ public class GridPlacementSystem : MonoBehaviour
             return "the outline crosses itself.";
         if (Mathf.Abs(SlabTile.SignedArea(poly)) < 0.25f)
             return "the outline is too small to be a slab.";
+        // The castle-grounds law: the lord builds on castle land and
+        // nowhere else (LandLaw — stands down when no castle parcel
+        // exists, so old saves keep building).
+        if (LandLaw.PolyOutside(poly))
+            return "outside your castle grounds.";
         foreach (SlabTile t in SlabTile.All)
         {
             if (t == null || t.isFoundation != foundation)
@@ -5678,7 +5708,8 @@ public class GridPlacementSystem : MonoBehaviour
             splineSpecs.AddRange(WallEdge.BuildSpecs(s, c, e, height, gridSize, gridSize,
                 baseStepSize, BaseHeight, topY, baseFloor - skirt));
             pendingCommits.Add((s, c, e, height, topY, baseFloor, skirt));
-            previewBlocked |= WallGraph.OverlapsExisting(s, c, e, baseFloor);
+            previewBlocked |= WallGraph.OverlapsExisting(s, c, e, baseFloor)
+                || LandLaw.SpanOutside(s, c, e);
             previewCrossings.AddRange(WallGraph.FindCrossings(s, c, e, baseFloor));
         }
         foreach (WallEdge.SectionSpec spec in splineSpecs)
@@ -5861,10 +5892,12 @@ public class GridPlacementSystem : MonoBehaviour
         foreach (WallEdge.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
 
-        // The graph verdicts the whole gesture: refused only for a
-        // near-exact redraw along an existing wall; crossings are legal
-        // and become shared nodes (shown as gold posts).
-        previewBlocked = WallGraph.OverlapsExisting(start, control, end, baseFloor);
+        // The graph verdicts the whole gesture: refused for a
+        // near-exact redraw along an existing wall, or for leaving the
+        // castle grounds (LandLaw — same red, same commit gate);
+        // crossings are legal and become shared nodes (gold posts).
+        previewBlocked = WallGraph.OverlapsExisting(start, control, end, baseFloor)
+            || LandLaw.SpanOutside(start, control, end);
         previewCrossings = WallGraph.FindCrossings(start, control, end, baseFloor);
     }
 
@@ -6117,7 +6150,8 @@ public class GridPlacementSystem : MonoBehaviour
             CurrentWallHeight, gridSize, gridSize, baseStepSize, BaseHeight, topY, srcBase));
         foreach (WallEdge.SectionSpec spec in splineSpecs)
             previewMeshes.Add(spec.mesh);
-        previewBlocked = WallGraph.OverlapsExisting(s, c, e, srcBase);
+        previewBlocked = WallGraph.OverlapsExisting(s, c, e, srcBase)
+            || LandLaw.SpanOutside(s, c, e);
         previewCrossings = WallGraph.FindCrossings(s, c, e, srcBase);
     }
 

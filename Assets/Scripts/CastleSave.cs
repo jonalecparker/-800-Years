@@ -49,7 +49,11 @@ public static class CastleSave
     // save has no parcels, so the survey regenerates fresh after load
     // (LandParcels.EnsureGenerated), the clock restarts at Lady Day and
     // households take the starting dozen.
-    const int Version = 6;
+    // 7: castle territories (2026-08-12, Docs/Territories.md) — each
+    // parcel carries its lordship as an index into the name-sorted
+    // site list. A v6 plot migrates ONCE at load: nearest site wins,
+    // stored thereafter.
+    const int Version = 7;
 
     // JSON has no -Infinity, and JsonUtility's handling of one is not
     // worth trusting across Unity versions — the graph's "-inf means
@@ -145,6 +149,7 @@ public static class CastleSave
     {
         public List<Vector3> verts = new List<Vector3>();
         public int type, owner, gx, gz;
+        public int territory;
     }
 
     [Serializable]
@@ -245,6 +250,7 @@ public static class CastleSave
                 owner = (int)p.owner,
                 gx = p.gx,
                 gz = p.gz,
+                territory = p.territory,
             };
             pd.verts.AddRange(p.verts);
             data.plots.Add(pd);
@@ -425,10 +431,31 @@ public static class CastleSave
         // EnsureGenerated pass will survey fresh ground.
         GameClock.SetElapsed(data.version >= 6 ? data.clockDays : 0);
         Estate.Households = data.version >= 6 ? data.households : 12;
+        // A v6 plot predates territories: migrate ONCE by nearest site,
+        // stored on the plot from here on (Docs/Territories.md).
+        List<LandParcels.Site> sites =
+            data.version < 7 ? LandParcels.Sites() : null;
         foreach (PlotData pd in data.plots)
-            if (pd.verts != null && pd.verts.Count >= 3)
-                LandPlot.Create(pd.verts, (LandType)pd.type,
-                    (LandOwner)pd.owner, pd.gx, pd.gz);
+        {
+            if (pd.verts == null || pd.verts.Count < 3)
+                continue;
+            int territory = pd.territory;
+            if (sites != null && sites.Count > 0)
+            {
+                Vector3 mid = Vector3.zero;
+                foreach (Vector3 v in pd.verts)
+                    mid += v;
+                mid /= pd.verts.Count;
+                territory = LandParcels.TerritoryOf(
+                    new Vector2(mid.x, mid.z), sites);
+            }
+            LandPlot.Create(pd.verts, (LandType)pd.type,
+                (LandOwner)pd.owner, pd.gx, pd.gz, territory);
+        }
+        // The woods follow the parcels wherever they come from —
+        // deterministic, so a snapshot undo replants the same oaks.
+        if (data.plots.Count > 0)
+            TimberWoods.Plant();
 
         // Earth before masonry: pristine ground back first, then the
         // saved pads reapply in order — every wall created below re-foots
