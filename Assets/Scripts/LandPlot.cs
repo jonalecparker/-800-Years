@@ -38,8 +38,10 @@ public class LandPlot : MonoBehaviour
     // through grass without hovering.
     const float Drape = 0.3f;
     // Triangles subdivide until edges are under this, so the sheet
-    // follows the hill instead of knifing through it.
-    const float MaxEdge = 8f;
+    // follows the hill instead of knifing through it. 12m, not finer:
+    // a full-map survey is thousands of parcels and the drape cost is
+    // paid for all of them at once.
+    const float MaxEdge = 12f;
 
     static Material overlayMat;
     static Transform root;
@@ -49,6 +51,12 @@ public class LandPlot : MonoBehaviour
     MeshCollider col;
     Mesh ownedMesh;
     bool highlighted;
+    // The terrain edit under which the drape was last built. Opening
+    // the survey used to re-drape EVERY plot every time (seconds of
+    // stall at full-map surveys); the outline is a stored fact and the
+    // ground only moves through TerrainPads, so the mesh is valid
+    // until TerrainPads.EditVersion says otherwise.
+    int drapedVersion = -1;
 
     public float AreaM2 => Mathf.Abs(SlabTile.SignedArea(verts));
 
@@ -110,21 +118,57 @@ public class LandPlot : MonoBehaviour
     }
 
     // The whole survey shows and hides together with the tool. Showing
-    // re-drapes every plot over the CURRENT ground — the outline is the
+    // drapes each plot over the CURRENT ground — the outline is the
     // stored fact, the drape is presentation, so a re-benched hillside
-    // gets an honest map without any stored data changing.
+    // still gets an honest map — but only plots whose ground actually
+    // moved since their last drape rebuild (TerrainPads.EditVersion).
+    // Plots with a valid cached drape appear at once; the rest QUEUE
+    // and materialize a few milliseconds' worth per frame (Tick, from
+    // BuildMenu.Update) — draping 5,600 parcels in one frame stalled
+    // the editor for seconds on the first open of a session.
+    static readonly Queue<LandPlot> drapeQueue = new Queue<LandPlot>();
+    static bool showing;
+
     public static void ShowAll(bool shown)
     {
+        showing = shown;
+        drapeQueue.Clear();
         foreach (LandPlot p in All)
+        {
+            if (p == null)
+                continue;
+            if (!shown)
+                p.SetShown(false);
+            else if (p.ownedMesh != null
+                && p.drapedVersion == TerrainPads.EditVersion)
+                p.SetShown(true);
+            else
+                drapeQueue.Enqueue(p);
+        }
+    }
+
+    public static void Tick()
+    {
+        if (!showing || drapeQueue.Count == 0)
+            return;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (drapeQueue.Count > 0 && sw.ElapsedMilliseconds < 6)
+        {
+            LandPlot p = drapeQueue.Dequeue();
             if (p != null)
-                p.SetShown(shown);
+                p.SetShown(true);
+        }
     }
 
     public void SetShown(bool shown)
     {
         if (shown)
         {
-            RebuildMesh();
+            if (ownedMesh == null || drapedVersion != TerrainPads.EditVersion)
+            {
+                RebuildMesh();
+                drapedVersion = TerrainPads.EditVersion;
+            }
             Retint();
         }
         rend.enabled = shown;

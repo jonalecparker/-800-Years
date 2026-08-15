@@ -33,8 +33,9 @@ public class LandSurvey : MonoBehaviour
     [Tooltip("The grounds end where the land rises or falls this many meters from the site's own ground — the platform edge.")]
     public float castleGroundsRelief = 6f;
 
-    [Header("Settled demesne, in plots (village → fields → pasture)")]
-    public int villagePlots = 2;
+    [Header("Settled demesne (village in acres; fields & pasture in plots)")]
+    [Tooltip("The town grows out from the castle gate until it holds this many acres — the village flood's budget.")]
+    public float villageAcres = 15f;
     public int farmPlots = 5;
     public int pasturePlots = 3;
 
@@ -59,6 +60,9 @@ public class LandSurvey : MonoBehaviour
         foreach (LandPlot p in LandPlot.All.ToArray())
             if (p != null)
                 DestroyImmediate(p.gameObject);
+        // The disk cache would hand back the identical survey —
+        // Resurvey means "run it fresh with the dials as they stand".
+        LandParcels.InvalidateCache();
         LandParcels.EnsureGenerated();
         BuildLog.Add("Resurveyed — ownership reset to the fresh state."
             + " Reopen the Survey to see it.");

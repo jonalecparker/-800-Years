@@ -816,6 +816,8 @@ public class BuildMenu : MonoBehaviour
         // your lands is the point; standing down is deliberately not
         // done here.
         LandParcels.EnsureGenerated();
+        VillageHouses.EnsureCurrent();
+        LandPlot.Tick();
         GameClock.Tick(Time.deltaTime);
 
         // Walking has no tools, so it has no tool HUD. Switching the
@@ -843,6 +845,30 @@ public class BuildMenu : MonoBehaviour
                 }
                 if (kb.enterKey.wasPressedThisFrame || kb.numpadEnterKey.wasPressedThisFrame)
                     CommitSave();
+            }
+        }
+        else
+        {
+            // Population test dial ([ / ], Shift ×5, the user's ask
+            // 2026-08-13): households move, VillageHouses.EnsureCurrent
+            // above rebuilds next frame, and the town visibly grows or
+            // shrinks — houses are a prefix of a stable lot plan, so
+            // growth only ever appends. A stand-in until the economy
+            // grows households on its own; Households is saved (v6),
+            // so a dialed population persists like any other fact.
+            var popKb = UnityEngine.InputSystem.Keyboard.current;
+            if (popKb != null)
+            {
+                int step = popKb.leftShiftKey.isPressed
+                    || popKb.rightShiftKey.isPressed ? 5 : 1;
+                int delta = (popKb.rightBracketKey.wasPressedThisFrame ? step : 0)
+                    - (popKb.leftBracketKey.wasPressedThisFrame ? step : 0);
+                if (delta != 0)
+                {
+                    Estate.Households = Mathf.Max(0, Estate.Households + delta);
+                    BuildLog.Add($"The manor counts {Estate.Households}"
+                        + $" household{(Estate.Households == 1 ? "" : "s")}.");
+                }
             }
         }
 

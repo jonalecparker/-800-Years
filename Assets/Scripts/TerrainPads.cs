@@ -48,6 +48,13 @@ public static class TerrainPads
 
     public static readonly List<Op> All = new List<Op>();
 
+    // Bumped on every heightmap write (reshape, preview revert, reset)
+    // so cached drapes — the survey overlay — can tell whether the
+    // ground moved under them without resampling it. Cheap and
+    // monotonic; a spurious bump costs one rebuild, a missed one shows
+    // a stale map, so every SetHeights path increments it.
+    public static int EditVersion { get; private set; }
+
     // The law. One number; everything above enforces it.
     public const float MaxDeviation = 3f;
 
@@ -306,6 +313,7 @@ public static class TerrainPads
             tile.runtime.SetHeights(tile.pvC0, tile.pvR0, patch);
             RefreshSurface(tile, tile.pvC0, tile.pvR0, tile.pvC1, tile.pvR1);
             tile.previewApplied = false;
+            EditVersion++;
         }
     }
 
@@ -326,6 +334,7 @@ public static class TerrainPads
     public static void ResetToPristine()
     {
         All.Clear();
+        EditVersion++;
         foreach (Tile tile in tiles)
         {
             // A load mid-drag would otherwise revert onto stale heights.
@@ -359,6 +368,8 @@ public static class TerrainPads
             touched |= ReshapeTile(tile, bounds, covers, levelAt, guarded,
                 out _, out _, out _, out _);
         }
+        if (touched)
+            EditVersion++;
         return touched;
     }
 

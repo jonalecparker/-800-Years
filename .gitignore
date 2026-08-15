@@ -41,3 +41,8 @@ Assets/Screenshots/*
 # Unity's recovery scratch folder
 Assets/_Recovery/
 Assets/_Recovery.meta
+
+# LIDAR source data (~1GB zips + extracted ASC) — derived inputs, not
+# project assets. Docs/CastleLidar.md records the repeatable download
+# query if a fresh clone ever needs them re-fetched.
+TerrainSources/

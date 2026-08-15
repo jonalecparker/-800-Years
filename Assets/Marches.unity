@@ -79930,6 +79930,7 @@ GameObject:
   - component: {fileID: 1184855073}
   - component: {fileID: 1184855077}
   - component: {fileID: 1184855078}
+  - component: {fileID: 1184855079}
   m_Layer: 0
   m_Name: Terrain
   m_TagString: Untagged
@@ -80096,6 +80097,22 @@ MonoBehaviour:
   tilesPerSide: 4
   tileAlphamapResolution: 1024
   groupingID: 800
+--- !u!114 &1184855079
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1184855072}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f24bafa70e31b6242aca642dd33ed51f, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::CastleLidar
+  lidarFolder: TerrainSources/lidar
+  patchRadius: 600
+  featherBand: 150
+  waterMargin: 10
 --- !u!1 &1185103206
 GameObject:
   m_ObjectHideFlags: 0
@@ -84196,7 +84213,7 @@ MonoBehaviour:
   castleGroundsMin: 60
   castleGroundsMax: 140
   castleGroundsRelief: 6
-  villagePlots: 2
+  villageAcres: 15
   farmPlots: 5
   pasturePlots: 3
 --- !u!4 &1232948110
