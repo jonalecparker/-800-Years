@@ -917,6 +917,21 @@ public static class LandParcels
                     MixF(Ground.HeightAt(
                         b.xMin + b.width * i / 32f,
                         b.yMin + b.height * j / 32f));
+            // The floods stripe against roads and rivers, so the
+            // features asset is a generation input too — a re-baked
+            // MarchesFeatures.json must miss (learned 2026-08-15: a
+            // road-graph fix left the cache serving parcels striped
+            // along the broken routes).
+            var dressing = Object.FindAnyObjectByType<MarchesDressing>(
+                FindObjectsInactive.Include);
+            if (dressing != null && dressing.features != null)
+            {
+                string fea = dressing.features.text;
+                Mix(fea.Length);
+                foreach (char c in fea)
+                    Mix(c);
+                Mix(dressing.castleRoadsOnly ? 1 : 0);
+            }
             return (long)h;
         }
     }

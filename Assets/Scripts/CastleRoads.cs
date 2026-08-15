@@ -61,6 +61,42 @@ public static class CastleRoads
                 adj[b].Add((a, len));
             }
 
+        // Castles snap to the MAIN network, not the nearest vertex:
+        // OSM keeps orphan fragments (a driveway mapped without a
+        // shared node — Skenfrith's closest vertex is a 2-vertex stub),
+        // and a castle snapped to one can route nowhere. The largest
+        // connected component IS the road network the routes ride.
+        var comp = new int[pos.Count];
+        for (int v = 0; v < pos.Count; v++)
+            comp[v] = -1;
+        int compCount = 0, mainComp = -1, mainSize = 0;
+        var flood = new Stack<int>();
+        for (int s = 0; s < pos.Count; s++)
+        {
+            if (comp[s] >= 0)
+                continue;
+            int size = 0;
+            comp[s] = compCount;
+            flood.Push(s);
+            while (flood.Count > 0)
+            {
+                int v = flood.Pop();
+                size++;
+                foreach ((int to, float _) in adj[v])
+                    if (comp[to] < 0)
+                    {
+                        comp[to] = compCount;
+                        flood.Push(to);
+                    }
+            }
+            if (size > mainSize)
+            {
+                mainSize = size;
+                mainComp = compCount;
+            }
+            compCount++;
+        }
+
         var castleNode = new int[castles.Count];
         for (int c = 0; c < castles.Count; c++)
         {
@@ -68,6 +104,8 @@ public static class CastleRoads
             float bestSq = CastleSnapRange * CastleSnapRange;
             for (int v = 0; v < pos.Count; v++)
             {
+                if (comp[v] != mainComp)
+                    continue;
                 float sq = (pos[v] - castles[c]).sqrMagnitude;
                 if (sq < bestSq)
                 {

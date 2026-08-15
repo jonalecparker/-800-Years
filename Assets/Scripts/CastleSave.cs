@@ -53,7 +53,21 @@ public static class CastleSave
     // parcel carries its lordship as an index into the name-sorted
     // site list. A v6 plot migrates ONCE at load: nearest site wins,
     // stored thereafter.
-    const int Version = 7;
+    // 8: the BNG world frame (2026-08-15, Docs/WorldFrame.md) — world
+    // coordinates became the British National Grid and world Y became
+    // metres ODN. Nothing NEW travels; the version records which frame
+    // the save's coordinates speak. A pre-v8 save loading into the
+    // Marches (current terrain "Marches", saved terrain "Terrain")
+    // migrates ONCE through WorldFrame's legacy chain: every stored XZ
+    // through WorldFromOldWorld, every finite absolute Y lifted to ODN.
+    // Spiš saves — same old terrain name, but loaded into the scene
+    // whose BaseName still matches — never migrate.
+    const int Version = 8;
+
+    // Lifting by WorldFrame.LegacyLift keeps every structure's relation
+    // to the ground at its site; the re-foot on the new LIDAR ground
+    // absorbs the residue.
+    const float LegacyLift = WorldFrame.LegacyLift;
 
     // JSON has no -Infinity, and JsonUtility's handling of one is not
     // worth trusting across Unity versions — the graph's "-inf means
@@ -403,6 +417,18 @@ public static class CastleSave
             return false;
         }
 
+        // A pre-v8 Marches save speaks the old Mercator frame; loading
+        // it into the BNG world transforms it ONCE, here, before Apply
+        // ever sees it. The gate is the frame MISMATCH — old save, new
+        // Marches — so Spiš saves (old name, old scene, frames agree)
+        // pass untouched.
+        if (data.version < 8 && Ground.Any && Ground.BaseName == "Marches"
+            && data.terrainName == "Terrain")
+        {
+            MigrateToBngFrame(data);
+            BuildLog.Add("Save migrated to the BNG world frame (pre-v8 Marches save).");
+        }
+
         if (Ground.Any && !string.IsNullOrEmpty(data.terrainName)
             && data.terrainName != Ground.BaseName)
             BuildLog.Add($"Save was made on terrain '{data.terrainName}' — footings"
@@ -412,6 +438,86 @@ public static class CastleSave
         BuildLog.Add($"Loaded — {data.edges.Count} walls, {data.stairs.Count} stairs,"
             + $" {data.slabs.Count} slabs from {Path.GetFileName(path)}.");
         return true;
+    }
+
+    // The one-time frame migration (v8): every stored XZ through the
+    // legacy Mercator→BNG chain, every finite ABSOLUTE Y lifted to ODN.
+    // Relative quantities (height, thickness, skirt, width, head, arc
+    // lengths) and the −inf terrain sentinels stay; curve/span points
+    // keep their y (the planar-point convention — verticals live in the
+    // named Y fields). The terrain name is rewritten so the mismatch
+    // warning stays quiet and a re-save is v8 in every respect.
+    static void MigrateToBngFrame(SaveData data)
+    {
+        Vector2 XZ(float x, float z) =>
+            WorldFrame.WorldFromOldWorld(new Vector2(x, z));
+        Vector3 P(Vector3 v)
+        {
+            Vector2 p = XZ(v.x, v.z);
+            return new Vector3(p.x, v.y, p.y);
+        }
+        float Lift(float packedY) => packedY <= NegInf * 0.5f
+            ? packedY : packedY + LegacyLift;
+
+        foreach (NodeData nd in data.nodes)
+        {
+            Vector2 p = XZ(nd.x, nd.z);
+            nd.x = p.x;
+            nd.z = p.y;
+            nd.baseY = Lift(nd.baseY);
+        }
+        foreach (EdgeData ed in data.edges)
+        {
+            ed.control = P(ed.control);
+            ed.fixedTopY = Lift(ed.fixedTopY);
+            ed.baseY = Lift(ed.baseY);
+            for (int i = 0; i < ed.openings.Count; i++)
+                ed.openings[i].sill = Lift(ed.openings[i].sill);
+        }
+        foreach (StairData sd in data.stairs)
+        {
+            for (int i = 0; i < sd.spans.Count; i++)
+            {
+                SpanData sp = sd.spans[i];
+                sp.s = P(sp.s);
+                sp.c = P(sp.c);
+                sp.e = P(sp.e);
+            }
+            sd.bottomY += LegacyLift;
+            sd.topY += LegacyLift;
+            sd.baseFrom = Lift(sd.baseFrom);
+        }
+        foreach (SlabData sd in data.slabs)
+        {
+            for (int i = 0; i < sd.verts.Count; i++)
+                sd.verts[i] = P(sd.verts[i]);
+            foreach (WellData wd in sd.wells)
+                for (int i = 0; i < wd.verts.Count; i++)
+                    wd.verts[i] = P(wd.verts[i]);
+            sd.topY += LegacyLift;
+            sd.bottomY += LegacyLift;
+            if (sd.verts.Count < 3)
+            {
+                // A v2 square tile still stores center/size/yaw; Apply
+                // derives its corners from these, so they migrate too.
+                Vector2 c = XZ(sd.x, sd.z);
+                sd.x = c.x;
+                sd.z = c.y;
+            }
+        }
+        foreach (PlotData pd in data.plots)
+            for (int i = 0; i < pd.verts.Count; i++)
+                pd.verts[i] = P(pd.verts[i]);
+        foreach (PadData pd in data.pads)
+        {
+            for (int i = 0; i < pd.poly.Count; i++)
+                pd.poly[i] = P(pd.poly[i]);
+            pd.level += LegacyLift;
+            pd.ya += LegacyLift;
+            pd.yb += LegacyLift;
+        }
+        data.terrainName = "Marches";
+        data.version = 8;
     }
 
     // The restore itself: tear the world down and rebuild it from data.

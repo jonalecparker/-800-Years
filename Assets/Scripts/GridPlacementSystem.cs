@@ -332,6 +332,17 @@ public class GridPlacementSystem : MonoBehaviour
     // Pre-anchor plane dial, quarter steps off the seated plane; folded
     // into slabChainPlane at the anchor click and reset on cancel/commit.
     private float slabPlaneDial;
+    // The foundation's draw shape is the SAME Circle/Rectangle checkbox
+    // state the walls and rooms use (`Shape` — the user's call, one set
+    // of checkboxes for everything): a 3-click rectangle (anchor → far
+    // corner of the first side → width) or a 2-click circle (centre →
+    // radius, emitted as a 24-gon — slab edges are straight by doctrine,
+    // and 24 chords read as round at castle scale). Shapes reuse the
+    // chain's plane machinery wholesale: the anchor states the plane,
+    // Ctrl+scroll dials it, SlabPolyRefusal gates it, CommitSlabPoly
+    // commits it. Floors stay chain-only — their outlines hug existing
+    // walls, which no stamped shape does.
+    private readonly List<Vector3> slabShapePts = new List<Vector3>();
     public int SlabChainCount => slabChain.Count;
     // The chain's fill ghost — one mesh, refilled in place each frame.
     private Mesh slabPreviewMesh;
@@ -953,17 +964,47 @@ public class GridPlacementSystem : MonoBehaviour
         }
         else if (Mode == ToolMode.Foundation)
         {
-            context = slabChain.Count > 0
-                ? $"Foundation · outline ({slabChain.Count})" : "Foundation";
-            lines.Add(slabChain.Count == 0
-                ? "Click — start the outline (snapping an edge extends its level)"
-                : "Click — add a corner; close on the first corner to fill");
+            // The Circle/Rectangle checkboxes pick the figure here too.
+            if (Shape == BuildShape.Rect)
+            {
+                context = slabShapePts.Count == 0 ? "Foundation · rectangle"
+                    : slabShapePts.Count == 1 ? "Foundation · rectangle — first side"
+                    : "Foundation · rectangle — width";
+                lines.Add(slabShapePts.Count == 0
+                    ? "Click — plant the first corner"
+                    : slabShapePts.Count == 1
+                        ? "Click — fix the first side"
+                        : "Click — commit the rectangle");
+                if (slabShapePts.Count == 1)
+                    lines.Add("Shift — step the side's angle (5°)");
+                else if (slabShapePts.Count == 2)
+                    lines.Add("Shift — square it (width = side)");
+                lines.Add("Alt — free lengths and snaps");
+            }
+            else if (Shape == BuildShape.Circle)
+            {
+                context = slabShapePts.Count == 0
+                    ? "Foundation · circle" : "Foundation · circle — radius";
+                lines.Add(slabShapePts.Count == 0
+                    ? "Click — plant the centre" : "Click — commit the circle");
+                lines.Add("Alt — free the radius and snaps");
+            }
+            else
+            {
+                context = slabChain.Count > 0
+                    ? $"Foundation · outline ({slabChain.Count})" : "Foundation";
+                lines.Add(slabChain.Count == 0
+                    ? "Click — start the outline (snapping an edge extends its level)"
+                    : "Click — add a corner; close on the first corner to fill");
+                if (slabChain.Count > 0)
+                    lines.Add("Shift — step the leg's angle (5°)");
+                lines.Add("Alt — ignore snaps");
+            }
             lines.Add("Ctrl + scroll — plane up/down (¼m)");
-            lines.Add("Alt — ignore snaps");
-            if (slabChain.Count > 0)
+            if (slabChain.Count > 0 || slabShapePts.Count > 0)
             {
                 lines.Add("Right-click — undo the last corner");
-                lines.Add("Esc — abandon the outline");
+                lines.Add("Esc — abandon it");
             }
             lines.Add("Red — mostly buried, skirt too deep, or overlapping");
         }
@@ -979,6 +1020,7 @@ public class GridPlacementSystem : MonoBehaviour
             {
                 lines.Add("Click — add a corner; close on the first corner to fill");
                 lines.Add("Corners snap to wall corners at this plane");
+                lines.Add("Shift — step the leg's angle (5°)");
                 lines.Add("A stairwell is drawn AROUND — leave it out of the outline");
                 lines.Add("Right-click — undo the last corner");
                 lines.Add("Esc — abandon the outline");
@@ -1157,6 +1199,9 @@ public class GridPlacementSystem : MonoBehaviour
         CancelCurve();
         CancelShape();
         CancelRoomChain();
+        // The shape rides the Foundation tool too — a half-drawn outline
+        // means nothing to a rect.
+        CancelSlabChain();
     }
 
     // The Survey: the countryside's parcels as a draped map, shown only
@@ -3992,6 +4037,15 @@ public class GridPlacementSystem : MonoBehaviour
     void UpdateSlab(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
         bool foundation = Mode == ToolMode.Foundation;
+        // The Circle/Rectangle checkboxes arm the stamped foundations
+        // exactly as they arm wall figures; unchecked (or Curved) means
+        // the drawn outline.
+        if (foundation
+            && (Shape == BuildShape.Circle || Shape == BuildShape.Rect))
+        {
+            UpdateSlabShapeGesture(mouse, keyboard, ray, overUI);
+            return;
+        }
         if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
         {
             CancelSlabChain();
@@ -4041,6 +4095,40 @@ public class GridPlacementSystem : MonoBehaviour
         if (closing)
             point = slabChain[0];
 
+        // The chain leg reads like the room chain's: Shift steps the
+        // bearing in angleStep increments (snaps and the closing pull
+        // outrank it — only one of a point and an angle can be
+        // honoured), and the corner readout appears once a previous leg
+        // gives it a reference.
+        if (!closing && slabChain.Count > 0)
+        {
+            Vector3 last = slabChain[slabChain.Count - 1];
+            if (FlatDistance(point, last) >= 0.25f)
+            {
+                float bearing = Mathf.Atan2(point.z - last.z, point.x - last.x)
+                    * Mathf.Rad2Deg;
+                bool stepAim = keyboard != null && !snapped
+                    && (keyboard.leftShiftKey.isPressed
+                        || keyboard.rightShiftKey.isPressed);
+                if (stepAim)
+                {
+                    float len = FlatDistance(point, last);
+                    bearing = Mathf.Round(bearing / angleStep) * angleStep;
+                    float rad = bearing * Mathf.Deg2Rad;
+                    point = last
+                        + new Vector3(Mathf.Cos(rad), 0f, Mathf.Sin(rad)) * len;
+                }
+                if (slabChain.Count >= 2)
+                {
+                    Vector3 back = slabChain[slabChain.Count - 2] - last;
+                    activeAngle = (last,
+                        Mathf.Atan2(back.z, back.x) * Mathf.Rad2Deg, bearing);
+                }
+                guideBearing = bearing;
+                dimGuides.Add((last, point, FlatDistance(point, last)));
+            }
+        }
+
         // The tentative polygon: the chain closed through the cursor. The
         // refusal below IS the commit test run on it, so red at any
         // moment answers "what if you closed here" (one-test doctrine).
@@ -4074,22 +4162,7 @@ public class GridPlacementSystem : MonoBehaviour
                 BuildLog.Add("Refused: " + refusal);
                 return;
             }
-            float bottom = foundation
-                ? FoundationBottom(slabChain, slabChainPlane)
-                : slabChainPlane - SlabTile.Thickness;
-            SlabTile made = SlabTile.Create(splineParent, wallMaterial, slabChain,
-                slabChainPlane, bottom, foundation,
-                foundation ? null : slabWells);
-            BuildLog.Add((foundation ? "Foundation" : "Floor")
-                + $" — {slabChain.Count} corners,"
-                + $" {Mathf.Abs(SlabTile.SignedArea(slabChain)):0.#}m²"
-                + $" at {slabChainPlane:0.##}m."
-                + (!foundation && slabWells.Count > 0
-                    ? $" {slabWells.Count} stairwell"
-                        + (slabWells.Count == 1 ? "" : "s") + " cut."
-                    : ""));
-            Estate.Pay(Estate.CostOfSlab(made), foundation ? "Foundation" : "Floor");
-            CancelSlabChain();
+            CommitSlabPoly(slabChain, foundation);
         }
         else if (FlatDistance(point, slabChain[slabChain.Count - 1]) >= 0.25f)
         {
@@ -4100,8 +4173,174 @@ public class GridPlacementSystem : MonoBehaviour
     void CancelSlabChain()
     {
         slabChain.Clear();
+        slabShapePts.Clear();
         slabPlaneDial = 0f;
         HideGhosts();
+    }
+
+    // One commit for every slab gesture — the chain's closing click and
+    // the stamped shapes both land here, so cost, log line and cleanup
+    // cannot drift apart.
+    void CommitSlabPoly(List<Vector3> poly, bool foundation)
+    {
+        float bottom = foundation
+            ? FoundationBottom(poly, slabChainPlane)
+            : slabChainPlane - SlabTile.Thickness;
+        SlabTile made = SlabTile.Create(splineParent, wallMaterial, poly,
+            slabChainPlane, bottom, foundation,
+            foundation ? null : slabWells);
+        BuildLog.Add((foundation ? "Foundation" : "Floor")
+            + $" — {poly.Count} corners,"
+            + $" {Mathf.Abs(SlabTile.SignedArea(poly)):0.#}m²"
+            + $" at {slabChainPlane:0.##}m."
+            + (!foundation && slabWells.Count > 0
+                ? $" {slabWells.Count} stairwell"
+                    + (slabWells.Count == 1 ? "" : "s") + " cut."
+                : ""));
+        Estate.Pay(Estate.CostOfSlab(made), foundation ? "Foundation" : "Floor");
+        CancelSlabChain();
+    }
+
+    // The stamped foundations (R cycles to them): the same anchor-states-
+    // the-plane contract as the chain, the same one-test refusal, the
+    // same commit door. Rect follows the wall rect's grammar — anchor,
+    // far corner of the first side, width; circle is centre → radius.
+    // Length steps on lengthStep, Shift steps the side's bearing, Alt
+    // frees both and the snaps.
+    void UpdateSlabShapeGesture(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
+    {
+        if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
+        {
+            CancelSlabChain();
+            return;
+        }
+        if (rightClick && slabShapePts.Count > 0)
+        {
+            slabShapePts.RemoveAt(slabShapePts.Count - 1);
+            if (slabShapePts.Count == 0)
+                CancelSlabChain();
+            return;
+        }
+        bool free = keyboard != null
+            && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
+        bool shift = keyboard != null
+            && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
+        HandleSlabPlaneScroll(mouse, keyboard);
+
+        if (!ResolveFoundationPoint(ray, free, overUI, out Vector3 point,
+            out float plane, out bool snapped))
+        {
+            if (slabShapePts.Count == 0)
+                HideGhosts();
+            return;
+        }
+
+        // Anchor phase: one corner (rect) or the centre (circle); the
+        // click states the plane exactly as the chain's anchor does.
+        if (slabShapePts.Count == 0)
+        {
+            slabTempPoly.Clear();
+            slabTempPoly.Add(point);
+            ghostTopY = plane;
+            guideCenter = point;
+            snapTint = snapped;
+            ShowSlabChainGhost(point, plane, true, false, snapped);
+            if (mouse.leftButton.wasPressedThisFrame && !overUI)
+            {
+                slabShapePts.Add(point);
+                slabChainPlane = plane;
+                slabPlaneDial = 0f;
+            }
+            return;
+        }
+
+        Vector3 a = slabShapePts[0];
+        plane = slabChainPlane;
+        slabTempPoly.Clear();
+        bool committable = false;
+
+        if (Shape == BuildShape.Circle)
+        {
+            float r = FlatDistance(point, a);
+            if (!free)
+                r = Mathf.Round(r / lengthStep) * lengthStep;
+            r = Mathf.Max(1f, r);
+            const int Segs = 24;
+            for (int i = 0; i < Segs; i++)
+            {
+                float ang = i * Mathf.PI * 2f / Segs;
+                slabTempPoly.Add(a
+                    + new Vector3(Mathf.Cos(ang), 0f, Mathf.Sin(ang)) * r);
+            }
+            dimGuides.Add((a, a + (point - a).normalized * r, r));
+            committable = true;
+        }
+        else if (slabShapePts.Count == 1)
+        {
+            // First-side phase: bearing Shift-steps, length steps on the
+            // grid; a snapped cursor is honoured exactly (only one of a
+            // point and an angle can be honoured).
+            float len = FlatDistance(point, a);
+            float bearing = Mathf.Atan2(point.z - a.z, point.x - a.x)
+                * Mathf.Rad2Deg;
+            if (shift && !snapped)
+                bearing = Mathf.Round(bearing / angleStep) * angleStep;
+            if (!free && !snapped)
+                len = Mathf.Max(lengthStep,
+                    Mathf.Round(len / lengthStep) * lengthStep);
+            float rad = bearing * Mathf.Deg2Rad;
+            Vector3 b = snapped ? point
+                : a + new Vector3(Mathf.Cos(rad), 0f, Mathf.Sin(rad)) * len;
+            slabTempPoly.Add(a);
+            slabTempPoly.Add(b);
+            ghostTopY = plane;
+            guideCenter = (a + b) * 0.5f;
+            guideBearing = bearing;
+            dimGuides.Add((a, b, FlatDistance(a, b)));
+            snapTint = snapped;
+            ShowSlabChainGhost(null, plane, true, false, snapped);
+            if (mouse.leftButton.wasPressedThisFrame && !overUI
+                && FlatDistance(a, b) >= 1f)
+                slabShapePts.Add(b);
+            return;
+        }
+        else
+        {
+            // Width phase: perpendicular from the fixed side toward the
+            // cursor; Shift squares it (width = side).
+            Vector3 b = slabShapePts[1];
+            Vector3 side = b - a;
+            side.y = 0f;
+            float sideLen = side.magnitude;
+            Vector3 perp = new Vector3(-side.z, 0f, side.x).normalized;
+            float w = Vector3.Dot(point - a, perp);
+            if (shift)
+                w = Mathf.Sign(w == 0f ? 1f : w) * sideLen;
+            else if (!free)
+                w = Mathf.Round(w / lengthStep) * lengthStep;
+            if (Mathf.Abs(w) < 1f)
+                w = w < 0f ? -1f : 1f;
+            slabTempPoly.Add(a);
+            slabTempPoly.Add(b);
+            slabTempPoly.Add(b + perp * w);
+            slabTempPoly.Add(a + perp * w);
+            dimGuides.Add((b, b + perp * w, Mathf.Abs(w)));
+            committable = true;
+        }
+
+        string refusal = SlabPolyRefusal(slabTempPoly, plane, true);
+        ghostTopY = plane;
+        guideCenter = point;
+        ShowSlabChainGhost(null, plane, true, refusal != null, false);
+        if (committable && mouse.leftButton.wasPressedThisFrame && !overUI)
+        {
+            if (refusal != null)
+            {
+                BuildLog.Add("Refused: " + refusal);
+                return;
+            }
+            CommitSlabPoly(new List<Vector3>(slabTempPoly), true);
+        }
     }
 
     // Ctrl+scroll: the foundation's plane, in quarter steps — the same
@@ -4121,7 +4360,7 @@ public class GridPlacementSystem : MonoBehaviour
         if (Mathf.Abs(scroll) >= 100f)
             scroll /= 120f;
         float notches = Mathf.Clamp(scroll, -4f, 4f);
-        if (slabChain.Count > 0)
+        if (slabChain.Count > 0 || slabShapePts.Count > 0)
             slabChainPlane = Mathf.Round((slabChainPlane
                 + notches * SlabTile.FloorStep) / SlabTile.FloorStep)
                 * SlabTile.FloorStep;
@@ -4153,7 +4392,8 @@ public class GridPlacementSystem : MonoBehaviour
         if (!free && TrySlabOutlineSnap(true, ref point, ref hostPlane))
             snapped = true;
 
-        if (slabChain.Count > 0)
+        // A shape anchor states the plane exactly as a chain anchor does.
+        if (slabChain.Count > 0 || slabShapePts.Count > 0)
         {
             plane = slabChainPlane;
             return true;

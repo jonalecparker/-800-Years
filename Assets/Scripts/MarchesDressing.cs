@@ -8,19 +8,20 @@ using UnityEditor;
 // Dresses the Marches terrain with real land cover baked from OpenStreetMap
 // (Docs/MarchesRealism.md and Docs/Rivers.md are the briefs): roads as
 // worn-track splat paint (the draped road ribbons are gone — the user's
-// call: "just the terrain"), waterways CARVED into the tiles and filled
-// with draped water ribbons (the cheap tier of the two-tier water story;
-// RiverWaterLOD swaps the near ones for HDRP water), real wood polygons
-// filled with terrain trees, bushes as undergrowth and hedging the lanes.
+// call: "just the terrain"), water ribbons over the beds MarchesBaker
+// carved (the cheap tier of the two-tier water story; RiverWaterLOD
+// swaps the near ones for HDRP water), real wood polygons filled with
+// terrain trees, bushes as undergrowth and hedging the lanes.
 // Everything here is scene DRESSING derived from the features asset — no
 // stored gameplay facts, nothing joins CastleSave, and the dressing root
 // stays out of splineParent (the cutaway has no business slicing a road,
-// the LandPlot precedent). ContextMenu bakes like TerrainGenerator, in
-// order: Carve Rivers reshapes the tiles' heightmaps (idempotent — re-run
-// converges), then Dress lays the cover; Clear Dressing removes what Dress
-// made (un-carving is re-running TerrainTiler.Split). Ribbons carry no
+// the LandPlot precedent). ContextMenu bake like TerrainGenerator: the
+// baker bakes tiles (heights + carve), then Dress lays the cover; Clear
+// Dressing removes what Dress made. The carve itself lives in
+// MarchesBaker now — refs need PRE-carve ground, and only the bake has
+// it; ribbons read the water levels from the SAVED refs
+// (MarchesRiverRefs.json), never from carved ground. Ribbons carry no
 // colliders (the walker must never trip on a road); oak trunks DO collide.
-[RequireComponent(typeof(Terrain))]
 public class MarchesDressing : MonoBehaviour
 {
     // World-XZ polylines/polygons preprocessed offline from Overpass with the
@@ -33,7 +34,6 @@ public class MarchesDressing : MonoBehaviour
     // splat paint alone now, but the widths still drive the paint falloff,
     // the tree keep-out cells and the hedgerows.
     public float[] roadWidths = { 4f, 3f, 1.8f };
-    public float sampleStep = 5f;
 
     [Header("Roads of 1220")]
     // Keep only the routes that CONNECT the castles (CastleRoads —
@@ -45,10 +45,9 @@ public class MarchesDressing : MonoBehaviour
     [Header("Road Splat")]
     // The road IS this paint now (the ribbons are gone): a third terrain
     // layer along every corridor, full-strength over the roadbed and
-    // fading through the verge; the tiles' 1024 alphamap (3.68m/px)
-    // carries it. The dial exists for the day a corridor earns denser
-    // paint — 2048 quadruples every tile asset, so it must earn it.
-    public int splatResolution = 1024;
+    // fading through the verge. Painted at each TILE'S OWN alphamap
+    // resolution (the baker's dial — 512 on a 2km tile is ~3.9m/px);
+    // a resolution dial here would fight the baker's.
     // Beyond the road's own half-width: full-strength core, then fade.
     // Tuned against the first bake (core 1.5 / fade 4 read as sandy
     // avenues): the control map's own bilinear blur at 3.68m/px adds
@@ -79,7 +78,26 @@ public class MarchesDressing : MonoBehaviour
     public float treeSpacing = 9f;
     public float bushSpacing = 14f;
     public float roadsideBushStep = 16f;
-    public int maxTreeInstances = 300000;
+    // 450k: the 300k cap was set before the hedgebank pass existed —
+    // hedges filled it and the global thinning quietly sparsified the
+    // woods to make room. Headroom for both; the dial is perf-yours.
+    public int maxTreeInstances = 450000;
+
+    [Header("Hedgebanks & Field Paint")]
+    // The LIDAR keeps the field-boundary EARTHWORKS but strips the
+    // hedges that explain them — naked banks read as artifacts. A
+    // curvature pass finds the crests on the fine tiles and plants
+    // bushes along them; the mottle breaks up the billiard-table grass.
+    [Tooltip("Crest height over the surrounding ring that reads as a hedgebank (m).")]
+    public float hedgeBankSignal = 0.22f;
+    [Tooltip("Ring radius the crest is measured against (m).")]
+    public float hedgeBankRing = 7f;
+    [Tooltip("Approximate spacing of hedge bushes along a bank (m).")]
+    public float hedgeBushStep = 4f;
+    [Tooltip("Hedgebank bushes cap — they yield to woods, not the reverse.")]
+    public int maxHedgeInstances = 120000;
+    [Tooltip("Grass/dirt noise amplitude in the field paint (0 = off).")]
+    public float splatMottle = 0.35f;
 
     const string DressFolder = "Assets/Terrain/Dressing";
     const string RootName = "Marches Dressing";
@@ -158,17 +176,12 @@ public class MarchesDressing : MonoBehaviour
             if (Application.isPlaying) Destroy(root);
             else DestroyImmediate(root);
         }
-        // Trees live on whichever terrains were dressed — the tiles, and
-        // (pre-split scenes) the single terrain this component rides.
         foreach (Terrain t in Ground.Tiles())
         {
             ClearTrees(t.terrainData);
             if (restoreSplats)
                 RestoreSlopeSplats(t.terrainData);
         }
-        Terrain own = GetComponent<Terrain>();
-        if (own != null)
-            ClearTrees(own.terrainData);
     }
 
     static void ClearTrees(TerrainData data)
@@ -189,172 +202,19 @@ public class MarchesDressing : MonoBehaviour
     float BankEdge(float w) =>
         w * 0.5f + Mathf.Max(w * bankWidthFactor, bankWidthMin);
 
-    // The un-carved reference ground — the PRE-SPLIT source terrain this
-    // component rides (never carved, so everything derived from it is
-    // stable across re-runs); Ground as the unsplit-scene fallback.
-    Terrain srcTerrain;
-    float SrcHeight(Vector3 p)
+    // The saved carve refs (MarchesBaker wrote them beside the carve
+    // itself) — the PRE-carve channel levels the water sits against.
+    // Editor-only on purpose: Dress is an editor bake.
+    static MarchesBaker.RiverRefs LoadRiverRefs()
     {
-        if (srcTerrain == null)
-            srcTerrain = GetComponent<Terrain>();
-        TerrainData d = srcTerrain != null ? srcTerrain.terrainData : null;
-        if (d == null)
-            return Ground.HeightAt(p);
-        Vector3 o = srcTerrain.transform.position;
-        return d.GetInterpolatedHeight(
-            (p.x - o.x) / d.size.x, (p.z - o.z) / d.size.z) + o.y;
-    }
-
-    // The channel's local reference level at centerline sample i: the
-    // LOWEST of the centerline and the two points just outside the
-    // channel. CLOSE-IN on purpose — the first cut sampled banks 11m out
-    // and the lower one, metres downhill on a cross-slope, dragged the
-    // whole target down: hillside streams carved deep shadowed GASHES
-    // (the user's screenshot). Sampling at the channel edge bounds the
-    // cross-slope contribution to ~2m of run, a terrace notch. Carve
-    // targets AND the water level both derive from this one number.
-    float ChannelRef(List<Vector3> line, int i, float halfW)
-    {
-        Vector3 dir = line[Mathf.Min(i + 1, line.Count - 1)]
-            - line[Mathf.Max(i - 1, 0)];
-        dir.y = 0f;
-        if (dir.sqrMagnitude < 1e-6f)
-            dir = Vector3.forward;
-        dir.Normalize();
-        var perp = new Vector3(-dir.z, 0f, dir.x) * (halfW + 1.5f);
-        return Mathf.Min(SrcHeight(line[i]),
-            Mathf.Min(SrcHeight(line[i] - perp), SrcHeight(line[i] + perp)));
-    }
-
-    struct CarveStamp { public float x, z, bank, depth, halfW, edge; }
-
-    // Lowers the tiles' heightmaps along every waterway (Docs/Rivers.md).
-    // Idempotent because bank references come from the PRE-SPLIT SOURCE
-    // terrain (the un-carved original this component rides), never the
-    // live tiles: live sampling made re-runs RATCHET — at confluences and
-    // tight meanders a bank point lands inside another channel's carved
-    // zone, so each run lowered the refs and dug deeper (the second-run
-    // test caught 65k samples still moving). The source never carves, so
-    // targets are a pure function of features + source ground, the carve
-    // is min(current, bank − depth × profile), and re-running is a no-op.
-    // Seams hold because shared edge samples compute the same world-space
-    // target on both tiles. TerrainTiler.Split is the un-carve.
-    [ContextMenu("Carve Rivers")]
-    public void CarveRivers()
-    {
-        if (features == null)
-        {
-            Debug.LogError("MarchesDressing: no features asset assigned.");
-            return;
-        }
-        if (Application.isPlaying)
-        {
-            // Play-mode terrains are TerrainPads' session clones — a carve
-            // here would vanish on stop.
-            Debug.LogError("MarchesDressing: Carve Rivers is an edit-mode bake.");
-            return;
-        }
-        Terrain[] tiles = Ground.Tiles();
-        if (tiles.Length == 0)
-        {
-            Debug.LogError("MarchesDressing: no active terrain to carve.");
-            return;
-        }
-        FeaSet set = JsonUtility.FromJson<FeaSet>(features.text);
-        if (set.waters == null || set.waters.Length == 0)
-            return;
-
-        // Pass 1: all channel references, from the reference ground.
-        var stamps = new List<CarveStamp>();
-        foreach (Fea f in set.waters)
-        {
-            float w = Mathf.Max(1f, f.w);
-            float depth = CarveDepth(w), halfW = w * 0.5f, edge = BankEdge(w);
-            List<Vector3> line = Resample(Unflatten(f.p), 3f);
-            for (int i = 0; i < line.Count; i++)
-            {
-                float bank = ChannelRef(line, i, halfW);
-                stamps.Add(new CarveStamp { x = line[i].x, z = line[i].z,
-                    bank = bank, depth = depth, halfW = halfW, edge = edge });
-            }
-        }
-
-        long moved = 0;
-        foreach (Terrain t in tiles)
-            moved += CarveTile(t, stamps);
-        Debug.Log($"Rivers carved: {stamps.Count} channel samples,"
-            + $" {moved} heightmap samples lowered across {tiles.Length} tile(s).");
 #if UNITY_EDITOR
-        foreach (Terrain t in tiles)
-            EditorUtility.SetDirty(t.terrainData);
-        AssetDatabase.SaveAssets();
+        var asset = AssetDatabase.LoadAssetAtPath<TextAsset>(
+            MarchesBaker.RiverRefsPath);
+        return asset == null ? null
+            : JsonUtility.FromJson<MarchesBaker.RiverRefs>(asset.text);
+#else
+        return null;
 #endif
-    }
-
-    static long CarveTile(Terrain t, List<CarveStamp> stamps)
-    {
-        TerrainData d = t.terrainData;
-        int res = d.heightmapResolution;
-        Vector3 o = t.transform.position, size = d.size;
-        float cell = size.x / (res - 1);
-        var target = new float[res, res];
-        var touched = new bool[res, res];
-        bool any = false;
-        foreach (CarveStamp s in stamps)
-        {
-            if (s.x < o.x - s.edge || s.x > o.x + size.x + s.edge
-                || s.z < o.z - s.edge || s.z > o.z + size.z + s.edge)
-                continue;
-            int x0 = Mathf.Max(0, Mathf.FloorToInt((s.x - s.edge - o.x) / cell));
-            int x1 = Mathf.Min(res - 1, Mathf.CeilToInt((s.x + s.edge - o.x) / cell));
-            int z0 = Mathf.Max(0, Mathf.FloorToInt((s.z - s.edge - o.z) / cell));
-            int z1 = Mathf.Min(res - 1, Mathf.CeilToInt((s.z + s.edge - o.z) / cell));
-            for (int iz = z0; iz <= z1; iz++)
-            {
-                float wz = o.z + iz * cell;
-                for (int ix = x0; ix <= x1; ix++)
-                {
-                    float wx = o.x + ix * cell;
-                    float dx = wx - s.x, dz = wz - s.z;
-                    float dist = Mathf.Sqrt(dx * dx + dz * dz);
-                    if (dist >= s.edge)
-                        continue;
-                    float profile = dist <= s.halfW ? 1f
-                        : 1f - Mathf.SmoothStep(0f, 1f,
-                            Mathf.InverseLerp(s.halfW, s.edge, dist));
-                    float cand = s.bank - s.depth * profile;
-                    if (!touched[iz, ix] || cand < target[iz, ix])
-                    {
-                        target[iz, ix] = cand;
-                        touched[iz, ix] = true;
-                    }
-                    any = true;
-                }
-            }
-        }
-        if (!any)
-            return 0;
-        float[,] h = d.GetHeights(0, 0, res, res);
-        long moved = 0;
-        for (int iz = 0; iz < res; iz++)
-            for (int ix = 0; ix < res; ix++)
-            {
-                if (!touched[iz, ix])
-                    continue;
-                float norm = (target[iz, ix] - o.y) / size.y;
-                // Epsilon = one 16-bit heightmap quantum: SetHeights rounds
-                // to 1/65535 steps, and half of all writes round UP — a bare
-                // < re-triggered on those forever (44k phantom "moves" per
-                // re-run) while the ground never actually changed.
-                if (norm < h[iz, ix] - 1f / 65535f)
-                {
-                    h[iz, ix] = Mathf.Max(0f, norm);
-                    moved++;
-                }
-            }
-        if (moved > 0)
-            d.SetHeights(0, 0, h);
-        return moved;
     }
 
     // ---- Water ribbons -----------------------------------------------------
@@ -371,17 +231,47 @@ public class MarchesDressing : MonoBehaviour
     {
         if (feas == null)
             return 0;
+        MarchesBaker.RiverRefs refs = LoadRiverRefs();
+        if (refs == null || refs.waters == null
+            || refs.waters.Length != feas.Length)
+        {
+            // The refs are the bake's stored fact; deriving levels from
+            // CARVED ground here would re-invent the ratchet. Refuse
+            // loudly rather than build wrong water.
+            Debug.LogError("MarchesDressing: river refs missing or stale"
+                + $" ({MarchesBaker.RiverRefsPath}) — run MarchesBaker's"
+                + " Bake Tiles first; skipping water ribbons.");
+            return 0;
+        }
         var group = new GameObject("Waters").transform;
         group.SetParent(root, false);
         var cells = new Dictionary<(int, int), CellBuilder>();
         float cellSize = Mathf.Max(50f, waterCellSize);
         int built = 0;
 
-        foreach (Fea f in feas)
+        for (int fi = 0; fi < feas.Length; fi++)
         {
-            List<Vector3> line = Resample(Unflatten(f.p), sampleStep);
+            Fea f = feas[fi];
+            // The SAME resampling the baker used for the refs — the
+            // features asset is identical, so the counts align exactly.
+            List<Vector3> line = Resample(Unflatten(f.p), MarchesBaker.CarveStep);
+            float[] channelRefs = refs.waters[fi]?.refs;
             if (line.Count < 2)
                 continue;
+            if (channelRefs == null || channelRefs.Length != line.Count)
+            {
+                Debug.LogError($"MarchesDressing: river refs for waterway {fi}"
+                    + $" carry {channelRefs?.Length ?? 0} samples, the line"
+                    + $" {line.Count} — stale bake, skipping this waterway.");
+                continue;
+            }
+            // The carve thalweg-snaps its stations off the OSM line onto
+            // the real channel; the water must follow the channel
+            // AS-BUILT, so the saved station positions override the map.
+            float[] snapped = refs.waters[fi].pts;
+            if (snapped != null && snapped.Length == line.Count * 2)
+                for (int i = 0; i < line.Count; i++)
+                    line[i] = new Vector3(snapped[i * 2], 0f, snapped[i * 2 + 1]);
             float w = Mathf.Max(1f, f.w);
             float depth = CarveDepth(w);
             float halfWChannel = w * 0.5f;
@@ -394,8 +284,7 @@ public class MarchesDressing : MonoBehaviour
             // freeboard still tucks it inside the notch up close.
             var ys = new float[line.Count];
             for (int i = 0; i < line.Count; i++)
-                ys[i] = ChannelRef(line, i, halfWChannel)
-                    - depth * (1f - waterFill);
+                ys[i] = channelRefs[i] - depth * (1f - waterFill);
             for (int pass = 0; pass < 2; pass++)
                 for (int i = 1; i < line.Count - 1; i++)
                     ys[i] = (ys[i - 1] + ys[i] + ys[i + 1]) / 3f;
@@ -533,7 +422,7 @@ public class MarchesDressing : MonoBehaviour
         return kept;
     }
 
-    static List<Vector3> Unflatten(float[] p)
+    public static List<Vector3> Unflatten(float[] p)
     {
         var pts = new List<Vector3>(p.Length / 2);
         for (int i = 0; i + 1 < p.Length; i += 2)
@@ -543,7 +432,9 @@ public class MarchesDressing : MonoBehaviour
 
     // Every original vertex survives (a winding lane keeps its shape); long
     // segments are subdivided so the ribbon follows the ground between them.
-    static List<Vector3> Resample(List<Vector3> pts, float step)
+    // PUBLIC because the baker's carve and the ribbons here must resample
+    // identically — one definition is what makes the refs index-align.
+    public static List<Vector3> Resample(List<Vector3> pts, float step)
     {
         var outPts = new List<Vector3>();
         for (int i = 0; i < pts.Count - 1; i++)
@@ -663,6 +554,8 @@ public class MarchesDressing : MonoBehaviour
                 }
             }
 
+        PlantHedgeBanks(set, Add, NearRoad);
+
         if (total > maxTreeInstances)
         {
             float keep = (float)maxTreeInstances / total;
@@ -703,6 +596,120 @@ public class MarchesDressing : MonoBehaviour
             t.treeMaximumFullLODCount = 200000;
         }
         return total;
+    }
+
+    // The hedgebank pass: the LIDAR keeps the field-boundary earthworks
+    // but strips the hedges that explain them, so naked banks read as
+    // artifacts. Walk each FINE tile's heightmap (banks don't survive
+    // the coarse tiles' box-average, so those skip by construction),
+    // flag samples standing proud of the surrounding ring, and plant a
+    // bush on a loose lattice along the crests. Keep-outs: roads and
+    // waters (the shared cell mask — carved channel banks read as
+    // crests too, and rivers must not grow a hedge), woods (dense trees
+    // already; bushes there just burn the instance cap) and castle
+    // grounds. Deterministic like every scatter here.
+    int PlantHedgeBanks(FeaSet set,
+        Action<float, float, int, float> add, Func<float, float, bool> nearRoad)
+    {
+        if (hedgeBankSignal <= 0f || maxHedgeInstances <= 0)
+            return 0;
+
+        var woodPolys = new List<(List<Vector3> poly, float minX, float maxX, float minZ, float maxZ)>();
+        if (set.woods != null)
+            foreach (Fea wf in set.woods)
+            {
+                List<Vector3> poly = Unflatten(wf.p);
+                float minX = float.MaxValue, maxX = float.MinValue;
+                float minZ = float.MaxValue, maxZ = float.MinValue;
+                foreach (Vector3 v in poly)
+                {
+                    minX = Mathf.Min(minX, v.x); maxX = Mathf.Max(maxX, v.x);
+                    minZ = Mathf.Min(minZ, v.z); maxZ = Mathf.Max(maxZ, v.z);
+                }
+                woodPolys.Add((poly, minX, maxX, minZ, maxZ));
+            }
+        var castles = new List<Vector2>();
+        foreach (CastleSite s in FindObjectsByType<CastleSite>(FindObjectsSortMode.None))
+            castles.Add(s.PositionXZ);
+        List<List<Vector3>> grounds = castles.Count > 0
+            ? CastleGrounds.Outlines(castles) : new List<List<Vector3>>();
+
+        bool Excluded(float x, float z)
+        {
+            if (nearRoad(x, z))
+                return true;
+            var p = new Vector3(x, 0f, z);
+            foreach ((List<Vector3> poly, float minX, float maxX, float minZ, float maxZ) in woodPolys)
+                if (x >= minX && x <= maxX && z >= minZ && z <= maxZ
+                    && SlabTile.Contains(poly, p))
+                    return true;
+            foreach (List<Vector3> g in grounds)
+                if (SlabTile.Contains(g, p))
+                    return true;
+            return false;
+        }
+
+        // Collect first, thin after: the cap used to be first-come in
+        // tile order, which spent the whole budget on the southern
+        // tiles and left Grosmont's row bare (caught on the first
+        // hand-test). A global hash-thin spreads the survivors evenly.
+        var cands = new List<(float x, float z, float s)>();
+        foreach (Terrain t in Ground.Tiles())
+        {
+            TerrainData td = t.terrainData;
+            int res = td.heightmapResolution;
+            float cell = td.size.x / (res - 1);
+            if (cell > 5f)
+                continue;   // coarse tile — the box-average smeared the banks away
+            float[,] h = td.GetHeights(0, 0, res, res);
+            float sy = td.size.y;
+            Vector3 origin = t.transform.position;
+            int rc = Mathf.Max(1, Mathf.RoundToInt(hedgeBankRing / cell));
+            int rd = Mathf.Max(1, Mathf.RoundToInt(hedgeBankRing * 0.707f / cell));
+            int stride = Mathf.Max(1, Mathf.RoundToInt(hedgeBushStep / cell));
+            for (int iz = rc; iz < res - rc; iz += stride)
+                for (int ix = rc; ix < res - rc; ix += stride)
+                {
+                    float h0 = h[iz, ix] * sy;
+                    float sum = 0f, lo = float.MaxValue, hi = float.MinValue;
+                    void Ring(int dz, int dx)
+                    {
+                        float v = h[iz + dz, ix + dx] * sy;
+                        sum += v;
+                        lo = Mathf.Min(lo, v);
+                        hi = Mathf.Max(hi, v);
+                    }
+                    Ring(rc, 0); Ring(-rc, 0); Ring(0, rc); Ring(0, -rc);
+                    Ring(rd, rd); Ring(rd, -rd); Ring(-rd, rd); Ring(-rd, -rd);
+                    if (h0 - sum / 8f < hedgeBankSignal)
+                        continue;
+                    // A ring spanning metres is a hillside or a motte,
+                    // not a hedgebank — leave it bare.
+                    if (hi - lo > 4f)
+                        continue;
+                    float wx = origin.x + ix * cell
+                        + (Hash01(ix, iz, 57) - 0.5f) * cell;
+                    float wz = origin.z + iz * cell
+                        + (Hash01(ix, iz, 58) - 0.5f) * cell;
+                    if (Excluded(wx, wz))
+                        continue;
+                    cands.Add((wx, wz, 0.6f + Hash01(ix, iz, 59) * 0.5f));
+                }
+        }
+        float keep = cands.Count > maxHedgeInstances
+            ? (float)maxHedgeInstances / cands.Count : 1f;
+        int planted = 0;
+        foreach ((float x, float z, float s) in cands)
+        {
+            if (keep < 1f && Hash01(x, z, 61) >= keep)
+                continue;
+            add(x, z, 1, s);
+            planted++;
+        }
+        Debug.Log($"Marches dressing: {planted} hedgebank bushes from"
+            + $" {cands.Count} bank candidates on the fine tiles"
+            + (keep < 1f ? $" (thinned ×{keep:F2} to the {maxHedgeInstances} cap)." : "."));
+        return planted;
     }
 
     void ScatterInPoly(List<Vector3> poly, float minX, float maxX,
@@ -746,10 +753,12 @@ public class MarchesDressing : MonoBehaviour
 
     // ---- Road splat --------------------------------------------------------
 
-    // The grass/dirt slope thresholds — TerrainGenerator's rule, read from
-    // the component wherever it rides (the deactivated pre-split source
-    // included), TerrainPads' defaults otherwise.
-    static (float start, float full) SlopeNumbers()
+    // The grass/dirt slope thresholds — TerrainGenerator's rule where a
+    // scene carries one (Spiš), the shared defaults otherwise (the
+    // Marches has no TerrainGenerator since the BNG rebuild; 24/38 are
+    // the values its source terrain used). Public: the baker's initial
+    // slope paint uses the same numbers.
+    public static (float start, float full) SlopeNumbers()
     {
         var gen = FindAnyObjectByType<TerrainGenerator>(FindObjectsInactive.Include);
         return (gen != null ? gen.dirtSlopeStart : 24f,
@@ -786,15 +795,33 @@ public class MarchesDressing : MonoBehaviour
         }
         var bedLines = new List<(List<Vector3> pts, float core, float edge)>();
         if (set.waters != null)
-            foreach (Fea f in set.waters)
+        {
+            // The mud must lie under the water: where the carve snapped
+            // its stations onto the real channel, the bed paint follows
+            // the saved as-built stations, not the OSM map line.
+            MarchesBaker.RiverRefs bedRefs = LoadRiverRefs();
+            for (int fi = 0; fi < set.waters.Length; fi++)
             {
+                Fea f = set.waters[fi];
                 float w = Mathf.Max(1f, f.w);
                 float halfW = w * 0.5f, edge = BankEdge(w);
+                List<Vector3> pts = Resample(Unflatten(f.p), 1.5f);
+                float[] snapped = bedRefs != null && bedRefs.waters != null
+                    && fi < bedRefs.waters.Length
+                    ? bedRefs.waters[fi]?.pts : null;
+                if (snapped != null && snapped.Length >= 4)
+                {
+                    var chan = new List<Vector3>(snapped.Length / 2);
+                    for (int i = 0; i + 1 < snapped.Length; i += 2)
+                        chan.Add(new Vector3(snapped[i], 0f, snapped[i + 1]));
+                    pts = Resample(chan, 1.5f);
+                }
                 // Full strength past the water ribbon's own edge so no
                 // grass survives underwater; fade dies at the bank line.
-                bedLines.Add((Resample(Unflatten(f.p), 1.5f),
+                bedLines.Add((pts,
                     halfW + (edge - halfW) * 0.6f + 0.5f, edge + 1f));
             }
+        }
 
         foreach (Terrain t in tiles)
         {
@@ -802,7 +829,7 @@ public class MarchesDressing : MonoBehaviour
             TerrainLayer[] layers = data.terrainLayers;
             if (layers == null || layers.Length < 2)
                 continue;   // not the grass/dirt convention — leave alone
-            int res = Mathf.Max(64, splatResolution);
+            int res = Mathf.Max(64, data.alphamapResolution);
             Vector3 o = t.transform.position;
             Vector3 size = data.size;
             float pxPerM = (res - 1) / size.x;
@@ -848,11 +875,26 @@ public class MarchesDressing : MonoBehaviour
             var alphas = new float[res, res, 4];
             for (int iz = 0; iz < res; iz++)
             {
+                float wz = o.z + iz / pxPerM;
                 for (int ix = 0; ix < res; ix++)
                 {
+                    float wx = o.x + ix / pxPerM;
                     float steep = data.GetSteepness(
                         (float)ix / (res - 1), (float)iz / (res - 1));
                     float dirt = Mathf.InverseLerp(slopeStart, slopeFull, steep);
+                    // Field mottle: two octaves of world-space noise
+                    // lean the grass/dirt mix around so open country
+                    // isn't one billiard-table material — the uniform
+                    // grass made every LIDAR crease read as an artifact.
+                    // World-anchored, so tile seams can't show.
+                    if (splatMottle > 0f)
+                    {
+                        float m = Mathf.PerlinNoise(
+                                wx * 0.011f + 31.7f, wz * 0.011f + 12.3f) * 0.65f
+                            + Mathf.PerlinNoise(
+                                wx * 0.047f + 5.1f, wz * 0.047f + 77.9f) * 0.35f;
+                        dirt = Mathf.Clamp01(dirt + (m - 0.5f) * splatMottle);
+                    }
                     float bed = bedMask[iz, ix];
                     float road = roadMask[iz, ix] * (1f - bed);
                     float rem = 1f - bed - road;

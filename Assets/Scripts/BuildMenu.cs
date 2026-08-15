@@ -525,7 +525,8 @@ public class BuildMenu : MonoBehaviour
     // The helper panel on the left edge above the bar: gesture helpers
     // first (Curved bends the wall drag; Offset arms the parallel-wall
     // tool; Circle and Rectangle turn the drag into a whole figure, for
-    // walls AND rooms), then session options like the top lock. The
+    // walls, rooms AND foundations), then session options like the top
+    // lock. The
     // shape checkboxes are mutually exclusive — Update() keeps all of
     // them honest against the placement system's actual state.
     void CreateOptionsPanel(Transform parent)
