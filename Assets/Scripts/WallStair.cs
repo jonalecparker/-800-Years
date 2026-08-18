@@ -323,7 +323,7 @@ public class WallStair : MonoBehaviour
                 spec.tStart, spec.tEnd, width, baseStep);
             spec.bottomY = Mathf.Min(Mathf.Max(ground, baseFrom), floor);
             if (WallEdge.BuildSpecFrame(ref spec, sp.s, sp.c, sp.e, width,
-                baseWallHeight, table))
+                baseWallHeight, table, false))
                 specs.Add(spec);
         }
     }

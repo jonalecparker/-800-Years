@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
@@ -62,7 +62,23 @@ public static class CastleSave
     // through WorldFromOldWorld, every finite absolute Y lifted to ODN.
     // Spiš saves — same old terrain name, but loaded into the scene
     // whose BaseName still matches — never migrate.
-    const int Version = 8;
+    // 9: bridges (2026-08-16) — a rider like the stair: ends, planes,
+    // width and STAMPED pier footings travel. Pre-v9 saves simply have
+    // none.
+    // 10: buttresses (2026-08-16) — edge data like a doorway, so each
+    // edge carries a list of them (parameter, side, absolute top). Pre-v10
+    // saves simply have none: the list deserializes empty and every wall
+    // stands exactly as it did.
+    // 11: corner buttresses (2026-08-16) — a clasping pier belongs to two
+    // walls at once and so to neither, and lives on the NODE (bearing,
+    // absolute top), where this graph has always kept joint geometry.
+    // Pre-v11 saves have none.
+    // 12: crenellations (2026-08-17) — a battlement is a SPAN on the edge
+    // (two parameters), so each edge carries a list of them. Nothing about
+    // the merlons travels: their number and spacing are derived from the
+    // span, so a save states the stretch and the load lays it out again
+    // identically. Pre-v12 saves have none.
+    const int Version = 12;
 
     // Lifting by WorldFrame.LegacyLift keeps every structure's relation
     // to the ground at its site; the re-foot on the new LIDAR ground
@@ -82,12 +98,42 @@ public static class CastleSave
         public float x, z;
         public float baseY;
         public float radius;
+        public List<CornerData> buttresses = new List<CornerData>();
+        public List<NodeCrenelData> crenels = new List<NodeCrenelData>();
+    }
+
+    [Serializable]
+    class CornerData
+    {
+        public float bearing, topY;
     }
 
     [Serializable]
     class OpeningData
     {
         public float t, width, head, sill;
+    }
+
+    [Serializable]
+    class ButtressData
+    {
+        public float t, side, topY;
+    }
+
+    [Serializable]
+    class CrenelData
+    {
+        public float t0, t1;
+        // Zero means "the default" — which is also what a v12 file written
+        // before these two existed deserializes to, so the omitted-field
+        // trap is a safe answer here rather than a silent change.
+        public float height, gap;
+    }
+
+    [Serializable]
+    class NodeCrenelData
+    {
+        public float height;
     }
 
     [Serializable]
@@ -101,6 +147,8 @@ public static class CastleSave
         // every pre-v5 wall was, so missing fields mean what they meant.
         public int kind;
         public List<OpeningData> openings = new List<OpeningData>();
+        public List<ButtressData> buttresses = new List<ButtressData>();
+        public List<CrenelData> crenels = new List<CrenelData>();
     }
 
     [Serializable]
@@ -158,6 +206,24 @@ public static class CastleSave
         public float size, yaw;
     }
 
+    // A bridge: two stated ends with their deck-top planes, the width,
+    // and the piers exactly as the commit stamped them — footings are
+    // stored facts, never re-derived from whatever the ground is now.
+    [Serializable]
+    class PierData
+    {
+        public Vector3 pos;
+        public float bottomY;
+    }
+
+    [Serializable]
+    class BridgeData
+    {
+        public Vector3 start, end;
+        public float startY, endY, width;
+        public List<PierData> piers = new List<PierData>();
+    }
+
     [Serializable]
     class PlotData
     {
@@ -183,6 +249,7 @@ public static class CastleSave
         public List<EdgeData> edges = new List<EdgeData>();
         public List<StairData> stairs = new List<StairData>();
         public List<SlabData> slabs = new List<SlabData>();
+        public List<BridgeData> bridges = new List<BridgeData>();
         public List<PlotData> plots = new List<PlotData>();
     }
 
@@ -287,13 +354,18 @@ public static class CastleSave
             if (n == null)
                 continue;
             nodeIndex[n] = data.nodes.Count;
-            data.nodes.Add(new NodeData
+            var nd = new NodeData
             {
                 x = n.point.x,
                 z = n.point.z,
                 baseY = Pack(n.baseY),
                 radius = n.radius,
-            });
+            };
+            foreach (WallNode.Buttress b in n.buttresses)
+                nd.buttresses.Add(new CornerData { bearing = b.bearing, topY = b.topY });
+            foreach (WallNode.Crenel c in n.crenels)
+                nd.crenels.Add(new NodeCrenelData { height = c.height });
+            data.nodes.Add(nd);
         }
 
         var edgeIndex = new Dictionary<WallEdge, int>();
@@ -324,6 +396,21 @@ public static class CastleSave
                     width = o.width,
                     head = o.head,
                     sill = Pack(o.sill),
+                });
+            foreach (WallEdge.Buttress b in e.buttresses)
+                ed.buttresses.Add(new ButtressData
+                {
+                    t = b.t,
+                    side = b.side,
+                    topY = b.topY,
+                });
+            foreach (WallEdge.Crenel c in e.crenels)
+                ed.crenels.Add(new CrenelData
+                {
+                    t0 = c.t0,
+                    t1 = c.t1,
+                    height = c.height,
+                    gap = c.gap,
                 });
             edgeIndex[e] = data.edges.Count;
             data.edges.Add(ed);
@@ -377,6 +464,23 @@ public static class CastleSave
                 sd.wells.Add(wd);
             }
             data.slabs.Add(sd);
+        }
+
+        foreach (Bridge b in Bridge.All)
+        {
+            if (b == null)
+                continue;
+            var bd = new BridgeData
+            {
+                start = b.start,
+                end = b.end,
+                startY = b.startY,
+                endY = b.endY,
+                width = b.width,
+            };
+            foreach (Bridge.Pier p in b.piers)
+                bd.piers.Add(new PierData { pos = p.pos, bottomY = p.bottomY });
+            data.bridges.Add(bd);
         }
 
         return data;
@@ -436,7 +540,9 @@ public static class CastleSave
 
         Apply(data, parent, material, palisadeMaterial);
         BuildLog.Add($"Loaded — {data.edges.Count} walls, {data.stairs.Count} stairs,"
-            + $" {data.slabs.Count} slabs from {Path.GetFileName(path)}.");
+            + $" {data.slabs.Count} slabs"
+            + (data.bridges.Count > 0 ? $", {data.bridges.Count} bridges" : "")
+            + $" from {Path.GetFileName(path)}.");
         return true;
     }
 
@@ -582,8 +688,23 @@ public static class CastleSave
 
         var nodes = new List<WallNode>();
         foreach (NodeData nd in data.nodes)
-            nodes.Add(WallNode.Create(parent, new Vector3(nd.x, 0f, nd.z),
-                Unpack(nd.baseY), nd.radius, material));
+        {
+            WallNode node = WallNode.Create(parent, new Vector3(nd.x, 0f, nd.z),
+                Unpack(nd.baseY), nd.radius, material);
+            // Stated before any member arrives; the node's own RebuildMesh
+            // (run once the edges are back) is what raises the pier.
+            foreach (CornerData cd in nd.buttresses)
+                node.buttresses.Add(new WallNode.Buttress
+                {
+                    bearing = cd.bearing,
+                    topY = cd.topY,
+                });
+            // Stated before the members arrive, like the corner pier: the
+            // RebuildMesh that follows every edge's creation raises both.
+            foreach (NodeCrenelData ncd in nd.crenels)
+                node.crenels.Add(new WallNode.Crenel { height = ncd.height });
+            nodes.Add(node);
+        }
 
         var edges = new List<WallEdge>();
         foreach (EdgeData ed in data.edges)
@@ -601,18 +722,31 @@ public static class CastleSave
                 ed.height, ed.thickness, ed.baseWallHeight, edgeMaterial,
                 ed.targetSectionLength, ed.baseStep, Unpack(ed.fixedTopY),
                 Unpack(ed.baseY), ed.skirt, kind);
-            if (ed.openings.Count > 0)
-            {
-                foreach (OpeningData od in ed.openings)
-                    edge.openings.Add(new WallEdge.Opening
-                    {
-                        t = od.t,
-                        width = od.width,
-                        head = od.head,
-                        sill = Unpack(od.sill),
-                    });
+            foreach (OpeningData od in ed.openings)
+                edge.openings.Add(new WallEdge.Opening
+                {
+                    t = od.t,
+                    width = od.width,
+                    head = od.head,
+                    sill = Unpack(od.sill),
+                });
+            foreach (ButtressData bd in ed.buttresses)
+                edge.buttresses.Add(new WallEdge.Buttress
+                {
+                    t = bd.t,
+                    side = bd.side,
+                    topY = bd.topY,
+                });
+            foreach (CrenelData cd in ed.crenels)
+                edge.crenels.Add(new WallEdge.Crenel
+                {
+                    t0 = cd.t0,
+                    t1 = cd.t1,
+                    height = cd.height,
+                    gap = cd.gap,
+                });
+            if (ed.openings.Count > 0 || ed.buttresses.Count > 0 || ed.crenels.Count > 0)
                 edge.Rebuild();
-            }
             edges.Add(edge);
         }
 
@@ -675,6 +809,15 @@ public static class CastleSave
                 sd.isFoundation, wells);
         }
 
+        foreach (BridgeData bd in data.bridges)
+        {
+            var piers = new List<Bridge.Pier>();
+            foreach (PierData pd in bd.piers)
+                piers.Add(new Bridge.Pier { pos = pd.pos, bottomY = pd.bottomY });
+            Bridge.Create(parent, material, bd.start, bd.end,
+                bd.startY, bd.endY, bd.width, piers);
+        }
+
         Physics.SyncTransforms();
     }
 
@@ -687,6 +830,9 @@ public static class CastleSave
     // own nodes; the final node sweep catches only free-standing litter.
     static void Clear()
     {
+        foreach (Bridge b in new List<Bridge>(Bridge.All))
+            if (b != null)
+                UnityEngine.Object.DestroyImmediate(b.gameObject);
         foreach (WallStair s in new List<WallStair>(WallStair.All))
             if (s != null)
                 UnityEngine.Object.DestroyImmediate(s.gameObject);

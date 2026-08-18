@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 using UnityEngine.InputSystem;
 
 // Two ways to be in this world.
@@ -174,6 +174,7 @@ public class WalkMode : MonoBehaviour
 
         fallSpeed = 0f;
         lastFooting = transform.position;
+        PinBody();
 
         // The controller is enabled AFTER the teleport: it owns the
         // transform while it's on, and moving a live one is how you end
@@ -227,6 +228,33 @@ public class WalkMode : MonoBehaviour
         yaw += delta.x * lookSensitivity;
         pitch = Mathf.Clamp(pitch - delta.y * lookSensitivity, -89f, 89f);
         transform.rotation = Quaternion.Euler(pitch, yaw, 0f);
+        PinBody();
+    }
+
+    // Keeps the body under the lens whatever the head is doing.
+    //
+    // The capsule hangs below the camera by CharacterController.center —
+    // and `center` is a LOCAL offset, so pitching the camera swung the
+    // whole body on a pendulum about the eyes. Measured: at 85 degrees of
+    // look-up the capsule stood 0.80m FORWARD of the lens with its feet
+    // 0.73m higher than they should be (−0.97 instead of −1.70), and
+    // looking down swung it the same distance BACKWARD. So where you could
+    // walk depended on where you were looking, and looking up was a way
+    // past an obstruction that stopped you when level. (It was NOT the
+    // cause of the stairs not being climbable — that was MoveSwept's
+    // problem, below — but it made the symptom look angle-dependent, which
+    // sent the diagnosis the wrong way for a while.)
+    //
+    // The capsule itself never tilts (its bounds stay 0.70 x 1.80 x 0.70 at
+    // every pitch — PhysX keeps its own up axis), so countering the
+    // rotation on the offset alone is exact: the world-space capsule ends
+    // up in the one place it was always meant to be.
+    void PinBody()
+    {
+        if (controller == null)
+            return;
+        controller.center = Quaternion.Inverse(transform.rotation)
+            * new Vector3(0f, bodyHeight * 0.5f - eyeHeight, 0f);
     }
 
     void Step(Keyboard keyboard)
@@ -259,7 +287,7 @@ public class WalkMode : MonoBehaviour
             fallSpeed += gravity * Time.deltaTime;
         }
 
-        controller.Move((wish * speed + Vector3.up * fallSpeed) * Time.deltaTime);
+        MoveSwept((wish * speed + Vector3.up * fallSpeed) * Time.deltaTime);
 
         // Past the terrain edge there is nothing below to land on, so the
         // fall never ends. Put them back where they last had footing.
@@ -271,6 +299,40 @@ public class WalkMode : MonoBehaviour
             Physics.SyncTransforms();
             controller.enabled = true;
         }
+    }
+
+    // A frame's travel, taken in bites no bigger than a stair tread.
+    //
+    // CharacterController.Move is ONE discrete sweep, so a move longer than
+    // the obstacle it is climbing can wedge on that obstacle instead of
+    // stepping over it. At the scene's 10 m/s and the editor's ~17 fps a
+    // single frame carries the walker 0.58m into a flight of 0.249m treads
+    // — two and a bit treads in one sweep — and the controller jams on a
+    // tread nose. That is why the stall was intermittent and looked like it
+    // depended on where you were looking: whether a frame lands on a nose
+    // or on a tread is luck, and turning the head is what changes the
+    // approach enough to shake it loose.
+    //
+    // Measured on Grosmont's 33-step flight, driving the real controller
+    // from the foot of the stair: one Move per frame NEVER reached the top
+    // at 17 fps (stuck for 187 straight frames) and never got off the first
+    // step at running speed, while at 60 fps — the same 0.166m per sweep
+    // the old 2.8 m/s walk gave at 17 fps — it climbed cleanly. Capped, it
+    // reached the top at every speed and every frame rate with no stall at
+    // all. Total displacement per frame is unchanged, so nothing about the
+    // feel of walking moves; only the number of sweeps it is cut into.
+    //
+    // The cap is comfortably under a tread. The ceiling of 24 bounds the
+    // cost of a pathological frame — a long editor hitch at running speed —
+    // at which point a metre of overshoot is the least of it.
+    const float MaxSweep = 0.15f;
+
+    void MoveSwept(Vector3 delta)
+    {
+        int sweeps = Mathf.Clamp(Mathf.CeilToInt(delta.magnitude / MaxSweep), 1, 24);
+        Vector3 slice = delta / sweeps;
+        for (int i = 0; i < sweeps; i++)
+            controller.Move(slice);
     }
 
     // The surface under a point: masonry, deck, stair or terrain,

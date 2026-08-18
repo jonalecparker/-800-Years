@@ -24,6 +24,21 @@ public class CastleSite : MonoBehaviour
     void OnEnable() { All.Add(this); }
     void OnDisable() { All.Remove(this); }
 
+    // A marker is a GEOREFERENCE, not a building: it must never catch a
+    // ray or trip the walker. The scene authored these as boxes to be
+    // draggable in the editor, and their colliders survived their
+    // renderers being hidden — leaving three invisible 6 x 30 x 6m solids,
+    // one of them standing in the middle of Grosmont, blocking the walker
+    // on his own stairs and swallowing the wall tools' first hit. Killed
+    // here rather than in the scene so a marker added later cannot bring
+    // one back; edit mode keeps its collider, which is what makes the
+    // marker selectable in the Scene view.
+    void Awake()
+    {
+        foreach (Collider c in GetComponentsInChildren<Collider>(true))
+            c.enabled = false;
+    }
+
     // The marker's editor Y is approximate; the terrain's is the truth.
     void Start()
     {

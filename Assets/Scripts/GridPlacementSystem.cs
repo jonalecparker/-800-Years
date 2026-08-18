@@ -42,7 +42,10 @@ public class GridPlacementSystem : MonoBehaviour
     public float curveBulgeStep = 0.5f;
     // Existing nodes within this range of the cursor grab a new wall's
     // endpoint, so walls chain into networks. Hold Alt to place freely.
-    public float endpointSnapRadius = 0.75f;
+    // Every other snap reach in the tool is stated against this one or
+    // doubled alongside it (2026-08-16, the user's call), so grabbing
+    // stays one decision rather than a dozen tuning numbers.
+    public float endpointSnapRadius = 1.5f;
 
     [Header("Stairs")]
     // Fixed for now rather than scrolled: the wheel already carries four
@@ -79,8 +82,12 @@ public class GridPlacementSystem : MonoBehaviour
     // instead of the top riding the ground section by section.
     public bool lockTopHeight;
 
-    public enum ToolMode { Build, Delete, Offset, Room, Stair, Door, Ground, Foundation, Floor, Land }
-    public ToolMode Mode { get; private set; } = ToolMode.Build;
+    // None is the empty hand — the session starts there, and nothing
+    // returns to it automatically: picking any tool leaves it for good
+    // until the next play run. Appended last so the named values keep
+    // their order.
+    public enum ToolMode { Build, Delete, Offset, Room, Stair, Door, Ground, Foundation, Floor, Land, None, Bridge, Buttress, Crenel }
+    public ToolMode Mode { get; private set; } = ToolMode.None;
 
     // What the wall-family tools build OF (the menu's Walls items pick
     // it): decides the committed edges' material and price, nothing else.
@@ -313,8 +320,12 @@ public class GridPlacementSystem : MonoBehaviour
     // match until the drag ends or the hover leaves the snap, then
     // matching re-arms.
     private bool heightOverride;
-    private (Vector3 center, float fromBearing, float toBearing)? activeAngle;
-    private LineRenderer angleLine;
+    // Every corner the live gesture is changing — at most two at once
+    // (the corner a leg grows from and the corner it lands on, or a
+    // closing leg's two ends). Cleared each frame like the other guides.
+    private readonly List<(Vector3 center, float fromBearing, float toBearing)> activeAngles =
+        new List<(Vector3 center, float fromBearing, float toBearing)>();
+    private readonly List<LineRenderer> angleLines = new List<LineRenderer>();
     private Mesh prefabMesh;
     private Material wallMaterial;
     private Material palisadeMaterial;
@@ -328,6 +339,12 @@ public class GridPlacementSystem : MonoBehaviour
     // Ctrl+scroll dials it in quarter steps (foundations only — a floor's
     // plane IS the wall top it connects to).
     private readonly List<Vector3> slabChain = new List<Vector3>();
+    // The outline each chain corner lies on (null for free corners),
+    // parallel to slabChain. When a leg's two ends share a host, the leg
+    // is a TRACE of that host's outline between them instead of a chord
+    // — filling the gap between two round pads follows their curves
+    // rather than cutting through them.
+    private readonly List<SlabTile> slabChainTiles = new List<SlabTile>();
     private float slabChainPlane;
     // Pre-anchor plane dial, quarter steps off the seated plane; folded
     // into slabChainPlane at the anchor click and reset on cancel/commit.
@@ -344,6 +361,15 @@ public class GridPlacementSystem : MonoBehaviour
     // walls, which no stamped shape does.
     private readonly List<Vector3> slabShapePts = new List<Vector3>();
     public int SlabChainCount => slabChain.Count;
+    // The bridge gesture: two ends, then the width. Each end's deck-top
+    // elevation is captured at its click (placement state expires — the
+    // hover of a later frame must not restate an earlier end's plane).
+    private Vector3? bridgeStart;
+    private float bridgeStartY;
+    private Vector3? bridgeEnd;
+    private float bridgeEndY;
+    private float bridgeWidth = 3f;
+    private Mesh bridgeGhostMesh;
     // The chain's fill ghost — one mesh, refilled in place each frame.
     private Mesh slabPreviewMesh;
     private readonly List<Vector3> slabTempPoly = new List<Vector3>();
@@ -545,12 +571,13 @@ public class GridPlacementSystem : MonoBehaviour
     // (where it starts, where it lands, how long it is, which curve).
     private readonly List<WallEdge.SectionSpec> stairSpecs = new List<WallEdge.SectionSpec>();
     private readonly List<Mesh> stairMeshes = new List<Mesh>();
-    // The wall under the cursor last frame — changing walls re-arms the
-    // camera's say over the climb direction.
+    // The wall under the cursor, for the hint panel's sake — it no longer
+    // governs the climb latch (that belongs to the tool).
     private WallEdge stairHost;
     // Which way the ghost climbs, and whether the player has taken that
     // decision off the camera by pressing R. Without the latch, orbiting
-    // the camera would silently undo an R press.
+    // the camera would silently undo an R press. The latch lives as long
+    // as the tool does — only SetMode(Stair) re-arms it.
     private bool stairForward = true;
     private bool stairHeld;
     // R's extra stop: the flight turns OUT from the wall face — a
@@ -611,6 +638,94 @@ public class GridPlacementSystem : MonoBehaviour
     // on level ground — offering a flight of stairs for that would be
     // noise. Three risers is the smallest thing worth building steps for.
     const float DoorStepsNeeded = WallStair.TargetRise * 3f;
+
+    // ---- Buttress tool ---------------------------------------------
+    // The same shape of tool again: point at a wall's face and the pier
+    // is there. The wall answers where its footing is and how high it
+    // stands; the one thing it can't answer is whether a low pilaster or
+    // a full pier was meant, so that — and only that — is dialed.
+    private Mesh buttressGhostMesh;
+    private WallEdge buttressHost;
+    private float buttressT;
+    private float buttressSide = 1f;
+    private float buttressBottomY;
+    private float buttressTopY;
+    private bool buttressBlocked;
+    private string buttressRefusal;
+    private long buttressPrice;
+    // Set when the cursor is claimed by a CORNER: the pier belongs to this
+    // node, facing this bearing, and the face-pier fields go unused.
+    private WallNode buttressCorner;
+    private float buttressBearing;
+    // How near a real corner the cursor has to be for the clasping block
+    // to claim it. Comfortably wider than the zone a face pier is refused
+    // in anyway, so there is no dead band between the two.
+    const float CornerGrab = 1.6f;
+    // Where the pier's TOP sits, as a drop below the wall's own top. Null
+    // = the wall answers, and its answer is the set-off. Stated as a drop
+    // rather than an elevation so it carries meaningfully from wall to
+    // wall — an absolute top dialed against a tall curtain would silently
+    // clamp against the next wall along. Latched to the TOOL like the
+    // stair's climb: picking the tool up again re-arms the default.
+    //
+    // It dials the TOP, not the pier's height (the user's call,
+    // 2026-08-16): the footing digs into the ground now, so overall height
+    // counts buried stone and is not a number anyone can aim with.
+    private float? buttressTopDrop;
+    private (Object owner, float where, float pad, float top)? lastButtressKey;
+    private Vector3 buttressGhostPos;
+    private float buttressGhostYaw;
+    // Masonry that must stand either side of a pier, so one can't hang
+    // half off the end of a wall. A joint the stone carries straight
+    // through needs none — the same question the doorway's jamb asks.
+    const float ButtressMargin = 0.15f;
+
+    // ---- Crenel tool -----------------------------------------------
+    // Press on a wall and drag along it, exactly like placing a wall. The
+    // run FOLLOWS THE MASONRY through the graph, so a drag from one corner
+    // of a ward to another crenellates every wall between them — most drags
+    // will run node to node, which is why a merlon lands ON each node
+    // crossed and takes that joint's own plan.
+    //
+    // The wall answers everything about the parapet except the two things
+    // that make one battlement read differently from another: how high the
+    // merlons stand (Ctrl + scroll) and how far apart they sit (Alt +
+    // scroll). Both are latched to the TOOL, like the stair's climb and the
+    // pier's top: picking the tool up again re-arms the defaults.
+    // HOVER rides a single merlon on the cursor, DRAGGING lays the run out,
+    // PENDING freezes it so the dials can be reached without the mouse
+    // button held down, and a second click builds it.
+    enum CrenelPhase { Hover, Dragging, Pending }
+    private CrenelPhase crenelPhase = CrenelPhase.Hover;
+    // The live end is sitting on something worth meeting exactly — a node,
+    // or the end of a battlement already standing. Tints the ghost gold,
+    // the same tell every other snap in this tool set gives.
+    private bool crenelSnapped;
+    // How near a node or an existing battlement's end pulls the run onto
+    // it, in metres of arc.
+    const float CrenelSnapArc = 1.2f;
+
+    private Mesh crenelGhostMesh;
+    private WallEdge crenelHost;
+    private float crenelT0;
+    private WallEdge crenelEndEdge;
+    private float crenelT1;
+    private float? crenelHeight;
+    private float? crenelGap;
+    // What a release would commit: a span per wall the run crosses, and a
+    // block per joint it passes through.
+    private readonly List<(WallEdge edge, WallEdge.Crenel span)> crenelSpans
+        = new List<(WallEdge, WallEdge.Crenel)>();
+    private readonly List<(WallNode node, WallNode.Crenel joint)> crenelJoints
+        = new List<(WallNode, WallNode.Crenel)>();
+    private bool crenelBlocked;
+    private string crenelRefusal;
+    private long crenelPrice;
+    private int crenelMerlons;
+    private (WallEdge a, float ta, WallEdge b, float tb, float h, float g)? lastCrenelKey;
+
+    float CrenelHeight => crenelHeight ?? WallCrenel.DefaultHeight;
+    float CrenelGap => crenelGap ?? WallCrenel.DefaultGap;
 
     const int CircleSegments = 8;
     const float MinCircleRadius = 1.5f;
@@ -717,14 +832,19 @@ public class GridPlacementSystem : MonoBehaviour
         }
 
         ClaimingScrollWheel = (Mode == ToolMode.Build && Shape == BuildShape.Curved && splineEnd.HasValue)
-            || (Mode == ToolMode.Offset && offsetSource != null);
+            || (Mode == ToolMode.Offset && offsetSource != null)
+            // The crenel tool's SPACING dial rides Alt, which nothing else
+            // has taken and which the camera would otherwise dolly through.
+            // Ctrl needs no claim — FreeFlyCamera already stands off it.
+            || (Mode == ToolMode.Crenel && keyboard != null
+                && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed));
 
         // Placement branches re-set the pending wall's center and bearing
         // each frame; anything else (delete mode, idle off-target) leaves
         // it unset and the guides disappear with it. Same for the snap
         // state and the corner-angle readout.
         guideCenter = null;
-        activeAngle = null;
+        activeAngles.Clear();
         dimGuides.Clear();
         alignLines.Clear();
         snapTint = false;
@@ -737,7 +857,11 @@ public class GridPlacementSystem : MonoBehaviour
         pendingNodeGhosts.Clear();
         ghostTopY = null;
 
-        if (Mode == ToolMode.Delete)
+        // The empty hand: no gesture, no ghost, no hover — the cursor is
+        // just a cursor until a tool is picked from the bar.
+        if (Mode == ToolMode.None)
+            HideGhosts();
+        else if (Mode == ToolMode.Delete)
             UpdateDelete(mouse, keyboard, ray, overUI);
         else if (Mode == ToolMode.Land)
             UpdateLand(mouse, ray, overUI);
@@ -750,9 +874,19 @@ public class GridPlacementSystem : MonoBehaviour
         // Nor does the door tool: point at a wall, the opening is there.
         else if (Mode == ToolMode.Door)
             UpdateDoor(mouse, ray, overUI);
+        // Nor does the buttress: point at a wall's face, the pier is there.
+        else if (Mode == ToolMode.Buttress)
+            UpdateButtress(mouse, keyboard, ray, overUI);
+        // The crenel tool has the one gesture the walls taught: press,
+        // optionally drag, release.
+        else if (Mode == ToolMode.Crenel)
+            UpdateCrenel(mouse, keyboard, ray, overUI);
         // Ground has one gesture for both jobs: drag a line on terrain.
         else if (Mode == ToolMode.Ground)
             UpdateGround(mouse, ray, overUI);
+        // The bridge: two ends, then the width — piers place themselves.
+        else if (Mode == ToolMode.Bridge)
+            UpdateBridge(mouse, keyboard, ray, overUI);
         // The slab tools draw an outline — a vertex chain, closed on its
         // own first corner, filled as one prism.
         else if (Mode == ToolMode.Foundation || Mode == ToolMode.Floor)
@@ -804,6 +938,21 @@ public class GridPlacementSystem : MonoBehaviour
         // a deliberate pick, exactly like Designate.
         if (mode == ToolMode.Ground)
             GroundTask = GroundAction.Path;
+        // Picking the Stair tool up again is the one thing that re-arms
+        // the camera's say over the climb: an R press outlives the wall it
+        // was made on, and outlives the cursor leaving the masonry.
+        if (mode == ToolMode.Stair)
+        {
+            stairHeld = false;
+            stairPerp = false;
+        }
+        // Same latch, same re-arming: a dialed pier height outlives the
+        // wall it was set against, but not picking the tool up again.
+        if (mode == ToolMode.Buttress)
+            buttressTopDrop = null;
+        // The crenel dials are deliberately NOT re-armed here (the user's
+        // call, 2026-08-17): a parapet dialed once is the parapet this
+        // castle has, and re-stating it on every wall is work already done.
         offsetSource = null;
         // The delete undo dies with its tool session: anything built
         // under another tool must never be rolled back by a stale one.
@@ -814,8 +963,11 @@ public class GridPlacementSystem : MonoBehaviour
         CancelDelete();
         CancelStair();
         CancelDoor();
+        CancelButtress();
+        CancelCrenel();
         CancelGround();
         CancelSlabChain();
+        CancelBridge();
     }
 
     // Everything the tool has on screen or half-finished, put away — run
@@ -831,13 +983,16 @@ public class GridPlacementSystem : MonoBehaviour
         CancelDelete();
         CancelStair();
         CancelDoor();
+        CancelButtress();
+        CancelCrenel();
         CancelGround();
         CancelSlabChain();
+        CancelBridge();
         HideGhosts();
         ClearPreviewMeshes();
 
         guideCenter = null;
-        activeAngle = null;
+        activeAngles.Clear();
         dimGuides.Clear();
         alignLines.Clear();
         pendingNodeGhosts.Clear();
@@ -899,7 +1054,12 @@ public class GridPlacementSystem : MonoBehaviour
     public void ModifierHints(out string context, out string hints)
     {
         var lines = new List<string>();
-        if (Mode == ToolMode.Delete)
+        if (Mode == ToolMode.None)
+        {
+            context = "No tool in hand";
+            lines.Add("Pick a tool from the bar to begin");
+        }
+        else if (Mode == ToolMode.Delete)
         {
             context = "Delete";
             lines.Add("Drag over walls — paint a selection");
@@ -962,6 +1122,73 @@ public class GridPlacementSystem : MonoBehaviour
             lines.Add("Click — cut it through");
             lines.Add("Delete tool, click a doorway's stone — fill it in");
         }
+        else if (Mode == ToolMode.Buttress)
+        {
+            if (buttressHost == null)
+                context = "Buttress · point at a wall";
+            else if (buttressBlocked)
+                context = "Buttress · won't stand here";
+            else
+                context = $"{(buttressCorner != null ? "Corner buttress" : "Buttress")}"
+                    + $" · top {buttressTopY:0.0#}m, {Estate.Format(buttressPrice)}";
+            lines.Add("Point at the face it should stand against");
+            lines.Add("Near a corner — it claspes the joint instead");
+            // The wall answers the range, exactly as it does for a stair's
+            // climb; the dial moves the top within it.
+            lines.Add(buttressTopDrop.HasValue
+                ? $"Ctrl + scroll — top ({buttressTopDrop.Value:0.0#}m below the wall)"
+                : "Ctrl + scroll — top (the wall answers)");
+            lines.Add("Click — build it");
+            lines.Add("Delete tool, click a buttress — take it down");
+        }
+        else if (Mode == ToolMode.Crenel)
+        {
+            if (crenelHost == null)
+                context = "Crenellate · point at a wall";
+            else if (crenelPhase == CrenelPhase.Hover)
+                context = "Crenellate · drag along the wall";
+            else if (crenelBlocked)
+                context = "Crenellate · " + crenelRefusal;
+            else
+                context = $"Crenellate · {crenelMerlons} merlons"
+                    + (crenelSpans.Count > 1 ? $" over {crenelSpans.Count} walls" : "")
+                    + $", {Estate.Format(crenelPrice)}"
+                    + (crenelPhase == CrenelPhase.Pending ? " · click to build" : "");
+            lines.Add(crenelPhase == CrenelPhase.Pending
+                ? "Click — build it (the dials still move it)"
+                : "Drag along the wall, then let go to set the run");
+            lines.Add("Across a joint — a merlon takes the corner's own shape");
+            lines.Add($"Ctrl + scroll — merlon height ({CrenelHeight:0.0#}m)");
+            lines.Add($"Alt + scroll — spacing ({CrenelGap:0.0#}m)");
+            lines.Add("Right-click or Esc — abandon the run");
+            lines.Add("Delete tool, click a battlement — take it down");
+        }
+        else if (Mode == ToolMode.Bridge)
+        {
+            context = !bridgeStart.HasValue ? "Bridge · near end"
+                : !bridgeEnd.HasValue ? "Bridge · far end"
+                : "Bridge · width";
+            if (!bridgeStart.HasValue)
+            {
+                lines.Add("Click ground, a wall top or a slab — the deck sits flush");
+            }
+            else if (!bridgeEnd.HasValue)
+            {
+                lines.Add("Click — set the far end");
+                lines.Add("Shift — hold the near end's height (a level deck)");
+            }
+            else
+            {
+                lines.Add("Pull sideways — the width; click — build it");
+                lines.Add("Alt — free width (no 0.5m steps)");
+            }
+            lines.Add($"Piers place themselves every {Bridge.MaxClearSpan:0}m");
+            if (bridgeStart.HasValue)
+            {
+                lines.Add("Right-click — step back");
+                lines.Add("Esc — cancel");
+            }
+        }
         else if (Mode == ToolMode.Foundation)
         {
             // The Circle/Rectangle checkboxes pick the figure here too.
@@ -997,7 +1224,10 @@ public class GridPlacementSystem : MonoBehaviour
                     ? "Click — start the outline (snapping an edge extends its level)"
                     : "Click — add a corner; close on the first corner to fill");
                 if (slabChain.Count > 0)
+                {
                     lines.Add("Shift — step the leg's angle (5°)");
+                    lines.Add("Two corners on one pad — the leg follows its outline");
+                }
                 lines.Add("Alt — ignore snaps");
             }
             lines.Add("Ctrl + scroll — plane up/down (¼m)");
@@ -1021,6 +1251,7 @@ public class GridPlacementSystem : MonoBehaviour
                 lines.Add("Click — add a corner; close on the first corner to fill");
                 lines.Add("Corners snap to wall corners at this plane");
                 lines.Add("Shift — step the leg's angle (5°)");
+                lines.Add("Two corners on one floor — the leg follows its outline");
                 lines.Add("A stairwell is drawn AROUND — leave it out of the outline");
                 lines.Add("Right-click — undo the last corner");
                 lines.Add("Esc — abandon the outline");
@@ -1059,12 +1290,16 @@ public class GridPlacementSystem : MonoBehaviour
                 context = $"{tool} · {figure} · anchor";
                 if (Shape == BuildShape.Rect)
                     lines.Add("Ctrl + click — centre the first side here");
+                if (Shape == BuildShape.Circle)
+                    lines.Add("A pad's centre grabs the anchor — concentric walls");
                 lines.Add("Alt — free placement (no snapping)");
                 lines.Add("Ctrl + scroll — wall height");
             }
             else if (Shape == BuildShape.Circle)
             {
                 context = $"{tool} · {figure} · radius";
+                lines.Add("Click — commit the circle");
+                lines.Add("A pad's rim grabs the radius — the face lands on the edge");
                 lines.Add("Alt — free radius (no 0.5m steps)");
                 lines.Add("Ctrl + scroll — wall height");
                 lines.Add("Esc — cancel the figure");
@@ -1099,7 +1334,7 @@ public class GridPlacementSystem : MonoBehaviour
             if (chaining)
             {
                 lines.Add("Right-click — undo the last corner");
-                lines.Add("Esc — abandon the chain");
+                lines.Add("Esc — finish here (the walls stay)");
             }
         }
         else if (Shape == BuildShape.Curved)
@@ -1454,8 +1689,8 @@ public class GridPlacementSystem : MonoBehaviour
                 // the slab edge. Like the flank, the rim yields to Shift's
                 // stepped bearing; the snap outranks length stepping while
                 // it holds, exactly as a node snap does.
-                else if (!freePlace && !steppedAim && hoverSlabTile != null
-                    && TrySlabRimSnap(hoverSlabTile, rawSurface, out Vector3 rimEnd, out _))
+                else if (!freePlace && !steppedAim
+                    && TryRimSnap(hoverSlabTile, rawSurface, out Vector3 rimEnd, out _))
                 {
                     splineEnd = rimEnd;
                     dragEndSnap = null;
@@ -1561,9 +1796,18 @@ public class GridPlacementSystem : MonoBehaviour
                 : -(anchorSnapYaw ?? currentYRotation);
             // The corner-angle readout only means something for a kinked
             // joint — a tangent-tied connector has no corner by design.
+            // BOTH changing corners read: the anchor's, and the drag
+            // end's where it lands on existing masonry.
             if (anchorSnap.HasValue && !tangentTied && FlatDistance(anchor, end) >= 0.25f)
-                activeAngle = (anchor,
-                    AngleRefBearing(anchorSnap.Value, guideBearing), guideBearing);
+                activeAngles.Add((anchor,
+                    AngleRefBearing(anchorSnap.Value, guideBearing), guideBearing));
+            if (dragEndSnap.HasValue && !tangentTied && FlatDistance(anchor, end) >= 0.25f)
+            {
+                float endB = Mathf.Atan2(anchor.z - end.z, anchor.x - end.x)
+                    * Mathf.Rad2Deg;
+                activeAngles.Add((end,
+                    AngleRefBearing(dragEndSnap.Value, endB), endB));
+            }
 
             if (mouse.leftButton.wasReleasedThisFrame)
                 CommitSpline();
@@ -1878,8 +2122,8 @@ public class GridPlacementSystem : MonoBehaviour
                 guideCenter = (splineStart.Value + point) * 0.5f;
                 guideBearing = Mathf.Atan2(point.z - splineStart.Value.z, point.x - splineStart.Value.x) * Mathf.Rad2Deg;
                 if (anchorSnap.HasValue && FlatDistance(splineStart.Value, point) >= 0.25f)
-                    activeAngle = (splineStart.Value,
-                        AngleRefBearing(anchorSnap.Value, guideBearing), guideBearing);
+                    activeAngles.Add((splineStart.Value,
+                        AngleRefBearing(anchorSnap.Value, guideBearing), guideBearing));
                 Vector3 flat = point - splineStart.Value;
                 flat.y = 0f;
                 if (flat.sqrMagnitude > 0.25f
@@ -1929,8 +2173,8 @@ public class GridPlacementSystem : MonoBehaviour
             guideBearing = Mathf.Atan2(splineEnd.Value.z - splineStart.Value.z,
                 splineEnd.Value.x - splineStart.Value.x) * Mathf.Rad2Deg;
             if (anchorSnap.HasValue)
-                activeAngle = (splineStart.Value,
-                    AngleRefBearing(anchorSnap.Value, guideBearing), guideBearing);
+                activeAngles.Add((splineStart.Value,
+                    AngleRefBearing(anchorSnap.Value, guideBearing), guideBearing));
 
             if (mouse.leftButton.wasPressedThisFrame)
                 CommitSpline();
@@ -2056,6 +2300,14 @@ public class GridPlacementSystem : MonoBehaviour
         {
             if (hit.collider.isTrigger)
                 continue;
+            // Merlons are DECORATION to every resolver. A wall's build
+            // surface is section.topY and must stay section.topY, or
+            // pointing at a crenellated wall-walk would offer to start the
+            // next storey 1.2m up in the air and a floor drawn off it would
+            // sit on the parapet. Solid to the walker, invisible to the
+            // cursor — the buttress precedent, for a sharper reason.
+            if (hit.collider.GetComponent<WallCrenel>() != null)
+                continue;
             point = new Vector3(hit.point.x, 0f, hit.point.z);
             // A slab tile is elevated ground: building on it is
             // free-form (no ride lock). A terrain hit within rim reach
@@ -2070,6 +2322,13 @@ public class GridPlacementSystem : MonoBehaviour
                 deckY = slab.topY;
                 hoverSnapBase = deckY;
                 hoverSlabTile = slab;
+                // Directly over a wall the masonry underfoot outranks the
+                // slab — see TryGetCurveTarget for the why; both resolvers
+                // have to agree or the room chain and the wall tool would
+                // snap a floor's own walls differently.
+                hoverRideHost = RideHostUnder(point, slab.topY);
+                if (hoverRideHost != null)
+                    point = RideOnto(hoverRideHost, point);
                 return true;
             }
             // A wall's TOP FACE is elevated ground here too: the room and
@@ -2121,12 +2380,13 @@ public class GridPlacementSystem : MonoBehaviour
     }
 
     // Circle and Rect: whole-figure gestures shared by the wall and room
-    // tools. Press plants the anchor (circle center / first corner), the
-    // drag sizes the figure — radius and sides step in lengthStep, Shift
-    // squares the rectangle, Alt frees — and release commits every edge
-    // through the graph (splitting whatever they cross, gold posts
-    // previewing the joints). With the Room tool in hand the closed
-    // figure designates its face as a room in the same act.
+    // tools. A click plants the anchor (circle center / first corner),
+    // the cursor sizes the figure — radius and sides step in lengthStep,
+    // Shift squares the rectangle, Alt frees — and a second click (third
+    // for the rect's width) commits every edge through the graph
+    // (splitting whatever they cross, gold posts previewing the joints).
+    // With the Room tool in hand the closed figure designates its face
+    // as a room in the same act.
     void UpdateShapeGesture(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI, bool designate)
     {
         HandleHeightScroll(mouse, keyboard);
@@ -2180,7 +2440,30 @@ public class GridPlacementSystem : MonoBehaviour
                     hoverSnapHeight = SnapHeightOf(flankSnap.edge, flankSnap.point);
                 AdoptSnapElevation(flankSnap);
             }
-            snapTint = attach.HasValue;
+            // The centre of a hovered slab grabs a circle's anchor — a
+            // ring tower lands concentric on its pad instead of by eye.
+            bool slabGrab = false;
+            if (attach == null && canSnap && Shape == BuildShape.Circle
+                && hoverSlabTile != null)
+            {
+                Vector3 centroid = SlabTile.Centroid(hoverSlabTile.verts);
+                centroid.y = 0f;
+                if (FlatDistance(raw, centroid) < CentroidSnapRadius)
+                {
+                    point = centroid;
+                    slabGrab = true;
+                }
+            }
+            // The slab rim grabs the figure's anchor exactly as it grabs
+            // the wall tool's and the room chain's — the figure's outer
+            // face lands on the slab edge.
+            if (attach == null && !slabGrab && canSnap
+                && TryRimSnap(hoverSlabTile, raw, out Vector3 rimAnchor, out _))
+            {
+                point = rimAnchor;
+                slabGrab = true;
+            }
+            snapTint = attach.HasValue || slabGrab;
             if (attach.HasValue && attach.Value.node != null)
             {
                 ShowNodeEndHighlight(attach.Value.node);
@@ -2221,8 +2504,10 @@ public class GridPlacementSystem : MonoBehaviour
 
         Vector3 anchor = shapeAnchor.Value;
 
-        // Circle keeps its press-drag-release feel: the radius follows
-        // the cursor and release commits.
+        // Circle is click-click like every other figure: the anchor
+        // click placed the centre, the cursor sets the radius, and the
+        // second click commits — a refusal keeps the gesture alive to
+        // adjust, exactly like the rect's width phase.
         if (Shape == BuildShape.Circle)
         {
             if (hasPoint)
@@ -2230,13 +2515,28 @@ public class GridPlacementSystem : MonoBehaviour
                 float r = FlatDistance(anchor, raw);
                 if (!freePlace)
                     r = Mathf.Round(r / lengthStep) * lengthStep;
+                // Near a slab's rim the RADIUS snaps to the rim inset —
+                // with a centred anchor, the ring's outer face lands
+                // exactly on the pad's edge all the way around.
+                if (!freePlace
+                    && TryRimSnap(hoverSlabTile, raw, out Vector3 rimAt, out _))
+                {
+                    r = FlatDistance(anchor, rimAt);
+                    snapTint = true;
+                }
                 r = Mathf.Max(MinCircleRadius, r);
                 BuildShapePreview(CircleEdges(anchor, r), anchor, anchor + Vector3.right * r, r);
                 Vector3 toward = raw - anchor;
                 toward.y = 0f;
+                // A closed figure LABELS its outer envelope (the user's
+                // call, 2026-08-16): "a 5m tower" means the outside —
+                // the number that matches the pad it stands on. The
+                // graph, snaps and stepping all stay centerline; only
+                // the label speaks the footprint, half a thickness out.
+                float face = r + gridSize * 0.5f;
                 Vector3 rim = anchor + (toward.sqrMagnitude > 0.01f
-                    ? toward.normalized : Vector3.right) * r;
-                dimGuides.Add((anchor, rim, r));
+                    ? toward.normalized : Vector3.right) * face;
+                dimGuides.Add((anchor, rim, face));
                 ShowShapeGhosts();
                 foreach (Vector3 p in shapeCrossings)
                     AddNodeGhost(p);
@@ -2248,13 +2548,17 @@ public class GridPlacementSystem : MonoBehaviour
                 ShowShapeGhosts();
             }
 
-            if (mouse.leftButton.wasReleasedThisFrame)
+            if (mouse.leftButton.wasPressedThisFrame && !overUI)
             {
                 if (shapeBlocked)
+                {
                     BuildLog.Add("Refused: a side partially overlaps a wall — line it up fully (the wall becomes that side) or move clear.");
+                }
                 else if (shapeSpecs.Count > 0 && shapeEdgesLive.Count > 0)
+                {
                     CommitShape(designate);
-                CancelShape();
+                    CancelShape();
+                }
             }
             return;
         }
@@ -2329,7 +2633,10 @@ public class GridPlacementSystem : MonoBehaviour
                     float bestOff = endpointSnapRadius;
                     foreach (WallNode node in WallNode.All)
                     {
-                        if (node.Valence != 1
+                        // Storey-filtered like every other snap.
+                        if (node == null || node.Valence != 1
+                            || !WallGraph.SameBase(node.baseY,
+                                shapeBaseY ?? float.NegativeInfinity)
                             || (shapeAnchorSnap.HasValue && node == shapeAnchorSnap.Value.node))
                             continue;
                         Vector3 v = node.point - m;
@@ -2363,7 +2670,9 @@ public class GridPlacementSystem : MonoBehaviour
                 ShowShapeGhosts();
                 foreach (Vector3 p in shapeCrossings)
                     AddNodeGhost(p);
-                dimGuides.Add((aC, bC, sideLen));
+                // Figure labels read the OUTER envelope — the side plus
+                // half a thickness past each corner.
+                dimGuides.Add((aC, bC, sideLen + gridSize));
                 guideCenter = m;
                 guideBearing = Mathf.Atan2(sideDir.z, sideDir.x) * Mathf.Rad2Deg;
                 if (mouse.leftButton.wasPressedThisFrame && sideLen >= MinRectSide)
@@ -2386,6 +2695,7 @@ public class GridPlacementSystem : MonoBehaviour
             {
                 Vector3 b;
                 EndSnap? sideSnap = null;
+                bool rimSide = false;
                 // The gesture's own storey, captured at the anchor — not
                 // whatever the cursor is over now. A rect started on the
                 // ground stays a ground rect when its side runs past a
@@ -2399,6 +2709,15 @@ public class GridPlacementSystem : MonoBehaviour
                 {
                     b = sideFlank.point;
                     sideSnap = sideFlank;
+                }
+                // The slab rim grabs the side's end too — laying the
+                // first side along a pad's edge lands both corners on the
+                // rim inset. It yields to Shift's stepping like the flank.
+                else if (canSnap && !shiftHeld
+                    && TryRimSnap(hoverSlabTile, raw, out Vector3 rimSideEnd, out _))
+                {
+                    b = rimSideEnd;
+                    rimSide = true;
                 }
                 else
                 {
@@ -2418,7 +2737,7 @@ public class GridPlacementSystem : MonoBehaviour
                     }
                     AddExtensionAlignGuides(b);
                 }
-                snapTint = sideSnap.HasValue;
+                snapTint = sideSnap.HasValue || rimSide;
                 BuildShapePreview(
                     new List<(Vector3 s, Vector3 c, Vector3 e)> { (anchor, (anchor + b) * 0.5f, b) },
                     anchor, b, 0f);
@@ -2426,12 +2745,21 @@ public class GridPlacementSystem : MonoBehaviour
                 foreach (Vector3 p in shapeCrossings)
                     AddNodeGhost(p);
                 float len = FlatDistance(anchor, b);
-                dimGuides.Add((anchor, b, len));
+                // Envelope label, like the circle's.
+                dimGuides.Add((anchor, b, len + gridSize));
                 guideCenter = (anchor + b) * 0.5f;
                 guideBearing = Mathf.Atan2(b.z - anchor.z, b.x - anchor.x) * Mathf.Rad2Deg;
                 if (shapeAnchorSnap.HasValue && len >= 0.25f)
-                    activeAngle = (anchor,
-                        AngleRefBearing(shapeAnchorSnap.Value, guideBearing), guideBearing);
+                    activeAngles.Add((anchor,
+                        AngleRefBearing(shapeAnchorSnap.Value, guideBearing), guideBearing));
+                // The far corner reads too when the side lands on masonry.
+                if (sideSnap.HasValue && len >= 0.25f)
+                {
+                    float backB = Mathf.Atan2(anchor.z - b.z, anchor.x - b.x)
+                        * Mathf.Rad2Deg;
+                    activeAngles.Add((b,
+                        AngleRefBearing(sideSnap.Value, backB), backB));
+                }
                 if (mouse.leftButton.wasPressedThisFrame && len >= MinRectSide)
                     shapeSideEnd = b;
             }
@@ -2456,10 +2784,27 @@ public class GridPlacementSystem : MonoBehaviour
             float depth = Vector3.Dot(raw - sideA, n);
             float dir = depth >= 0f ? 1f : -1f;
             float w = Mathf.Abs(depth);
+            bool rimWidth = false;
             if (shiftHeld)
+            {
                 w = sideLen;
+            }
             else if (!freePlace)
+            {
                 w = Mathf.Round(w / lengthStep) * lengthStep;
+                // The far side pulls to a slab's rim inset — the fourth
+                // wall of a pad-hugging rect lands on the rim instead of
+                // hunting it on the 0.5m grid.
+                if (TryRimSnap(hoverSlabTile, raw, out Vector3 rimW, out _))
+                {
+                    float wr = Vector3.Dot(rimW - sideA, n) * dir;
+                    if (wr >= MinRectSide)
+                    {
+                        w = wr;
+                        rimWidth = true;
+                    }
+                }
+            }
             w = Mathf.Max(MinRectSide, w);
             // Solve the second curtain: if a free wall end lines up with
             // an adjacent side's midline (on the cursor's side), the
@@ -2469,28 +2814,44 @@ public class GridPlacementSystem : MonoBehaviour
             if (!freePlace)
             {
                 Vector3 along = ab / Mathf.Max(0.001f, sideLen);
+                // A solve is an OFFER, and it may only round the width the
+                // cursor is already asking for — the same guard the side's
+                // length solve carries. Ranking on lateral alignment alone
+                // pinned the figure outright: any free wall end lined up
+                // with a side end, at ANY depth out to the horizon, became
+                // the width and the cursor could not move it. Only the
+                // opposite drag — where the solve can't reach — stayed
+                // free (measured live: an end 3.5m away pinning 6.89m).
                 float bestErr = endpointSnapRadius;
+                float asked = w;
                 foreach (WallNode node in WallNode.All)
                 {
-                    if (node.Valence != 1)
+                    // Storey-filtered like every other snap. The end that
+                    // pinned it stood a storey below the gesture.
+                    if (node == null || node.Valence != 1
+                        || !WallGraph.SameBase(node.baseY,
+                            shapeBaseY ?? float.NegativeInfinity))
                         continue;
                     foreach (Vector3 root in new[] { sideA, sideB })
                     {
                         Vector3 v = node.point - root;
                         v.y = 0f;
                         float lateral = Mathf.Abs(Vector3.Dot(v, along));
-                        float longi = Vector3.Dot(v, n) * dir;
-                        if (lateral < bestErr && longi * 2f >= MinRectSide)
+                        float candidate = Vector3.Dot(v, n) * dir * 2f;
+                        if (lateral >= endpointSnapRadius || candidate < MinRectSide)
+                            continue;
+                        float err = Mathf.Abs(candidate - asked);
+                        if (err < bestErr)
                         {
-                            bestErr = lateral;
-                            w = longi * 2f;
+                            bestErr = err;
+                            w = candidate;
                             widthSnapped = true;
                             widthSnapRoot = root;
                         }
                     }
                 }
             }
-            snapTint = widthSnapped;
+            snapTint = widthSnapped || rimWidth;
             Vector3 offset = n * (w * dir);
             // White tie along the adjacent side whose midpoint just
             // caught the wall end, plus extension lines off the far
@@ -2503,8 +2864,9 @@ public class GridPlacementSystem : MonoBehaviour
             ShowShapeGhosts();
             foreach (Vector3 p in shapeCrossings)
                 AddNodeGhost(p);
-            dimGuides.Add((sideA, sideB, sideLen));
-            dimGuides.Add((sideB, sideB + offset, w));
+            // Envelope labels on both dimensions.
+            dimGuides.Add((sideA, sideB, sideLen + gridSize));
+            dimGuides.Add((sideB, sideB + offset, w + gridSize));
             guideCenter = (sideA + sideB) * 0.5f + offset * 0.5f;
             guideBearing = Mathf.Atan2(ab.z, ab.x) * Mathf.Rad2Deg;
             if (mouse.leftButton.wasPressedThisFrame)
@@ -2703,16 +3065,17 @@ public class GridPlacementSystem : MonoBehaviour
     // whole chain stays a ghost until it CLOSES: the far end lands on the
     // chain's own start, or on existing masonry connected back to the
     // start attachment — then every segment commits through the graph at
-    // once and the enclosed face is announced. Escape abandons
-    // the chain and leaves nothing. Segments never cross walls: a drag
-    // over one clamps to the first crossing point (a T at commit, and
-    // often the closure itself).
+    // once and the enclosed face is announced. Escape FINISHES an open
+    // chain — the clicked walls build, only the live leg is dropped —
+    // the wall chain's rule (Esc ends the chain, walls stay). Segments
+    // never cross walls: a drag over one clamps to the first crossing
+    // point (a T at commit, and often the closure itself).
     void UpdateRoom(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
     {
         HandleHeightScroll(mouse, keyboard);
         if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
         {
-            CancelRoomChain();
+            FinishRoomChain();
             return;
         }
         // Right click steps the chain back one corner; popping the anchor
@@ -2765,8 +3128,8 @@ public class GridPlacementSystem : MonoBehaviour
             // pulls onto the outline inset half a thickness, mitered at
             // the outline's corners — walls around a foundation hug its
             // edge face-flush.
-            else if (canSnap && hoverSlabTile != null
-                && TrySlabRimSnap(hoverSlabTile, raw, out Vector3 rimPoint, out _))
+            else if (canSnap
+                && TryRimSnap(hoverSlabTile, raw, out Vector3 rimPoint, out _))
             {
                 point = rimPoint;
                 snapTint = true;
@@ -2848,8 +3211,8 @@ public class GridPlacementSystem : MonoBehaviour
             // The slab rim grabs the chain's next corner too — same rule
             // as the wall tool's drag end, and it yields to Shift's
             // stepped bearing the same way the flank does.
-            else if (canSnap && !steppedAim && hoverSlabTile != null
-                && TrySlabRimSnap(hoverSlabTile, raw, out Vector3 rimEnd, out _))
+            else if (canSnap && !steppedAim
+                && TryRimSnap(hoverSlabTile, raw, out Vector3 rimEnd, out _))
             {
                 end = rimEnd;
             }
@@ -2921,12 +3284,20 @@ public class GridPlacementSystem : MonoBehaviour
             guideCenter = (last + end) * 0.5f;
             guideBearing = Mathf.Atan2(end.z - last.z, end.x - last.x) * Mathf.Rad2Deg;
             // Corner readout at the vertex the segment grows from, against
-            // the previous segment or the snapped start's masonry.
+            // the previous segment or the snapped start's masonry — and at
+            // the far end where the segment lands on existing walls.
             if (FlatDistance(last, end) >= 0.25f)
             {
                 float? arcRef = ChainStepRef(guideBearing);
                 if (arcRef.HasValue)
-                    activeAngle = (last, arcRef.Value, guideBearing);
+                    activeAngles.Add((last, arcRef.Value, guideBearing));
+                if (endAttach.HasValue)
+                {
+                    float backB = Mathf.Atan2(last.z - end.z, last.x - end.x)
+                        * Mathf.Rad2Deg;
+                    activeAngles.Add((end,
+                        AngleRefBearing(endAttach.Value, backB), backB));
+                }
             }
             snapTint = roomLiveClosing || endAttach.HasValue;
 
@@ -2955,6 +3326,230 @@ public class GridPlacementSystem : MonoBehaviour
     }
 
     // ------------------------------------------------------------------
+    // Bridges
+    // ------------------------------------------------------------------
+
+    // A bridge end reads what it stands on, like a stair's foot: a slab's
+    // stated plane, a wall's top face (cut-surface guarded like every
+    // top-face read), or the ground itself. The deck top sits flush with
+    // what each end rests on. A bridge's own deck is deliberately NOT an
+    // end (not a build surface — the v1 call), so a hit on one refuses.
+    bool TryGetBridgeEnd(Ray ray, out Vector3 point, out float topY)
+    {
+        point = default;
+        topY = 0f;
+        if (!TryGetFirstHit(ray, out RaycastHit best))
+            return false;
+        point = new Vector3(best.point.x, 0f, best.point.z);
+        SlabTile slab = best.collider.GetComponent<SlabTile>();
+        if (slab != null)
+        {
+            topY = slab.topY;
+            return true;
+        }
+        WallEdgeSection sec = best.collider.GetComponent<WallEdgeSection>();
+        if (sec != null && best.normal.y > 0.7f
+            && !CutawayView.IsCutSurface(best.point))
+        {
+            topY = sec.topY;
+            return true;
+        }
+        if (best.collider is TerrainCollider)
+        {
+            topY = best.point.y;
+            return true;
+        }
+        return false;
+    }
+
+    // The piers a span needs, footed on the ground of THIS moment — the
+    // commit stamps these numbers and they never re-derive (later
+    // earthworks must not move a standing bridge's legs). Shared by the
+    // ghost and the commit, so the preview shows the piers that will be
+    // built (ghost = commit).
+    List<Bridge.Pier> BuildBridgePiers(Vector3 s, Vector3 e, float width)
+    {
+        var piers = new List<Bridge.Pier>();
+        Vector3 run = e - s;
+        run.y = 0f;
+        if (run.sqrMagnitude < 0.01f)
+            return piers;
+        Vector3 axis = run.normalized;
+        Vector3 half = new Vector3(-axis.z, 0f, axis.x) * (width * 0.5f);
+        Vector3 depth = axis * (Bridge.PierDepth * 0.5f);
+        foreach (Vector3 c in Bridge.PierCenters(s, e))
+        {
+            float min = float.MaxValue;
+            foreach (Vector3 corner in new[] { c, c + depth + half,
+                c + depth - half, c - depth + half, c - depth - half })
+                min = Mathf.Min(min, Ground.Any
+                    ? Ground.HeightAt(corner) : 0f);
+            // Footings live on the half-metre grid, the stepped-foundation
+            // doctrine — a pier and a wall footing beside it agree.
+            piers.Add(new Bridge.Pier
+            {
+                pos = c,
+                bottomY = Mathf.Floor(min / baseStepSize) * baseStepSize,
+            });
+        }
+        return piers;
+    }
+
+    void UpdateBridge(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
+    {
+        if (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
+        {
+            CancelBridge();
+            return;
+        }
+        // Right-click steps the gesture back one phase, like the chains.
+        if (rightClick && (bridgeEnd.HasValue || bridgeStart.HasValue))
+        {
+            if (bridgeEnd.HasValue)
+                bridgeEnd = null;
+            else
+                CancelBridge();
+            return;
+        }
+        bool shift = keyboard != null
+            && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
+        bool free = keyboard != null
+            && (keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed);
+
+        // Near end: a marker where the deck will rest.
+        if (!bridgeStart.HasValue)
+        {
+            if (overUI || !TryGetBridgeEnd(ray, out Vector3 p, out float pY))
+            {
+                HideGhosts();
+                return;
+            }
+            ghostTopY = pY;
+            guideCenter = p;
+            ShowBridgeMarker(p, pY);
+            if (mouse.leftButton.wasPressedThisFrame)
+            {
+                bridgeStart = p;
+                bridgeStartY = pY;
+            }
+            return;
+        }
+
+        Vector3 s = bridgeStart.Value;
+        Vector3 e;
+        float eY;
+        // The click that fixes the far end must not double as the width
+        // phase's commit click.
+        bool endSetThisFrame = false;
+        if (!bridgeEnd.HasValue)
+        {
+            // Far end: the deck previews to the cursor; Shift holds the
+            // near end's height (a level deck — the Ground tool's Shift).
+            if (overUI || !TryGetBridgeEnd(ray, out e, out eY))
+            {
+                HideGhosts();
+                return;
+            }
+            if (shift)
+                eY = bridgeStartY;
+            if (mouse.leftButton.wasPressedThisFrame && FlatDistance(s, e) >= 2f)
+            {
+                bridgeEnd = e;
+                bridgeEndY = eY;
+                endSetThisFrame = true;
+            }
+        }
+        else
+        {
+            // Width phase: the cursor maps onto the deck's mid-plane and
+            // pulls the width out symmetric about the centerline.
+            e = bridgeEnd.Value;
+            eY = bridgeEndY;
+            float planeY = (bridgeStartY + bridgeEndY) * 0.5f;
+            if (!overUI && Mathf.Abs(ray.direction.y) > 0.0001f)
+            {
+                float t = (planeY - ray.origin.y) / ray.direction.y;
+                if (t > 0f)
+                {
+                    Vector3 onPlane = ray.origin + ray.direction * t;
+                    Vector3 run = e - s;
+                    run.y = 0f;
+                    if (run.sqrMagnitude > 0.01f)
+                    {
+                        Vector3 perp = new Vector3(-run.z, 0f, run.x).normalized;
+                        Vector3 flat = new Vector3(onPlane.x, 0f, onPlane.z);
+                        float w = Mathf.Abs(Vector3.Dot(flat - s, perp)) * 2f;
+                        if (!free)
+                            w = Mathf.Round(w / lengthStep) * lengthStep;
+                        bridgeWidth = Mathf.Max(Bridge.MinWidth, w);
+                    }
+                }
+            }
+        }
+
+        List<Bridge.Pier> piers = BuildBridgePiers(s, e, bridgeWidth);
+        if (bridgeGhostMesh == null)
+            bridgeGhostMesh = new Mesh { name = "BridgePreview" };
+        Bridge.BuildMesh(bridgeGhostMesh, s, e, bridgeStartY, eY,
+            bridgeWidth, piers, Vector3.zero);
+        ShowWorldGhost(0, bridgeGhostMesh, previewColor);
+        for (int i = 1; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+        ghostTopY = eY;
+        guideCenter = (s + e) * 0.5f;
+        dimGuides.Add((s, e, FlatDistance(s, e)));
+        if (bridgeEnd.HasValue)
+        {
+            Vector3 runD = e - s;
+            runD.y = 0f;
+            if (runD.sqrMagnitude > 0.01f)
+            {
+                Vector3 perpD = new Vector3(-runD.z, 0f, runD.x).normalized
+                    * (bridgeWidth * 0.5f);
+                dimGuides.Add(((s + e) * 0.5f - perpD, (s + e) * 0.5f + perpD,
+                    bridgeWidth));
+            }
+        }
+
+        if (bridgeEnd.HasValue && !endSetThisFrame
+            && mouse.leftButton.wasPressedThisFrame && !overUI)
+        {
+            Bridge made = Bridge.Create(splineParent, wallMaterial, s, e,
+                bridgeStartY, bridgeEndY, bridgeWidth, piers);
+            Estate.Pay(Estate.CostOfBridge(made), "Bridge");
+            BuildLog.Add($"Bridge — {made.Length:0.#}m span,"
+                + $" {piers.Count} pier{(piers.Count == 1 ? "" : "s")},"
+                + $" {bridgeWidth:0.#}m wide.");
+            CancelBridge();
+        }
+    }
+
+    void ShowBridgeMarker(Vector3 at, float topY)
+    {
+        GameObject m = GetPooled(ghostPool, 0, previewColor, "PlacementPreview");
+        m.SetActive(true);
+        SetGhostMesh(m, SlabTile.SharedCube());
+        SetGhostTint(m, previewColor);
+        m.transform.SetPositionAndRotation(
+            new Vector3(at.x, topY + 0.1f, at.z), Quaternion.identity);
+        m.transform.localScale = new Vector3(0.4f, 0.2f, 0.4f);
+        for (int i = 1; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    void CancelBridge()
+    {
+        bridgeStart = null;
+        bridgeEnd = null;
+        if (bridgeGhostMesh != null)
+        {
+            Destroy(bridgeGhostMesh);
+            bridgeGhostMesh = null;
+        }
+        HideGhosts();
+    }
+
+    // ------------------------------------------------------------------
     // Stairs
     // ------------------------------------------------------------------
 
@@ -2973,21 +3568,19 @@ public class GridPlacementSystem : MonoBehaviour
 
         if (overUI || !TryGetWallSideHit(ray, out WallEdgeSection sec, out Vector3 hit))
         {
-            // Off a wall the camera gets its say back — the latch belongs
-            // to the stair you were looking at, not to the tool.
-            stairHost = null;
-            stairHeld = false;
             CancelStair();
             return;
         }
 
-        // A different wall is a different stair: re-arm the camera.
-        if (sec.edge != stairHost)
-        {
-            stairHost = sec.edge;
-            stairHeld = false;
-            stairPerp = false;
-        }
+        // The latch belongs to the TOOL, not to the wall under the cursor
+        // (the user's call, 2026-08-16). It used to re-arm the camera
+        // whenever the ray left the masonry or crossed onto another edge —
+        // and since a chained run is many edges and the ray leaves the
+        // wall on every wide mouse move, a chosen orientation kept
+        // silently reverting to whatever the camera implied. Once R is
+        // pressed the choice stands until the Stair tool is picked up
+        // again (SetMode re-arms it).
+        stairHost = sec.edge;
         // R cycles the run: flip the along-wall climb, then turn it OUT
         // from the face, then back along — every stop reachable within
         // two presses, and each press stays latched off the camera.
@@ -3059,6 +3652,19 @@ public class GridPlacementSystem : MonoBehaviour
         foreach (RaycastHit hit in hits)
         {
             if (hit.collider.isTrigger)
+                continue;
+            // A buttress is this wall's own masonry, so the tools that
+            // point at a wall see straight through it to the face behind:
+            // a stair beside a pier, a doorway between two, another pier
+            // further along. The deliberate exception to first-hit-only —
+            // without it the wall a buttress stands on became untouchable
+            // for a metre and a half either side of it.
+            if (hit.collider.GetComponent<WallButtress>() != null)
+                continue;
+            // And so is a battlement — a stair or a doorway on a
+            // crenellated wall must be placed against the wall itself, not
+            // refused because the parapet took the ray.
+            if (hit.collider.GetComponent<WallCrenel>() != null)
                 continue;
             section = hit.collider.GetComponent<WallEdgeSection>();
             bool topFace = hit.normal.y > 0.7f && !CutawayView.IsCutSurface(hit.point);
@@ -3331,6 +3937,8 @@ public class GridPlacementSystem : MonoBehaviour
         float left = run;
         covered = 0f;
         stairLanding = null;
+        WallNode stopNode = null;
+        WallEdge stopEdge = null;
 
         while (cur != null && left > 0.01f && visited.Add(cur) && curves.Count < 64)
         {
@@ -3378,7 +3986,14 @@ public class GridPlacementSystem : MonoBehaviour
             WallNode node = towardB ? cur.nodeB : cur.nodeA;
             WallEdge next = StraightestContinuation(node, cur, towardB);
             if (next == null)
+            {
+                // Still wanting wall and there is none: this node is where
+                // the run ends, and TrimLandingAtWall decides whether
+                // something is standing in it.
+                stopNode = node;
+                stopEdge = cur;
                 break;
+            }
             towardB = next.nodeA == node;
             from = towardB ? 0f : 1f;
             cur = next;
@@ -3386,7 +4001,61 @@ public class GridPlacementSystem : MonoBehaviour
         // Meet at the corners before the arc bookkeeping is taken, so the
         // treads distribute over the run the stair actually has.
         WallStair.WeldOffsetJoints(curves, (host.thickness + stairWidth) * 0.5f);
+        TrimLandingAtWall(curves, stopNode, stopEdge, markArc);
         return WallStair.ChainSpans(curves);
+    }
+
+    // A run that ends because the masonry TURNS ends at a node — and a
+    // node is a centerline, so the landing drove half a thickness into
+    // the wall standing across it. Stop at that wall's face instead.
+    // Only the landing may be given back: eating into the climb would
+    // steepen a stair for no reason the player asked for, so the trim is
+    // capped at whatever arc lies beyond the climb. A free wall end has
+    // no other member and so takes no trim — ending flush with the
+    // masonry is right there.
+    void TrimLandingAtWall(List<(Vector3 s, Vector3 c, Vector3 e)> curves,
+        WallNode stop, WallEdge last, float keepArc)
+    {
+        if (stop == null || last == null || curves.Count == 0)
+            return;
+        float trim = 0f;
+        foreach (WallNode.Member m in stop.members)
+            if (m.edge != null && m.edge != last
+                && WallGraph.SameBase(m.edge.baseY, last.baseY))
+                trim = Mathf.Max(trim, m.edge.thickness * 0.5f);
+        if (trim < 0.01f)
+            return;
+
+        var tables = new List<float[]>();
+        float total = 0f;
+        foreach ((Vector3 s, Vector3 c, Vector3 e) cv in curves)
+        {
+            float[] t = WallEdge.BuildArcTable(cv.s, cv.c, cv.e);
+            tables.Add(t);
+            total += t[t.Length - 1];
+        }
+        trim = Mathf.Min(trim, Mathf.Max(0f, total - keepArc));
+
+        // Eat back from the far end, dropping whole spans if the trim
+        // outlasts one (a stair that turns a corner into a thick wall).
+        while (curves.Count > 0 && trim > 0.01f)
+        {
+            int i = curves.Count - 1;
+            float[] table = tables[i];
+            float len = table[table.Length - 1];
+            if (len - trim < 0.01f)
+            {
+                curves.RemoveAt(i);
+                tables.RemoveAt(i);
+                trim -= len;
+                continue;
+            }
+            float tCut = WallEdge.TAtArc(table, len - trim);
+            WallGraph.SubCurve(curves[i].s, curves[i].c, curves[i].e, 0f, tCut,
+                out Vector3 s2, out Vector3 c2, out Vector3 e2);
+            curves[i] = (s2, c2, e2);
+            trim = 0f;
+        }
     }
 
     // The wall top where the run just landed — pass two of the sizing.
@@ -3479,6 +4148,9 @@ public class GridPlacementSystem : MonoBehaviour
         stairBlocked = false;
         stairShortfall = 0f;
         stairToDoor = false;
+        // Only what's on screen — the R latch deliberately survives this,
+        // and this runs every frame the ray leaves the masonry.
+        stairHost = null;
         HideGhosts();
     }
 
@@ -3587,10 +4259,29 @@ public class GridPlacementSystem : MonoBehaviour
         if (sec.topY - doorSill < 0.6f)
             return $"The floor inside stands at {doorSill:0.0}m, leaving no wall"
                 + " above it for a doorway.";
-        if (total < doorWidth + DoorJamb * 2f)
-            return $"Wall too short for a doorway — it needs {doorWidth + DoorJamb * 2f:0.0}m.";
-        if (mid - doorWidth * 0.5f < DoorJamb || mid + doorWidth * 0.5f > total - DoorJamb)
-            return $"Too close to the wall's end — leave {DoorJamb:0.0}m of jamb.";
+        // A JOINT is not an END. The jamb is stone that must be left
+        // standing beside the opening — and where another wall carries
+        // straight on past the node (a chained run, or a wall a crossing
+        // split in two) that stone is already there, on the far side of a
+        // boundary the player never drew. Asking for a jamb there refused
+        // doorways in the middle of what looks like one continuous wall.
+        // A corner, a T or a free end still needs its jamb: there the
+        // masonry really does stop.
+        float jambA = MasonryContinuesPast(host, true) ? 0f : DoorJamb;
+        float jambB = MasonryContinuesPast(host, false) ? 0f : DoorJamb;
+        if (total < doorWidth + jambA + jambB)
+            return $"Wall too short for a doorway — it needs {doorWidth + jambA + jambB:0.0}m.";
+        if (mid - doorWidth * 0.5f < jambA || mid + doorWidth * 0.5f > total - jambB)
+        {
+            bool atJoint = mid - doorWidth * 0.5f < jambA ? jambA <= 0f : jambB <= 0f;
+            // An opening is data on ONE wall, so it can never cross the
+            // joint however continuous the stone looks. Say that, rather
+            // than blaming a jamb that isn't being asked for.
+            return atJoint
+                ? "A doorway belongs to one wall, and there's a joint here —"
+                    + $" move it {doorWidth * 0.5f:0.0}m clear of the joint."
+                : $"Too close to the wall's end — leave {DoorJamb:0.0}m of jamb.";
+        }
         foreach (WallEdge.Opening o in host.openings)
         {
             float other = WallEdge.ArcAt(table, o.t);
@@ -3598,6 +4289,53 @@ public class GridPlacementSystem : MonoBehaviour
                 return "That would run into the doorway already there.";
         }
         return null;
+    }
+
+    // Does the masonry carry straight on past this end of the wall? True
+    // only for a real continuation: a member of the same node, on the same
+    // storey, leaving very nearly along the host's own line (so a corner
+    // or a T reads false), and standing tall enough at the joint to be a
+    // jamb. Nothing is inferred about support — this asks one geometric
+    // question of the stored graph, the same way RideHostUnder does.
+    static bool MasonryContinuesPast(WallEdge host, bool atStart)
+    {
+        WallNode node = atStart ? host.nodeA : host.nodeB;
+        if (node == null)
+            return false;
+        Vector3 out0 = host.EndOutwardDir(atStart);
+        out0.y = 0f;
+        if (out0.sqrMagnitude < 0.0001f)
+            return false;
+        out0.Normalize();
+        foreach (WallNode.Member m in node.members)
+        {
+            if (m.edge == null || m.edge == host)
+                continue;
+            if (!WallGraph.SameBase(m.edge.baseY, host.baseY))
+                continue;
+            Vector3 out1 = m.edge.EndOutwardDir(m.atStart);
+            out1.y = 0f;
+            if (out1.sqrMagnitude < 0.0001f)
+                continue;
+            // The neighbour's body runs the way the host points, so its
+            // own outward direction points back at the host: collinear
+            // means the two outward bearings oppose. 20° of slack lets a
+            // gentle curve's segments still read as one wall.
+            if (Vector3.Dot(out0, out1.normalized) > -0.94f)
+                continue;
+            var sections = m.edge.SectionsInOrder();
+            if (sections.Count == 0)
+                continue;
+            WallEdgeSection end = m.atStart ? sections[0] : sections[sections.Count - 1];
+            // Solid stone, and enough of it to be a jamb — a lintel over
+            // the neighbour's own doorway is not a jamb.
+            if (end == null || end.openingIndex >= 0)
+                continue;
+            if (end.topY - end.bottomY < 0.6f)
+                continue;
+            return true;
+        }
+        return false;
     }
 
     // A box standing in the wall where the masonry would go: the opening
@@ -3645,6 +4383,921 @@ public class GridPlacementSystem : MonoBehaviour
         doorBlocked = false;
         doorRefusal = null;
         doorStep = 0f;
+        HideGhosts();
+    }
+
+    // ---- Buttress tool ---------------------------------------------
+
+    // A pier against the face under the cursor. The wall answers its
+    // footing (the ground under the pier's own footprint), its face and
+    // its top; the cursor answers where along the wall, and which side.
+    void UpdateButtress(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
+    {
+        if (overUI || !TryGetWallSideHit(ray, out WallEdgeSection sec, out Vector3 hit))
+        {
+            CancelButtress();
+            return;
+        }
+
+        WallEdge host = sec.edge;
+        buttressHost = host;
+        buttressT = host.NearestT(hit, out _);
+        buttressSide = host.SideOf(hit);
+        float wallTop = sec.topY;
+        // The wall's own floor, not the pier's buried footing: how much
+        // masonry is STANDING here is what bounds the top. A lintel's
+        // bottom is a doorway's head, so ask the nearest solid stone.
+        float wallFloor = MasonryFloorAt(sec);
+
+        HandleButtressTopScroll(mouse, keyboard, wallTop - wallFloor);
+        buttressTopY = Mathf.Clamp(
+            wallTop - (buttressTopDrop ?? WallButtress.SetOff),
+            wallFloor + WallButtress.MinHeight, wallTop);
+
+        // A real corner claims the cursor before a face does — and it has
+        // to, because a face pier is refused near a real end anyway, so
+        // without this the ground either side of every corner offered
+        // nothing at all. The clasping block is what belongs there.
+        buttressCorner = CornerUnder(host, hit, out buttressBearing);
+
+        if (buttressCorner != null)
+        {
+            var pier = new WallNode.Buttress { bearing = buttressBearing, topY = buttressTopY };
+            if (!WallButtress.TryCornerFrame(buttressCorner, buttressBearing, out _, out _,
+                    out _, out _, out buttressBottomY))
+            {
+                CancelButtress();
+                return;
+            }
+            buttressRefusal = CornerRefusal(buttressCorner, buttressBearing, wallTop, wallFloor);
+            buttressBlocked = buttressRefusal != null;
+            buttressPrice = Estate.CostOfCornerButtress(buttressCorner, pier);
+            ShowButtressGhost(buttressCorner, buttressBearing, buttressTopY, null, pier);
+            ghostTopY = buttressTopY;
+            if (mouse.leftButton.wasPressedThisFrame)
+            {
+                if (buttressBlocked)
+                {
+                    BuildLog.Add(buttressRefusal);
+                    return;
+                }
+                WallNode node = buttressCorner;
+                node.buttresses.Add(pier);
+                node.RebuildMesh();
+                BuildLog.Add("Corner buttress — clasping the joint, "
+                    + $"{buttressTopY - buttressBottomY:0.0}m of stone.");
+                Estate.Pay(buttressPrice, "Corner buttress");
+                CancelButtress();
+            }
+            return;
+        }
+
+        buttressBottomY = WallButtress.BottomAt(host, buttressT, buttressSide);
+        buttressRefusal = ButtressRefusal(host, buttressT, buttressSide, wallTop, wallFloor);
+        buttressBlocked = buttressRefusal != null;
+        var face = new WallEdge.Buttress
+        {
+            t = buttressT,
+            side = buttressSide,
+            topY = buttressTopY,
+        };
+        // The ghost is priced from the very fact the commit stores, so the
+        // readout, the charge and the delete refund are one number.
+        buttressPrice = Estate.CostOfButtress(host, face);
+        ShowButtressGhost(host, buttressT * buttressSide, buttressTopY, host, face);
+        ghostTopY = buttressTopY;
+
+        if (mouse.leftButton.wasPressedThisFrame)
+        {
+            if (buttressBlocked)
+            {
+                BuildLog.Add(buttressRefusal);
+                return;
+            }
+            host.buttresses.Add(face);
+            host.Rebuild();
+            BuildLog.Add($"Buttress — {buttressTopY - buttressBottomY:0.0}m of stone"
+                + " against the wall.");
+            Estate.Pay(buttressPrice, "Buttress");
+            // The rebuild replaced the section the ghost was measured
+            // against, so the next frame reads the wall afresh.
+            CancelButtress();
+        }
+    }
+
+    // Why this clasping block can't go here, or null — the same test the
+    // red ghost runs.
+    string CornerRefusal(WallNode node, float bearing, float wallTop, float wallFloor)
+    {
+        if (wallTop - wallFloor < WallButtress.MinHeight)
+            return "Too little wall standing here to buttress.";
+        // ONE clasping block to a corner. Two would stand at the same
+        // point and could only intersect — a joint with more than one
+        // exposed angle is dressed by one block or by face piers, never by
+        // two blocks fighting over the node.
+        if (node.buttresses.Count > 0)
+            return "This corner already has its buttress.";
+        if (!WallButtress.TryCornerFrame(node, bearing, out _, out float halfWidth,
+                out _, out _, out _))
+            return "No corner here to clasp.";
+        Vector3 facing = new Vector3(Mathf.Cos(bearing * Mathf.Deg2Rad), 0f,
+            Mathf.Sin(bearing * Mathf.Deg2Rad));
+        if (ButtressCrowded(node.point, facing, node.baseY, halfWidth, node))
+            return "That would run into the buttress already there.";
+        foreach (WallNode.Member m in node.members)
+        {
+            if (m.edge == null)
+                continue;
+            float[] tbl = WallEdge.BuildArcTable(m.edge.A, m.edge.control, m.edge.B);
+            foreach (WallEdge.Opening o in m.edge.openings)
+            {
+                Vector3 at = WallEdge.Evaluate(m.edge.A, m.edge.control, m.edge.B,
+                    Mathf.Clamp01(o.t));
+                if (FlatDistance(at, node.point) < halfWidth + o.width * 0.5f)
+                    return "A buttress can't stand across a doorway.";
+            }
+        }
+        return null;
+    }
+
+    // Is a pier already crowding this spot? Asked of the WORLD, not of one
+    // edge: a chained run is many edges, so the neighbour a foot away
+    // usually belongs to the next one along — and a clasping block belongs
+    // to a node rather than to any wall at all. Same storey, same face,
+    // closer than the two piers' own half-widths allow.
+    bool ButtressCrowded(Vector3 at, Vector3 facing, float baseY, float halfWidth,
+        WallNode ignoreNode)
+    {
+        foreach (WallEdge e in WallEdge.All)
+        {
+            if (e == null || e.buttresses.Count == 0
+                || !WallGraph.SameBase(e.baseY, baseY))
+                continue;
+            foreach (WallEdge.Buttress other in e.buttresses)
+            {
+                float ot = Mathf.Clamp01(other.t);
+                // The face matters: a pair facing each other across the
+                // thickness stand at the same point on the centreline and
+                // are a perfectly ordinary pilaster strip.
+                if (Vector3.Dot(facing, OutwardOf(e, ot, other.side)) <= 0f)
+                    continue;
+                Vector3 p = WallEdge.Evaluate(e.A, e.control, e.B, ot);
+                if (FlatDistance(at, p)
+                    < halfWidth + WallButtress.Width * 0.5f + ButtressMargin)
+                    return true;
+            }
+        }
+        foreach (WallNode n in WallNode.All)
+        {
+            if (n == null || n == ignoreNode || n.buttresses.Count == 0
+                || !WallGraph.SameBase(n.baseY, baseY))
+                continue;
+            foreach (WallNode.Buttress other in n.buttresses)
+            {
+                Vector3 dir = new Vector3(Mathf.Cos(other.bearing * Mathf.Deg2Rad), 0f,
+                    Mathf.Sin(other.bearing * Mathf.Deg2Rad));
+                if (Vector3.Dot(facing, dir) <= 0f)
+                    continue;
+                if (!WallButtress.TryCornerFrame(n, other.bearing, out _,
+                        out float oh, out _, out _, out _))
+                    continue;
+                if (FlatDistance(at, n.point) < halfWidth + oh + ButtressMargin)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    // The corner the cursor is asking for, or null. Whichever of the
+    // host's own end nodes is nearer, if the cursor is close enough to it
+    // AND the direction from that node to the cursor falls in a gap the
+    // node itself calls a corner (WallNode.TryCornerAt — the same
+    // arithmetic its wedge mesh runs). Standing on the OUTER face of an L
+    // therefore gets a clasping block, while the inner face falls in a gap
+    // with no exposed arc and drops through to an ordinary face pier.
+    static WallNode CornerUnder(WallEdge host, Vector3 hit, out float bearing)
+    {
+        bearing = 0f;
+        WallNode best = null;
+        float bestD = CornerGrab;
+        foreach (WallNode node in new[] { host.nodeA, host.nodeB })
+        {
+            if (node == null)
+                continue;
+            float d = FlatDistance(hit, node.point);
+            if (d < bestD) { bestD = d; best = node; }
+        }
+        if (best == null)
+            return null;
+        float toCursor = Mathf.Atan2(hit.z - best.point.z, hit.x - best.point.x) * Mathf.Rad2Deg;
+        if (!best.TryCornerAt(toCursor, out float mid, out _, out _))
+            return null;
+        bearing = mid;
+        return best;
+    }
+
+    // Ctrl+scroll moves the pier's TOP in quarter steps — flush with the
+    // wall head, the ordinary set-off below it, or a low pilaster. Scroll
+    // UP raises the top, which is the direction the hand expects. The wall
+    // still answers the range: its own top is the ceiling, and dialing
+    // back to the set-off re-adopts the wall's answer (null), exactly the
+    // stair climb's arrangement.
+    void HandleButtressTopScroll(Mouse mouse, Keyboard keyboard, float wallRise)
+    {
+        if (keyboard == null || (!keyboard.leftCtrlKey.isPressed && !keyboard.rightCtrlKey.isPressed))
+            return;
+        float scroll = mouse.scroll.ReadValue().y;
+        if (Mathf.Abs(scroll) < 0.01f)
+            return;
+        if (Mathf.Abs(scroll) >= 100f)
+            scroll /= 120f;
+        float notches = Mathf.Clamp(scroll, -4f, 4f);
+        float deepest = Mathf.Max(0f, wallRise - WallButtress.MinHeight);
+        float cur = buttressTopDrop ?? WallButtress.SetOff;
+        // Land ON the quarter grid, then step by it — round half-up, never
+        // Mathf.Round (banker's rounding jumps alternate notches).
+        cur = Mathf.Floor(cur / SlabTile.FloorStep + 0.5f) * SlabTile.FloorStep
+            - notches * SlabTile.FloorStep;
+        cur = Mathf.Clamp(cur, 0f, deepest);
+        buttressTopDrop = Mathf.Abs(cur - WallButtress.SetOff) < 0.01f
+            ? (float?)null : cur;
+    }
+
+    // Why this pier can't stand here, or null. Stated rather than silently
+    // refused, and it is the SAME test the red ghost runs — one fact.
+    string ButtressRefusal(WallEdge host, float t, float side, float wallTop, float wallFloor)
+    {
+        // Measured against the wall's own floor, never the pier's buried
+        // footing — a footing driven into a hillside would otherwise make
+        // any stub of wall look tall enough to buttress.
+        if (wallTop - wallFloor < WallButtress.MinHeight)
+            return "Too little wall standing here to buttress.";
+        float[] table = WallEdge.BuildArcTable(host.A, host.control, host.B);
+        float total = table[table.Length - 1];
+        float mid = WallEdge.ArcAt(table, t);
+        float half = WallButtress.Width * 0.5f;
+        // A JOINT is not an END — where the masonry carries straight on
+        // past the node, the pier may sit right on the joint and overhang
+        // it, because there is real stone on the far side to stand
+        // against. It is the doorway's jamb question, with a freer answer:
+        // a doorway cannot cross a joint (it is a hole in one wall's
+        // masonry), but a pier standing against two walls in line is one
+        // pier, and a chained run is many edges through no fault of the
+        // player's. Only a real end — a corner, a T, a free end — needs
+        // the pier kept whole on this side of it.
+        float needA = MasonryContinuesPast(host, true) ? 0f : half + ButtressMargin;
+        float needB = MasonryContinuesPast(host, false) ? 0f : half + ButtressMargin;
+        if (total < needA + needB + 0.1f)
+            return $"Wall too short for a buttress — it needs {needA + needB + 0.1f:0.0}m.";
+        if (mid < needA || mid > total - needB)
+            return "Too close to the wall's end — the pier would hang off it.";
+        Vector3 here = WallEdge.Evaluate(host.A, host.control, host.B, t);
+        Vector3 facing = OutwardOf(host, t, side);
+        if (ButtressCrowded(here, facing, host.baseY, WallButtress.Width * 0.5f, null))
+            return "That would run into the buttress already there.";
+        foreach (WallEdge.Opening o in host.openings)
+        {
+            float at = WallEdge.ArcAt(table, o.t);
+            // Either face blocks: a pier across a doorway's outside is
+            // still a pier across the doorway.
+            if (Mathf.Abs(at - mid) < (o.width + WallButtress.Width) * 0.5f)
+                return "A buttress can't stand across a doorway.";
+        }
+        return null;
+    }
+
+    // Which way a pier faces, in world terms — the wall's left-hand normal
+    // turned by the side it stands on.
+    static Vector3 OutwardOf(WallEdge edge, float t, float side)
+    {
+        Vector3 d = WallEdge.Tangent(edge.A, edge.control, edge.B, Mathf.Clamp01(t)).normalized;
+        return new Vector3(-d.z, 0f, d.x) * (side < 0f ? -1f : 1f);
+    }
+
+    // The ghost IS the pier, from the builder the commit uses — rebuilt
+    // only when the placement actually moves, since a fresh mesh a frame
+    // is churn for nothing.
+    // `edgeHost` null means the pier belongs to `owner` as a corner block.
+    // The mesh is rebuilt only when the placement actually moves — a fresh
+    // native Mesh every frame is churn for nothing.
+    void ShowButtressGhost(Object owner, float where, float top,
+        WallEdge edgeHost, object pier)
+    {
+        var key = (owner, Mathf.Round(where * 500f) / 500f, 0f,
+            Mathf.Round(top * 100f) / 100f);
+        if (buttressGhostMesh == null || !lastButtressKey.HasValue
+            || !lastButtressKey.Value.Equals(key))
+        {
+            if (buttressGhostMesh != null)
+                Destroy(buttressGhostMesh);
+            buttressGhostMesh = null;
+            Mesh mesh;
+            Vector3 pos;
+            float yaw;
+            bool built;
+            if (edgeHost != null)
+                built = WallButtress.TryBuild(edgeHost, (WallEdge.Buttress)pier,
+                    out mesh, out pos, out yaw, out _, out _);
+            else
+                built = WallButtress.TryBuildCorner((WallNode)owner, (WallNode.Buttress)pier,
+                    out mesh, out pos, out yaw, out _, out _);
+            if (built)
+            {
+                buttressGhostMesh = mesh;
+                buttressGhostPos = pos;
+                buttressGhostYaw = yaw;
+            }
+            lastButtressKey = key;
+        }
+        if (buttressGhostMesh == null)
+        {
+            HideGhosts();
+            return;
+        }
+
+        GameObject ghost = GetPooled(ghostPool, 0, previewColor, "PlacementPreview");
+        ghost.SetActive(true);
+        SetGhostMesh(ghost, buttressGhostMesh);
+        SetGhostTint(ghost, buttressBlocked ? deletePreviewColor : previewColor);
+        ghost.transform.SetPositionAndRotation(buttressGhostPos,
+            Quaternion.Euler(0f, buttressGhostYaw, 0f));
+        // The mesh is already world-sized — a pooled ghost carries
+        // whatever scale its last user left on it.
+        ghost.transform.localScale = Vector3.one;
+        for (int i = 1; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    // ---- Crenel tool -----------------------------------------------
+
+    // A battlement along the walls the drag runs over.
+    //
+    // Three phases, so the dials can be reached without holding the mouse
+    // down (the user's call, 2026-08-17): HOVER shows a single merlon
+    // riding the cursor, the DRAG lays out the run, and letting go leaves
+    // it PENDING — still a ghost, still re-laying out as the height and
+    // spacing are dialed — until a second click builds it. Right-click or
+    // Escape abandons at any point.
+    void UpdateCrenel(Mouse mouse, Keyboard keyboard, Ray ray, bool overUI)
+    {
+        HandleCrenelScroll(mouse, keyboard);
+
+        if (crenelPhase != CrenelPhase.Hover && (rightClick
+            || (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)))
+        {
+            CancelCrenel();
+            return;
+        }
+
+        // The confirming click, taken BEFORE this frame's hover work so a
+        // pending run is never re-aimed by the same press that builds it.
+        if (crenelPhase == CrenelPhase.Pending && mouse.leftButton.wasPressedThisFrame
+            && !overUI)
+        {
+            CommitCrenelRun();
+            return;
+        }
+
+        // Declared up front: the short-circuit past TryGetWallHit leaves
+        // its outs unassigned otherwise.
+        WallEdgeSection sec = null;
+        Vector3 hit = default;
+        bool onWall = !overUI && TryGetWallHit(ray, out sec, out hit);
+
+        if (crenelPhase == CrenelPhase.Hover)
+        {
+            if (!onWall)
+            {
+                CancelCrenel();
+                return;
+            }
+            crenelHost = sec.edge;
+            crenelT0 = SnapCrenelT(crenelHost, crenelHost.NearestT(hit, out _),
+                out crenelSnapped);
+            crenelEndEdge = crenelHost;
+            crenelT1 = crenelT0;
+            ShowCrenelHoverGhost();
+            if (mouse.leftButton.wasPressedThisFrame)
+            {
+                // Starting from a battlement that already stands means
+                // continuing it: its height and spacing come along, so a
+                // run built in two drags reads as one piece of masonry.
+                AdoptCrenelStyleAt(crenelHost, crenelT0);
+                crenelPhase = CrenelPhase.Dragging;
+            }
+            return;
+        }
+
+        // Mid-drag the cursor may wander off the masonry — onto the sky,
+        // onto the ground beyond it — and the run keeps the last end it was
+        // given. A drag that had to stay on a metre-wide strip of wall to
+        // survive would be a gesture nobody could finish. A PENDING run is
+        // frozen: only the dials still move it.
+        if (crenelPhase == CrenelPhase.Dragging && onWall)
+        {
+            crenelEndEdge = sec.edge;
+            crenelT1 = SnapCrenelT(crenelEndEdge, crenelEndEdge.NearestT(hit, out _),
+                out crenelSnapped);
+        }
+
+        if (crenelHost == null || crenelEndEdge == null)
+        {
+            CancelCrenel();
+            return;
+        }
+
+        crenelRefusal = BuildCrenelRun(crenelHost, crenelT0, crenelEndEdge, crenelT1,
+            crenelSpans, crenelJoints, out crenelPrice, out crenelMerlons);
+        crenelBlocked = crenelRefusal != null;
+        ShowCrenelRunGhost();
+
+        if (crenelPhase == CrenelPhase.Dragging && mouse.leftButton.wasReleasedThisFrame)
+        {
+            // A release with nothing to show for it goes back to hovering
+            // rather than stranding the player in a red pending state.
+            if (crenelBlocked)
+            {
+                BuildLog.Add(crenelRefusal);
+                CancelCrenel();
+                return;
+            }
+            crenelPhase = CrenelPhase.Pending;
+        }
+    }
+
+    void CommitCrenelRun()
+    {
+        if (crenelBlocked)
+        {
+            BuildLog.Add(crenelRefusal);
+            CancelCrenel();
+            return;
+        }
+        long price = crenelPrice;
+        int merlons = crenelMerlons;
+        int walls = crenelSpans.Count, joints = crenelJoints.Count;
+        var absorbed = new List<int>();
+        foreach ((WallEdge edge, WallEdge.Crenel span) in crenelSpans)
+        {
+            PlanMerge(edge, span, absorbed);
+            // Highest index first: removing by index is only safe downward.
+            absorbed.Sort();
+            for (int i = absorbed.Count - 1; i >= 0; i--)
+                edge.crenels.RemoveAt(absorbed[i]);
+            edge.crenels.Add(span);
+            edge.Rebuild();
+        }
+        foreach ((WallNode node, WallNode.Crenel joint) in crenelJoints)
+        {
+            // One block to a joint, like the clasping pier: a second would
+            // stand at the same point and could only intersect the first.
+            node.crenels.Clear();
+            node.crenels.Add(joint);
+            node.RebuildMesh();
+        }
+        string turned = joints > 0
+            ? ", turning " + joints + " joint" + (joints > 1 ? "s." : ".")
+            : ".";
+        BuildLog.Add("Crenellated — " + merlons + " merlons"
+            + (walls > 1 ? " along " + walls + " walls" : " along the wall") + turned);
+        Estate.Pay(price, "Crenellations");
+        CancelCrenel();
+    }
+
+    // The cursor's parameter, pulled onto whatever it is near: this wall's
+    // own end nodes, and the ends of any battlement already standing on it.
+    // Those are the only points a run has a reason to meet exactly — a
+    // parapet that stops a hand's breadth short of the corner is the one
+    // mistake this gesture can make that the player cannot see until it is
+    // built.
+    float SnapCrenelT(WallEdge edge, float t, out bool snapped)
+    {
+        snapped = false;
+        float[] table = WallEdge.BuildArcTable(edge.A, edge.control, edge.B);
+        float total = table[table.Length - 1];
+        float at = WallEdge.ArcAt(table, Mathf.Clamp01(t));
+        float best = CrenelSnapArc;
+        float bestArc = at;
+        bool hit = false;
+        // A local function can't touch an out parameter, so the answer is
+        // gathered here and handed over at the end.
+        void Consider(float arc)
+        {
+            float d = Mathf.Abs(arc - at);
+            if (d < best) { best = d; bestArc = arc; hit = true; }
+        }
+        Consider(0f);
+        Consider(total);
+        foreach (WallEdge.Crenel c in edge.crenels)
+        {
+            Consider(WallEdge.ArcAt(table, Mathf.Min(c.t0, c.t1)));
+            Consider(WallEdge.ArcAt(table, Mathf.Max(c.t0, c.t1)));
+        }
+        snapped = hit;
+        return WallEdge.TAtArc(table, bestArc);
+    }
+
+    // A run begun on a battlement that already stands continues it: the
+    // height and spacing are read off that stretch rather than off the last
+    // thing the player happened to dial. Looks on this wall first, then
+    // through the node the anchor sits on — starting at a corner means
+    // carrying on from whichever wall arrives there.
+    void AdoptCrenelStyleAt(WallEdge edge, float t)
+    {
+        if (TryReadCrenelStyle(edge, t))
+            return;
+        float[] table = WallEdge.BuildArcTable(edge.A, edge.control, edge.B);
+        float total = table[table.Length - 1];
+        float at = WallEdge.ArcAt(table, Mathf.Clamp01(t));
+        WallNode end = at < CrenelSnapArc ? edge.nodeA
+            : at > total - CrenelSnapArc ? edge.nodeB : null;
+        if (end == null)
+            return;
+        foreach (WallNode.Member m in end.members)
+        {
+            if (m.edge == null || m.edge == edge)
+                continue;
+            if (TryReadCrenelStyle(m.edge, m.atStart ? 0f : 1f))
+                return;
+        }
+    }
+
+    bool TryReadCrenelStyle(WallEdge edge, float t)
+    {
+        float[] table = WallEdge.BuildArcTable(edge.A, edge.control, edge.B);
+        float at = WallEdge.ArcAt(table, Mathf.Clamp01(t));
+        foreach (WallEdge.Crenel c in edge.crenels)
+        {
+            float lo = WallEdge.ArcAt(table, Mathf.Min(c.t0, c.t1)) - CrenelSnapArc;
+            float hi = WallEdge.ArcAt(table, Mathf.Max(c.t0, c.t1)) + CrenelSnapArc;
+            if (at < lo || at > hi)
+                continue;
+            if (c.height > 0.01f)
+                crenelHeight = c.height;
+            if (c.gap > 0.01f)
+                crenelGap = c.gap;
+            return true;
+        }
+        return false;
+    }
+
+    // The two dials. Merlon height tops out at the height a battlement
+    // stands by default and bottoms at a quarter of it — a low kerb rather
+    // than cover, which is still a thing a player might want along a garden
+    // wall. Spacing has no natural maximum, so it gets a generous one.
+    //
+    // Neither is re-armed when the tool is picked up again (unlike the
+    // stair's climb and the pier's top): a parapet dialed once is the
+    // parapet this castle has, and re-stating it on every wall is work the
+    // player already did.
+    void HandleCrenelScroll(Mouse mouse, Keyboard keyboard)
+    {
+        if (keyboard == null)
+            return;
+        bool ctrl = keyboard.leftCtrlKey.isPressed || keyboard.rightCtrlKey.isPressed;
+        bool alt = keyboard.leftAltKey.isPressed || keyboard.rightAltKey.isPressed;
+        if (!ctrl && !alt)
+            return;
+        float scroll = mouse.scroll.ReadValue().y;
+        if (Mathf.Abs(scroll) < 0.01f)
+            return;
+        if (Mathf.Abs(scroll) >= 100f)
+            scroll /= 120f;
+        float notches = Mathf.Clamp(scroll, -4f, 4f);
+
+        // Land ON the dial's own grid, then step by it — round half-up,
+        // never Mathf.Round (banker's rounding jumps alternate notches).
+        if (ctrl)
+        {
+            float step = WallCrenel.HeightStep;
+            float cur = Mathf.Floor(CrenelHeight / step + 0.5f) * step + notches * step;
+            crenelHeight = Mathf.Clamp(cur, WallCrenel.MinHeight, WallCrenel.DefaultHeight);
+            return;
+        }
+        float gstep = WallCrenel.GapStep;
+        float g = Mathf.Floor(CrenelGap / gstep + 0.5f) * gstep + notches * gstep;
+        crenelGap = Mathf.Clamp(g, WallCrenel.MinGap, WallCrenel.MaxGap);
+    }
+
+    // What the drag would raise: the spans, the joint blocks, the price and
+    // the merlon count — or a refusal string, which is the SAME test the
+    // red ghost and the release both read.
+    //
+    // The run FOLLOWS THE MASONRY. A drag that ends on another wall walks
+    // the graph to get there (EdgePath, the delete tool's own path finder),
+    // so crenellating a whole ward is one gesture rather than one per wall.
+    string BuildCrenelRun(WallEdge a, float ta, WallEdge b, float tb,
+        List<(WallEdge, WallEdge.Crenel)> spans,
+        List<(WallNode, WallNode.Crenel)> joints, out long price, out int merlons)
+    {
+        spans.Clear();
+        joints.Clear();
+        price = 0;
+        merlons = 0;
+        float height = CrenelHeight, gap = CrenelGap;
+
+        List<WallEdge> path = a == b ? new List<WallEdge> { a } : EdgePath(a, b);
+        if (path == null)
+            return "Those walls don't join up.";
+
+        // Which joints the run passes THROUGH — every node shared by two
+        // consecutive walls of the path.
+        var through = new List<WallNode>();
+        for (int i = 0; i + 1 < path.Count; i++)
+            through.Add(SharedNode(path[i], path[i + 1]));
+
+        for (int i = 0; i < path.Count; i++)
+        {
+            WallEdge edge = path[i];
+            float lo, hi;
+            bool loJoint, hiJoint;
+            if (path.Count == 1)
+            {
+                lo = Mathf.Min(ta, tb);
+                hi = Mathf.Max(ta, tb);
+                loJoint = hiJoint = false;
+            }
+            else if (i == 0)
+            {
+                bool exitAtB = through[0] == edge.nodeB;
+                lo = exitAtB ? ta : 0f;
+                hi = exitAtB ? 1f : ta;
+                loJoint = !exitAtB;
+                hiJoint = exitAtB;
+            }
+            else if (i == path.Count - 1)
+            {
+                bool entryAtA = through[i - 1] == edge.nodeA;
+                lo = entryAtA ? 0f : tb;
+                hi = entryAtA ? tb : 1f;
+                loJoint = entryAtA;
+                hiJoint = !entryAtA;
+            }
+            else
+            {
+                lo = 0f;
+                hi = 1f;
+                loJoint = hiJoint = true;
+            }
+
+            // Stand back from each joint by the block that will sit on it,
+            // plus one embrasure — otherwise the wall's own first merlon
+            // grows straight out of the joint block with no notch between.
+            float[] table = WallEdge.BuildArcTable(edge.A, edge.control, edge.B);
+            float arcLo = WallEdge.ArcAt(table, Mathf.Clamp01(lo));
+            float arcHi = WallEdge.ArcAt(table, Mathf.Clamp01(hi));
+            float standOff = WallCrenel.NodeReach + gap;
+            if (loJoint)
+                arcLo += standOff;
+            if (hiJoint)
+                arcHi -= standOff;
+            // A leg too short to hold a block after standing back is not an
+            // error: its joints still get theirs, and the parapet simply
+            // steps across the short wall as one piece of masonry.
+            if (arcHi - arcLo < WallCrenel.MinSpan)
+                continue;
+
+            var span = new WallEdge.Crenel
+            {
+                t0 = WallEdge.TAtArc(table, arcLo),
+                t1 = WallEdge.TAtArc(table, arcHi),
+                height = height,
+                gap = gap,
+            };
+            // What would STAND after merging with any battlement already
+            // there — the ghost shows it and the price is the difference,
+            // so swallowing stone the player has paid for doesn't charge
+            // twice and the delete refund still balances.
+            var absorbed = new List<int>();
+            span = PlanMerge(edge, span, absorbed);
+            long standing = 0;
+            foreach (int k in absorbed)
+                standing += Estate.CostOfCrenel(edge, edge.crenels[k]);
+            price += Estate.CostOfCrenel(edge, span) - standing;
+            merlons += WallCrenel.Layout(edge, span).Count;
+            spans.Add((edge, span));
+        }
+
+        foreach (WallNode node in through)
+        {
+            if (node == null || !node.TryCrenelPlan(out _, out _))
+                continue;
+            var joint = new WallNode.Crenel { height = height };
+            long standing = node.crenels.Count > 0
+                ? Estate.CostOfNodeCrenel(node, node.crenels[0]) : 0;
+            price += Estate.CostOfNodeCrenel(node, joint) - standing;
+            merlons += 1;
+            joints.Add((node, joint));
+        }
+
+        price = System.Math.Max(0, price);
+        if (spans.Count == 0 && joints.Count == 0)
+            return "Drag further — a battlement needs "
+                + WallCrenel.MinSpan.ToString("0.0") + "m of wall.";
+        return null;
+    }
+
+    // A battlement drawn onto or across another is ONE battlement: the two
+    // spans merge and the merlons re-lay out across the whole stretch.
+    // Refusing the overlap instead would leave a seam the player can see
+    // and cannot remove, since the layout begins and ends solid at every
+    // span boundary — two abutting spans put two merlons side by side.
+    // The NEW span's height and spacing win, so re-dragging over a
+    // battlement is how you change one.
+    static WallEdge.Crenel PlanMerge(WallEdge edge, WallEdge.Crenel span,
+        List<int> absorbed)
+    {
+        absorbed.Clear();
+        float lo = Mathf.Min(span.t0, span.t1);
+        float hi = Mathf.Max(span.t0, span.t1);
+        bool grew = true;
+        while (grew)
+        {
+            grew = false;
+            for (int i = 0; i < edge.crenels.Count; i++)
+            {
+                if (absorbed.Contains(i))
+                    continue;
+                float a = Mathf.Min(edge.crenels[i].t0, edge.crenels[i].t1);
+                float b = Mathf.Max(edge.crenels[i].t0, edge.crenels[i].t1);
+                if (b < lo - 0.001f || a > hi + 0.001f)
+                    continue;
+                lo = Mathf.Min(lo, a);
+                hi = Mathf.Max(hi, b);
+                absorbed.Add(i);
+                grew = true;
+            }
+        }
+        return new WallEdge.Crenel
+        {
+            t0 = lo,
+            t1 = hi,
+            height = span.height,
+            gap = span.gap,
+        };
+    }
+
+    // The ghost IS the run, from the emitters the commit uses, merged into
+    // one mesh. Rebuilt only when the run actually changes — a fresh native
+    // mesh every frame is churn for nothing.
+    // Before the drag begins: ONE merlon, riding the cursor, so a player
+    // can see the size and height of what they are about to lay before
+    // laying any of it. Where the cursor has snapped to a joint it shows
+    // THAT joint's block instead — the thing that would actually be built
+    // there — and turns gold, the same tell every other snap gives.
+    void ShowCrenelHoverGhost()
+    {
+        WallNode joint = CrenelJointAt(crenelHost, crenelT0);
+        var key = (crenelHost, Mathf.Round(crenelT0 * 2000f) / 2000f,
+            (WallEdge)null, joint == null ? 0f : 1f, CrenelHeight, CrenelGap);
+        if (crenelGhostMesh == null || !lastCrenelKey.HasValue
+            || !lastCrenelKey.Value.Equals(key))
+        {
+            if (crenelGhostMesh != null)
+                Destroy(crenelGhostMesh);
+            crenelGhostMesh = joint != null
+                ? (WallCrenel.TryBuildNode(joint,
+                    new WallNode.Crenel { height = CrenelHeight }, out Mesh jm) ? jm : null)
+                : (WallCrenel.TryBuild(crenelHost,
+                    OneMerlonAt(crenelHost, crenelT0, CrenelHeight, CrenelGap),
+                    out Mesh mm) ? mm : null);
+            lastCrenelKey = key;
+        }
+        PaintCrenelGhost(crenelSnapped ? snapColor : previewColor);
+    }
+
+    void ShowCrenelRunGhost()
+    {
+        var key = (crenelHost, Mathf.Round(crenelT0 * 2000f) / 2000f,
+            crenelEndEdge, Mathf.Round(crenelT1 * 2000f) / 2000f,
+            CrenelHeight, CrenelGap);
+        if (crenelGhostMesh == null || !lastCrenelKey.HasValue
+            || !lastCrenelKey.Value.Equals(key))
+        {
+            if (crenelGhostMesh != null)
+                Destroy(crenelGhostMesh);
+            crenelGhostMesh = WallCrenel.BuildRun(crenelSpans, crenelJoints);
+            lastCrenelKey = key;
+        }
+        PaintCrenelGhost(crenelBlocked ? deletePreviewColor
+            : crenelSnapped ? snapColor : previewColor);
+    }
+
+    void PaintCrenelGhost(Color tint)
+    {
+        if (crenelGhostMesh == null)
+        {
+            HideGhosts();
+            return;
+        }
+        ghostTopY = crenelGhostMesh.bounds.max.y;
+
+        GameObject ghost = GetPooled(ghostPool, 0, previewColor, "PlacementPreview");
+        ghost.SetActive(true);
+        SetGhostMesh(ghost, crenelGhostMesh);
+        SetGhostTint(ghost, tint);
+        // The mesh is already in world space on a unit transform — the wall
+        // convention — so the ghost object carries no transform of its own.
+        ghost.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+        ghost.transform.localScale = Vector3.one;
+        for (int i = 1; i < ghostPool.Count; i++)
+            ghostPool[i].SetActive(false);
+    }
+
+    // A span exactly one merlon long, centred where the cursor is: the
+    // hover ghost is built by the SAME layout the commit runs, so what
+    // rides the cursor is a real merlon of this wall and not a stand-in.
+    static WallEdge.Crenel OneMerlonAt(WallEdge edge, float t, float height, float gap)
+    {
+        float[] table = WallEdge.BuildArcTable(edge.A, edge.control, edge.B);
+        float total = table[table.Length - 1];
+        float half = WallCrenel.MerlonWidth * 0.5f;
+        float at = Mathf.Clamp(WallEdge.ArcAt(table, Mathf.Clamp01(t)), half, total - half);
+        return new WallEdge.Crenel
+        {
+            t0 = WallEdge.TAtArc(table, at - half),
+            t1 = WallEdge.TAtArc(table, at + half),
+            height = height,
+            gap = gap,
+        };
+    }
+
+    // The node this parameter is sitting on, if it is sitting on one.
+    static WallNode CrenelJointAt(WallEdge edge, float t)
+    {
+        if (edge == null)
+            return null;
+        float[] table = WallEdge.BuildArcTable(edge.A, edge.control, edge.B);
+        float total = table[table.Length - 1];
+        float at = WallEdge.ArcAt(table, Mathf.Clamp01(t));
+        if (at < 0.01f)
+            return edge.nodeA;
+        if (at > total - 0.01f)
+            return edge.nodeB;
+        return null;
+    }
+
+    void CancelCrenel()
+    {
+        crenelHost = null;
+        crenelEndEdge = null;
+        crenelPhase = CrenelPhase.Hover;
+        crenelSnapped = false;
+        crenelBlocked = false;
+        crenelRefusal = null;
+        crenelPrice = 0;
+        crenelMerlons = 0;
+        crenelSpans.Clear();
+        crenelJoints.Clear();
+        lastCrenelKey = null;
+        if (crenelGhostMesh != null)
+            Destroy(crenelGhostMesh);
+        crenelGhostMesh = null;
+        HideGhosts();
+    }
+
+    // The wall under the cursor for the crenel tool: the first thing there,
+    // whichever face it is. Unlike the stair and the doorway this tool
+    // needs no top-or-side decision — a battlement runs along the wall's
+    // top wherever on the wall you point at it — so the cut-surface
+    // question never arises, and pointing at a crenellated wall to extend
+    // its battlement has to see past the merlons already standing.
+    bool TryGetWallHit(Ray ray, out WallEdgeSection section, out Vector3 point)
+    {
+        section = null;
+        point = default;
+        RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (RaycastHit hit in hits)
+        {
+            if (hit.collider.isTrigger)
+                continue;
+            if (hit.collider.GetComponent<WallButtress>() != null
+                || hit.collider.GetComponent<WallCrenel>() != null)
+                continue;
+            section = hit.collider.GetComponent<WallEdgeSection>();
+            if (section == null || section.edge == null)
+            {
+                section = null;
+                return false;
+            }
+            point = new Vector3(hit.point.x, 0f, hit.point.z);
+            return true;
+        }
+        return false;
+    }
+
+    void CancelButtress()
+    {
+        buttressHost = null;
+        buttressCorner = null;
+        buttressBlocked = false;
+        buttressRefusal = null;
+        buttressPrice = 0;
+        lastButtressKey = null;
+        if (buttressGhostMesh != null)
+            Destroy(buttressGhostMesh);
+        buttressGhostMesh = null;
         HideGhosts();
     }
 
@@ -3811,6 +5464,22 @@ public class GridPlacementSystem : MonoBehaviour
     // the derivation. The chain's own winding picks the trace side.
     void CommitRoomChain()
     {
+        CommitRoomChainEdges(true);
+        CancelRoomChain();
+    }
+
+    // Esc on an open chain BUILDS the clicked legs instead of discarding
+    // them — the room tool's chain keeps the wall chain's promise. No
+    // enclosure announcement: an open run closed nothing.
+    void FinishRoomChain()
+    {
+        if (roomChain.Count >= 2)
+            CommitRoomChainEdges(false);
+        CancelRoomChain();
+    }
+
+    void CommitRoomChainEdges(bool closed)
+    {
         WallEdge lastEdge = null;
         var allCreated = new List<WallEdge>();
         for (int i = 0; i + 1 < roomChain.Count; i++)
@@ -3832,9 +5501,8 @@ public class GridPlacementSystem : MonoBehaviour
         // Chain wound counter-clockwise → its interior is on the left of
         // travel, which is the side TraceFace walks — trace the last edge
         // along the gesture. Clockwise → trace it reversed.
-        if (lastEdge != null)
+        if (closed && lastEdge != null)
             Enclosure.AnnounceChainClose(lastEdge, Enclosure.SignedArea(roomChain) > 0f);
-        CancelRoomChain();
     }
 
     void CancelRoomChain()
@@ -4056,6 +5724,7 @@ public class GridPlacementSystem : MonoBehaviour
         if (rightClick && slabChain.Count > 0)
         {
             slabChain.RemoveAt(slabChain.Count - 1);
+            slabChainTiles.RemoveAt(slabChainTiles.Count - 1);
             if (slabChain.Count == 0)
                 CancelSlabChain();
             return;
@@ -4065,11 +5734,18 @@ public class GridPlacementSystem : MonoBehaviour
         if (foundation)
             HandleSlabPlaneScroll(mouse, keyboard);
 
+        // Shift while a leg is in progress means angle stepping. A POINT
+        // snap (an outline corner, a wall node) still outranks it — only
+        // one of a point and an angle can be honoured — but the
+        // edge-slide snap yields to it, the flank rule everywhere.
+        bool stepAim = keyboard != null && slabChain.Count > 0
+            && (keyboard.leftShiftKey.isPressed
+                || keyboard.rightShiftKey.isPressed);
         bool has = foundation
-            ? ResolveFoundationPoint(ray, free, overUI, out Vector3 point,
-                out float plane, out bool snapped)
-            : ResolveFloorPoint(ray, free, overUI, out point, out plane,
-                out snapped);
+            ? ResolveFoundationPoint(ray, free, overUI, stepAim, out Vector3 point,
+                out float plane, out bool snapped, out SlabTile snapTile)
+            : ResolveFloorPoint(ray, free, overUI, stepAim, out point, out plane,
+                out snapped, out snapTile);
         if (!has)
         {
             // Off-target frames (HUD, sky, nothing to anchor to) keep
@@ -4077,7 +5753,7 @@ public class GridPlacementSystem : MonoBehaviour
             if (slabChain.Count > 0)
             {
                 slabTempPoly.Clear();
-                slabTempPoly.AddRange(slabChain);
+                slabTempPoly.AddRange(BuildTracedSlabPoly(null, null, false));
                 ghostTopY = slabChainPlane;
                 ShowSlabChainGhost(null, slabChainPlane, foundation,
                     slabTempPoly.Count >= 3 && SlabPolyRefusal(slabTempPoly,
@@ -4097,46 +5773,70 @@ public class GridPlacementSystem : MonoBehaviour
 
         // The chain leg reads like the room chain's: Shift steps the
         // bearing in angleStep increments (snaps and the closing pull
-        // outrank it — only one of a point and an angle can be
-        // honoured), and the corner readout appears once a previous leg
+        // outrank it), and the corner readout appears once a previous leg
         // gives it a reference.
         if (!closing && slabChain.Count > 0)
         {
             Vector3 last = slabChain[slabChain.Count - 1];
-            if (FlatDistance(point, last) >= 0.25f)
+            // A live leg whose ends share a host outline is a TRACE of
+            // that outline, not a chord — no bearing to step or read.
+            bool tracedLeg = snapTile != null
+                && slabChainTiles[slabChainTiles.Count - 1] == snapTile;
+            if (!tracedLeg && FlatDistance(point, last) >= 0.25f)
             {
+                if (stepAim && !snapped)
+                {
+                    // Stepping is RELATIVE to the leg it grows from once
+                    // one exists — stepped corners land on clean 5°
+                    // readings even off the world grid, exactly like the
+                    // room chain's — and absolute on the first leg.
+                    float refB = 0f;
+                    if (slabChain.Count >= 2)
+                    {
+                        Vector3 back = slabChain[slabChain.Count - 2] - last;
+                        refB = Mathf.Atan2(back.z, back.x) * Mathf.Rad2Deg;
+                    }
+                    point = StepBearingFrom(refB, last, point);
+                }
                 float bearing = Mathf.Atan2(point.z - last.z, point.x - last.x)
                     * Mathf.Rad2Deg;
-                bool stepAim = keyboard != null && !snapped
-                    && (keyboard.leftShiftKey.isPressed
-                        || keyboard.rightShiftKey.isPressed);
-                if (stepAim)
-                {
-                    float len = FlatDistance(point, last);
-                    bearing = Mathf.Round(bearing / angleStep) * angleStep;
-                    float rad = bearing * Mathf.Deg2Rad;
-                    point = last
-                        + new Vector3(Mathf.Cos(rad), 0f, Mathf.Sin(rad)) * len;
-                }
                 if (slabChain.Count >= 2)
                 {
                     Vector3 back = slabChain[slabChain.Count - 2] - last;
-                    activeAngle = (last,
-                        Mathf.Atan2(back.z, back.x) * Mathf.Rad2Deg, bearing);
+                    activeAngles.Add((last,
+                        Mathf.Atan2(back.z, back.x) * Mathf.Rad2Deg, bearing));
                 }
                 guideBearing = bearing;
                 dimGuides.Add((last, point, FlatDistance(point, last)));
             }
         }
+        // A closing hover changes TWO corners at once — where the closing
+        // leg leaves the last placed point, and where it lands on the
+        // anchor — so both read.
+        else if (closing && slabChain.Count >= 3)
+        {
+            Vector3 last = slabChain[slabChain.Count - 1];
+            Vector3 s = slabChain[0];
+            Vector3 back = slabChain[slabChain.Count - 2] - last;
+            activeAngles.Add((last,
+                Mathf.Atan2(back.z, back.x) * Mathf.Rad2Deg,
+                Mathf.Atan2(s.z - last.z, s.x - last.x) * Mathf.Rad2Deg));
+            activeAngles.Add((s,
+                Mathf.Atan2(last.z - s.z, last.x - s.x) * Mathf.Rad2Deg,
+                Mathf.Atan2(slabChain[1].z - s.z, slabChain[1].x - s.x)
+                    * Mathf.Rad2Deg));
+        }
 
-        // The tentative polygon: the chain closed through the cursor. The
-        // refusal below IS the commit test run on it, so red at any
-        // moment answers "what if you closed here" (one-test doctrine).
+        // The tentative polygon: the chain closed through the cursor,
+        // same-host legs traced along their host's outline. The refusal
+        // below IS the commit test run on it, so red at any moment
+        // answers "what if you closed here" (one-test doctrine).
         slabTempPoly.Clear();
-        slabTempPoly.AddRange(slabChain);
-        if (!closing && (slabChain.Count == 0
-            || FlatDistance(point, slabChain[slabChain.Count - 1]) >= 0.05f))
-            slabTempPoly.Add(point);
+        bool liveLeg = !closing && (slabChain.Count == 0
+            || FlatDistance(point, slabChain[slabChain.Count - 1]) >= 0.05f);
+        slabTempPoly.AddRange(BuildTracedSlabPoly(
+            liveLeg ? point : (Vector3?)null, liveLeg ? snapTile : null,
+            closing));
         string refusal = slabTempPoly.Count >= 3
             ? SlabPolyRefusal(slabTempPoly, plane, foundation)
             : null;
@@ -4152,6 +5852,7 @@ public class GridPlacementSystem : MonoBehaviour
         if (slabChain.Count == 0)
         {
             slabChain.Add(point);
+            slabChainTiles.Add(snapTile);
             slabChainPlane = plane;
             slabPlaneDial = 0f;
         }
@@ -4162,17 +5863,21 @@ public class GridPlacementSystem : MonoBehaviour
                 BuildLog.Add("Refused: " + refusal);
                 return;
             }
-            CommitSlabPoly(slabChain, foundation);
+            // slabTempPoly IS the traced closed polygon this frame — the
+            // very shape the refusal above just passed.
+            CommitSlabPoly(slabTempPoly, foundation);
         }
         else if (FlatDistance(point, slabChain[slabChain.Count - 1]) >= 0.25f)
         {
             slabChain.Add(point);
+            slabChainTiles.Add(snapTile);
         }
     }
 
     void CancelSlabChain()
     {
         slabChain.Clear();
+        slabChainTiles.Clear();
         slabShapePts.Clear();
         slabPlaneDial = 0f;
         HideGhosts();
@@ -4227,8 +5932,12 @@ public class GridPlacementSystem : MonoBehaviour
             && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
         HandleSlabPlaneScroll(mouse, keyboard);
 
-        if (!ResolveFoundationPoint(ray, free, overUI, out Vector3 point,
-            out float plane, out bool snapped))
+        // Shift after the anchor means the figure's bearing (first side)
+        // or the square constraint (width) — either way the edge-slide
+        // snap yields to it; corner welds still outrank.
+        if (!ResolveFoundationPoint(ray, free, overUI,
+            shift && slabShapePts.Count > 0, out Vector3 point,
+            out float plane, out bool snapped, out _))
         {
             if (slabShapePts.Count == 0)
                 HideGhosts();
@@ -4379,17 +6088,22 @@ public class GridPlacementSystem : MonoBehaviour
     // free anchor seats at its own ground ceiled to the quarter grid,
     // plus whatever the dial says.
     bool ResolveFoundationPoint(Ray ray, bool free, bool overUI,
-        out Vector3 point, out float plane, out bool snapped)
+        bool stepAim, out Vector3 point, out float plane, out bool snapped,
+        out SlabTile snapTile)
     {
         point = default;
         plane = 0f;
         snapped = false;
+        snapTile = null;
         if (overUI || !TryGetTerrainPoint(ray, out Vector3 p))
             return false;
         point = new Vector3(p.x, 0f, p.z);
 
+        // A stepped aim keeps the corner welds (a point outranks an
+        // angle) but drops the edge slide — Shift means the bearing.
         float hostPlane = 0f;
-        if (!free && TrySlabOutlineSnap(true, ref point, ref hostPlane))
+        if (!free && TrySlabOutlineSnap(true, stepAim, ref point, ref hostPlane,
+            out snapTile))
             snapped = true;
 
         // A shape anchor states the plane exactly as a chain anchor does.
@@ -4412,11 +6126,13 @@ public class GridPlacementSystem : MonoBehaviour
     // around. Corners snap to wall nodes carrying masonry at the plane,
     // and to existing floor outlines at it.
     bool ResolveFloorPoint(Ray ray, bool free, bool overUI,
-        out Vector3 point, out float plane, out bool snapped)
+        bool stepAim, out Vector3 point, out float plane, out bool snapped,
+        out SlabTile snapTile)
     {
         point = default;
         plane = slabChain.Count > 0 ? slabChainPlane : 0f;
         snapped = false;
+        snapTile = null;
         if (overUI)
             return false;
 
@@ -4431,7 +6147,8 @@ public class GridPlacementSystem : MonoBehaviour
                 plane = tile.topY;
                 float hostPlane = plane;
                 if (!free)
-                    TrySlabOutlineSnap(false, ref point, ref hostPlane);
+                    TrySlabOutlineSnap(false, stepAim, ref point, ref hostPlane,
+                        out snapTile);
                 snapped = true;
                 return true;
             }
@@ -4467,11 +6184,13 @@ public class GridPlacementSystem : MonoBehaviour
             {
                 Vector3 snapPt = point;
                 float hostPlane = plane;
-                if (TrySlabOutlineSnap(false, ref snapPt, ref hostPlane)
+                if (TrySlabOutlineSnap(false, stepAim, ref snapPt, ref hostPlane,
+                    out SlabTile onTile)
                     && Mathf.Abs(hostPlane - plane) < 0.25f)
                 {
                     point = snapPt;
                     snapped = true;
+                    snapTile = onTile;
                 }
             }
         }
@@ -4500,12 +6219,22 @@ public class GridPlacementSystem : MonoBehaviour
     // Snap a chain corner onto an existing outline of the same kind — its
     // corners first (weld exactly), then its edges (slide onto the line).
     // Reports the host's plane so a foundation ANCHOR can adopt the level
-    // it is extending.
-    bool TrySlabOutlineSnap(bool foundations, ref Vector3 point, ref float hostPlane)
+    // it is extending. cornersOnly drops the edge slide — a stepped aim
+    // keeps the welds but owns the bearing.
+    // How close an outline corner must aim to weld to an existing slab's
+    // corner, and to its edge. Doubled with every other reach 2026-08-16;
+    // a corner still outranks an edge, which is what keeps two pads
+    // sharing an exact vertex rather than a point 3cm along the line.
+    const float SlabCornerSnapRadius = 1f;
+    const float SlabEdgeSnapRadius = 0.8f;
+
+    bool TrySlabOutlineSnap(bool foundations, bool cornersOnly,
+        ref Vector3 point, ref float hostPlane, out SlabTile host)
     {
+        host = null;
         SlabTile bestTile = null;
         Vector3 bestPt = default;
-        float best = 0.5f;
+        float best = SlabCornerSnapRadius;
         foreach (SlabTile t in SlabTile.All)
         {
             if (t == null || t.isFoundation != foundations)
@@ -4521,9 +6250,9 @@ public class GridPlacementSystem : MonoBehaviour
                 }
             }
         }
-        if (bestTile == null)
+        if (bestTile == null && !cornersOnly)
         {
-            best = 0.4f;
+            best = SlabEdgeSnapRadius;
             foreach (SlabTile t in SlabTile.All)
             {
                 if (t == null || t.isFoundation != foundations)
@@ -4546,7 +6275,88 @@ public class GridPlacementSystem : MonoBehaviour
             return false;
         point = new Vector3(bestPt.x, 0f, bestPt.z);
         hostPlane = bestTile.topY;
+        host = bestTile;
         return true;
+    }
+
+    // The host-outline path between two points that both lie on it: the
+    // host's verts strictly between them, along the SHORTER way around.
+    // Empty when they share an edge or a corner. This is what lets a new
+    // outline MATCH a neighbour's edge shape — the traced verts are the
+    // host's own, so the shared boundary is exact and the overlap law
+    // reads clean contact.
+    static List<Vector3> SlabTraceBetween(SlabTile tile, Vector3 a, Vector3 b)
+    {
+        var picksOut = new List<Vector3>();
+        List<Vector3> v = tile.verts;
+        int n = v.Count;
+        if (n < 3)
+            return picksOut;
+        var cum = new float[n + 1];
+        for (int i = 0; i < n; i++)
+            cum[i + 1] = cum[i] + FlatDistance(v[i], v[(i + 1) % n]);
+        float perim = cum[n];
+        if (perim < 0.01f)
+            return picksOut;
+        float PosOf(Vector3 p)
+        {
+            float best = float.MaxValue;
+            float pos = 0f;
+            for (int i = 0; i < n; i++)
+            {
+                Vector3 q = ClosestOnSegment(v[i], v[(i + 1) % n], p);
+                float d = FlatDistance(p, q);
+                if (d < best)
+                {
+                    best = d;
+                    pos = cum[i] + FlatDistance(v[i], q);
+                }
+            }
+            return pos;
+        }
+        float pa = PosOf(a);
+        float fwd = Mathf.Repeat(PosOf(b) - pa, perim);
+        bool forward = fwd <= perim - fwd;
+        float span = forward ? fwd : perim - fwd;
+        var picks = new List<(float rel, Vector3 p)>();
+        for (int i = 0; i < n; i++)
+        {
+            float rel = forward
+                ? Mathf.Repeat(cum[i] - pa, perim)
+                : Mathf.Repeat(pa - cum[i], perim);
+            if (rel > 0.01f && rel < span - 0.01f)
+                picks.Add((rel, v[i]));
+        }
+        picks.Sort((x, y) => x.rel.CompareTo(y.rel));
+        foreach ((float _, Vector3 p) in picks)
+            picksOut.Add(p);
+        return picksOut;
+    }
+
+    // The chain with every same-host leg traced along its host's outline
+    // — the ONE polygon the ghost, the refusal and the commit all read
+    // (one-test doctrine). cursor extends the chain by the live leg;
+    // closeLoop adds the closing leg's trace back to the anchor.
+    List<Vector3> BuildTracedSlabPoly(Vector3? cursor, SlabTile cursorTile,
+        bool closeLoop)
+    {
+        var poly = new List<Vector3>();
+        int count = slabChain.Count + (cursor.HasValue ? 1 : 0);
+        Vector3 PointAt(int i) => i < slabChain.Count ? slabChain[i] : cursor.Value;
+        SlabTile TileAt(int i) => i < slabChain.Count ? slabChainTiles[i] : cursorTile;
+        for (int i = 0; i < count; i++)
+        {
+            poly.Add(PointAt(i));
+            bool wrap = i == count - 1;
+            if (wrap && !closeLoop)
+                continue;
+            int j = wrap ? 0 : i + 1;
+            SlabTile host = TileAt(i);
+            if (host != null && host == TileAt(j)
+                && FlatDistance(PointAt(i), PointAt(j)) >= 0.02f)
+                poly.AddRange(SlabTraceBetween(host, PointAt(i), PointAt(j)));
+        }
+        return poly;
     }
 
     static Vector3 ClosestOnSegment(Vector3 a, Vector3 b, Vector3 p)
@@ -4565,7 +6375,12 @@ public class GridPlacementSystem : MonoBehaviour
     // is measured against the outline AND the inset centerline both —
     // pointing at the visible slab edge and pointing at where the wall
     // will stand are the same intent.
-    const float RimEdgeSnapRadius = 0.45f;
+    const float RimEdgeSnapRadius = 0.9f;
+
+    // How close a circle's anchor must aim to grab a slab's centroid —
+    // the concentric-tower snap. Wider than a corner weld because the
+    // centre of a pad has no visible mark to aim at.
+    const float CentroidSnapRadius = 2f;
 
     // Walls hug a slab's rim: a point over the slab pulls to the outline
     // inset half a wall thickness, so the committed wall's outer FACE
@@ -4609,6 +6424,19 @@ public class GridPlacementSystem : MonoBehaviour
         return best;
     }
 
+    // The rim snap as every GESTURE asks for it: it stands aside for the
+    // wall the cursor is riding. The rim's own stretch of masonry is
+    // refused deeper in, per candidate (RimUnderMasonry) — this only
+    // catches the cursor case, where a ride is already resolved.
+    bool TryRimSnap(SlabTile tile, Vector3 raw, out Vector3 point, out float yaw)
+    {
+        point = default;
+        yaw = 0f;
+        if (tile == null || hoverRideHost != null)
+            return false;
+        return TrySlabRimSnap(tile, raw, out point, out yaw);
+    }
+
     bool TrySlabRimSnap(SlabTile tile, Vector3 raw, out Vector3 point, out float yaw)
     {
         point = default;
@@ -4645,11 +6473,10 @@ public class GridPlacementSystem : MonoBehaviour
                 continue;
             float d = Mathf.Min(FlatDistance(raw, inset[i]),
                 FlatDistance(raw, verts[i]));
-            if (d < best)
-            {
-                best = d;
-                bestCorner = i;
-            }
+            if (d >= best || RimUnderMasonry(tile, inset[i], verts[i]))
+                continue;
+            best = d;
+            bestCorner = i;
         }
         if (bestCorner >= 0)
         {
@@ -4678,14 +6505,13 @@ public class GridPlacementSystem : MonoBehaviour
             if (!valid[i] || !valid[j])
                 continue;
             Vector3 q = ClosestOnSegment(inset[i], inset[j], raw);
-            float d = Mathf.Min(FlatDistance(raw, q),
-                FlatDistance(raw, ClosestOnSegment(verts[i], verts[j], raw)));
-            if (d < best)
-            {
-                best = d;
-                bestEdge = i;
-                bestPt = q;
-            }
+            Vector3 onLine = ClosestOnSegment(verts[i], verts[j], raw);
+            float d = Mathf.Min(FlatDistance(raw, q), FlatDistance(raw, onLine));
+            if (d >= best || RimUnderMasonry(tile, q, onLine))
+                continue;
+            best = d;
+            bestEdge = i;
+            bestPt = q;
         }
         if (bestEdge < 0)
             return false;
@@ -4693,6 +6519,27 @@ public class GridPlacementSystem : MonoBehaviour
         Vector3 dir = verts[(bestEdge + 1) % n] - verts[bestEdge];
         yaw = Mathf.Atan2(-dir.z, dir.x) * Mathf.Rad2Deg;
         return true;
+    }
+
+    // A rim is not offered where masonry stands UNDER it — the wall says
+    // where the next one goes, and the rim would only ever offer a second,
+    // wrong point half a thickness beside it. A floor slab drawn onto its
+    // own walls covers their tops and renders 2mm proud, so the slab takes
+    // the ray along its whole edge, not merely where the cursor sits over
+    // the stone — which is why testing the CURSOR's point (the first cut
+    // at this) left the phantom line exactly where the player was working.
+    // The test is the rim's own point instead, and three probes wide: an
+    // outline may have been drawn along a wall's centerline or along
+    // either of its faces, which puts the masonry at the inset point, on
+    // the outline, or at the outset mirror. Walls STANDING on the slab
+    // share its base and are excluded by RideHostUnder, so a pad's rim
+    // keeps its snap with a curtain already on it — that is the whole
+    // purpose of the rim, and only the storey BELOW ever blocks it.
+    bool RimUnderMasonry(SlabTile tile, Vector3 rimPoint, Vector3 outlinePoint)
+    {
+        return RideHostUnder(rimPoint, tile.topY) != null
+            || RideHostUnder(outlinePoint, tile.topY) != null
+            || RideHostUnder(outlinePoint * 2f - rimPoint, tile.topY) != null;
     }
 
     // Unit inward (interior-side) normal of the outline edge a→b. The
@@ -5287,6 +7134,11 @@ public class GridPlacementSystem : MonoBehaviour
         {
             if (hit.collider.isTrigger)
                 continue;
+            // Decoration, not surface — see TryGetBuildSurface. Both
+            // resolvers have to agree about this or the wall tool and the
+            // room chain would read a crenellated wall-walk differently.
+            if (hit.collider.GetComponent<WallCrenel>() != null)
+                continue;
             first = hit;
             hasHit = true;
             break;
@@ -5317,6 +7169,17 @@ public class GridPlacementSystem : MonoBehaviour
             deckY = slabTile.topY;
             hoverBaseY = deckY;
             hoverSlabTile = slabTile;
+            // ...except directly over a wall. A floor slab drawn onto its
+            // own walls covers their tops (it renders 2mm proud, so it
+            // takes the ray), and the free-form exemption then handed the
+            // rim — inset half a thickness, so a phantom line just off the
+            // wall's centerline — the point that belongs to the masonry
+            // underfoot. Where a wall is genuinely under the cursor the
+            // WALL states where the next one goes; the rest of the slab
+            // stays free-form, and Alt still frees both.
+            // The ride branch below puts the point on the host's
+            // centerline, exactly as a bare wall-top hit does.
+            hoverRideHost = RideHostUnder(rawSurface, slabTile.topY);
         }
         // A cut-open wall's cross-section is not a wall top: it has the
         // same upward normal, but stacking on it would build at the wall's
@@ -5387,8 +7250,7 @@ public class GridPlacementSystem : MonoBehaviour
         // pull is to the MITERED corner point, so walls drawn along
         // adjacent edges meet at one shared node. Existing masonry (the
         // snaps above) outranks the rim; Alt frees, as everywhere.
-        if (slabTile != null
-            && TrySlabRimSnap(slabTile, rawSurface, out Vector3 rimPoint, out float rimYaw))
+        if (TryRimSnap(slabTile, rawSurface, out Vector3 rimPoint, out float rimYaw))
         {
             hoverSnapYaw = rimYaw;
             point = rimPoint;
@@ -5482,6 +7344,8 @@ public class GridPlacementSystem : MonoBehaviour
             // so without this they'd all answer every search.
             if (baseSnap.edge == null)
                 continue;
+            float radiusSq = NodeGrabRadius(node, atBase);
+            radiusSq *= radiusSq;
 
             void Consider(Vector3 candidate)
             {
@@ -5490,7 +7354,7 @@ public class GridPlacementSystem : MonoBehaviour
                 float dx = candidate.x - raw.x;
                 float dz = candidate.z - raw.z;
                 float sq = dx * dx + dz * dz;
-                if (sq >= bestSq)
+                if (sq >= bestSq || sq >= radiusSq)
                     return;
                 bestSq = sq;
                 found = true;
@@ -5511,6 +7375,39 @@ public class GridPlacementSystem : MonoBehaviour
         }
         snap = best;
         return found;
+    }
+
+    // Never let a node's grab shrink past this: a joint has to stay easy
+    // to hit even where the masonry around it is tiny. Deliberately NOT
+    // doubled with the other reaches (2026-08-16) — this is the floor of
+    // a SHORTENING rule, not a reach. At 0.9m a node would own a 5m
+    // tower's whole 1.5m arc again (a cursor on the face is half a
+    // thickness off the centerline, so 0.9m radial covers 0.75m along the
+    // wall from each end), which is exactly the tower-face bug the rule
+    // was written to kill. Ordinary walls take their reach from
+    // endpointSnapRadius and doubled with everything else.
+    const float MinNodeGrab = 0.45f;
+
+    // How far a node reaches for the cursor. A flat endpointSnapRadius is
+    // right on an ordinary wall, but a round tower is eight SHORT arcs —
+    // on a 5m ring each is 1.5m — and a 0.75m grab from each end covered
+    // the whole of every one of them. That is why joining a wall to a
+    // tower's FACE could only ever answer "corner": there was no point on
+    // the arc the nodes didn't already own. Capping the grab at a third of
+    // the shortest wall meeting here gives the middle of even a short arc
+    // back to the flank, and leaves every ordinary node exactly as it was.
+    float NodeGrabRadius(WallNode node, float? atBase)
+    {
+        float shortest = float.MaxValue;
+        foreach (WallNode.Member m in node.members)
+        {
+            if (m.edge == null || !BaseMatches(m.edge, atBase))
+                continue;
+            shortest = Mathf.Min(shortest, FlatDistance(m.edge.A, m.edge.B));
+        }
+        if (shortest == float.MaxValue)
+            return endpointSnapRadius;
+        return Mathf.Clamp(shortest / 3f, MinNodeGrab, endpointSnapRadius);
     }
 
     EndSnap MakeNodeSnap(WallNode node, float? atBase = null)
@@ -5640,6 +7537,8 @@ public class GridPlacementSystem : MonoBehaviour
     // at any angle, and the wedge rule fills the shoulder. `from` (the
     // drag anchor) picks which side the wall leaves toward and excludes
     // candidates near itself; host end zones are left to node snapping.
+    const float FlankEndZone = 0.15f;
+
     bool TryFlankSnap(Vector3 raw, Vector3? from, float? atBase, out EndSnap snap)
     {
         snap = default;
@@ -5656,7 +7555,21 @@ public class GridPlacementSystem : MonoBehaviour
                 continue;
             Vector3 cPoint = WallEdge.Evaluate(edge.A, edge.control, edge.B, t);
             cPoint = new Vector3(cPoint.x, 0f, cPoint.z);
-            if (FlatDistance(cPoint, edge.A) < 0.9f || FlatDistance(cPoint, edge.B) < 0.9f)
+            // The end zone is now only a guard against splitting a host
+            // into nothing — the ENDS are owned by node snapping, which
+            // every caller tries first, so they never needed reserving
+            // here as well. The old flat 0.9m reserved far more than the
+            // node could actually reach: a cursor on a wall's FACE is half
+            // a thickness off the centerline, so a 0.75m node grab covers
+            // only 0.56m along the wall, and the 0.34m beyond that snapped
+            // to nothing at all. On a round tower — eight arcs, 1.5m each
+            // on a 5m ring — 0.9m off both ends left no flank whatsoever,
+            // which is why a wall could only ever meet a tower at a
+            // corner.
+            float endZone = Mathf.Min(FlankEndZone,
+                FlatDistance(edge.A, edge.B) * 0.25f);
+            if (FlatDistance(cPoint, edge.A) < endZone
+                || FlatDistance(cPoint, edge.B) < endZone)
                 continue;
             if (from.HasValue && FlatDistance(cPoint, from.Value) < lengthStep)
                 continue;
@@ -5974,6 +7887,16 @@ public class GridPlacementSystem : MonoBehaviour
             if (edge == null || WallGraph.SameBase(edge.baseY, baseY))
                 continue;
             float half = edge.thickness * 0.5f;
+            // Cheap reject before the curve walk. A quadratic lies inside
+            // the hull of its three points, so anything outside that box
+            // grown by half a thickness cannot be underfoot — and NearestT
+            // costs ~80 evaluations, paid per edge, per call.
+            float minX = Mathf.Min(edge.A.x, Mathf.Min(edge.control.x, edge.B.x)) - half;
+            float maxX = Mathf.Max(edge.A.x, Mathf.Max(edge.control.x, edge.B.x)) + half;
+            float minZ = Mathf.Min(edge.A.z, Mathf.Min(edge.control.z, edge.B.z)) - half;
+            float maxZ = Mathf.Max(edge.A.z, Mathf.Max(edge.control.z, edge.B.z)) + half;
+            if (point.x < minX || point.x > maxX || point.z < minZ || point.z > maxZ)
+                continue;
             edge.NearestT(point, out float distSq);
             if (distSq > half * half || distSq >= bestSq)
                 continue;
@@ -6488,7 +8411,71 @@ public class GridPlacementSystem : MonoBehaviour
         {
             doomedSections.Clear();
             deleteRanges.Clear();
-            if (!overUI && TryGetSectionUnderCursor(ray, out WallEdgeSection hovered))
+            // A buttress comes down whole, and it is checked FIRST: it
+            // stands in front of the wall it belongs to, so a section pick
+            // would either miss it entirely or delete the masonry behind
+            // it. Taking the pier down leaves the wall exactly as it was —
+            // it is one entry in a list, not a cut.
+            if (!overUI && TryGetButtressUnderCursor(ray, out WallButtress pier))
+            {
+                doomedSections.Add(pier.transform);
+                if (mouse.leftButton.wasPressedThisFrame)
+                {
+                    deleteUndoJson = CastleSave.Snapshot();
+                    WallEdge host = pier.edge;
+                    WallNode corner = pier.node;
+                    if (host != null && pier.index >= 0 && pier.index < host.buttresses.Count)
+                    {
+                        Estate.Refund(Estate.CostOfButtress(host, host.buttresses[pier.index]),
+                            "Buttress removed");
+                        host.buttresses.RemoveAt(pier.index);
+                        host.Rebuild();
+                    }
+                    else if (corner != null && pier.index >= 0
+                        && pier.index < corner.buttresses.Count)
+                    {
+                        Estate.Refund(
+                            Estate.CostOfCornerButtress(corner, corner.buttresses[pier.index]),
+                            "Corner buttress removed");
+                        corner.buttresses.RemoveAt(pier.index);
+                        corner.RebuildMesh();
+                    }
+                    doomedSections.Clear();
+                }
+            }
+            // A battlement comes down whole for the pier's reason: it stands
+            // ON the wall it belongs to, so a section pick would take the
+            // masonry underneath instead. One entry out of a list, never a
+            // cut — the wall is left exactly as it was, minus its notches.
+            else if (!overUI && TryGetCrenelUnderCursor(ray, out WallCrenel battlement))
+            {
+                doomedSections.Add(battlement.transform);
+                if (mouse.leftButton.wasPressedThisFrame)
+                {
+                    deleteUndoJson = CastleSave.Snapshot();
+                    WallEdge host = battlement.edge;
+                    WallNode joint = battlement.node;
+                    if (host != null && battlement.index >= 0
+                        && battlement.index < host.crenels.Count)
+                    {
+                        Estate.Refund(Estate.CostOfCrenel(host, host.crenels[battlement.index]),
+                            "Crenellations removed");
+                        host.crenels.RemoveAt(battlement.index);
+                        host.Rebuild();
+                    }
+                    else if (joint != null && battlement.index >= 0
+                        && battlement.index < joint.crenels.Count)
+                    {
+                        Estate.Refund(
+                            Estate.CostOfNodeCrenel(joint, joint.crenels[battlement.index]),
+                            "Joint merlon removed");
+                        joint.crenels.RemoveAt(battlement.index);
+                        joint.RebuildMesh();
+                    }
+                    doomedSections.Clear();
+                }
+            }
+            else if (!overUI && TryGetSectionUnderCursor(ray, out WallEdgeSection hovered))
             {
                 doomedSections.Add(hovered.transform);
                 // A LINTEL is the masonry over a doorway, and deleting it
@@ -6531,6 +8518,19 @@ public class GridPlacementSystem : MonoBehaviour
                     Estate.Refund(Estate.CostOfStair(hoveredStair), "Stair removed");
                     CloseStairWells(hoveredStair);
                     Destroy(hoveredStair.gameObject);
+                    doomedSections.Clear();
+                }
+            }
+            // A bridge dies whole, like a stair — deck and piers are one
+            // object, and its refund is priced from its stored facts.
+            else if (!overUI && TryGetBridgeUnderCursor(ray, out Bridge hoveredBridge))
+            {
+                doomedSections.Add(hoveredBridge.transform);
+                if (mouse.leftButton.wasPressedThisFrame)
+                {
+                    deleteUndoJson = CastleSave.Snapshot();
+                    Estate.Refund(Estate.CostOfBridge(hoveredBridge), "Bridge removed");
+                    Destroy(hoveredBridge.gameObject);
                     doomedSections.Clear();
                 }
             }
@@ -6586,8 +8586,21 @@ public class GridPlacementSystem : MonoBehaviour
         // priced from the doomed sections BEFORE the surgery consumes them.
         long refund = 0;
         foreach (KeyValuePair<WallEdge, HashSet<int>> pair in byEdge)
-            if (pair.Key != null)
-                refund += Estate.CostOfSections(pair.Key, pair.Value);
+        {
+            if (pair.Key == null)
+                continue;
+            refund += Estate.CostOfSections(pair.Key, pair.Value);
+            // A wall taken down WHOLE takes its dressing with it, so the
+            // battlements and piers on it come back too. A wall taken down
+            // in part keeps its dressing: CarryDetails clips the
+            // battlements onto the survivors and re-hangs the piers, so
+            // refunding here would pay for stone that is still standing.
+            // (The residue: a pier the cut runs THROUGH is dropped by that
+            // same carry and is not refunded — the rule it dies by, not a
+            // rule of this refund.)
+            if (pair.Value.Count >= pair.Key.SectionsInOrder().Count)
+                refund += Estate.CostOfDressing(pair.Key);
+        }
         foreach (SlabTile slab in marqueeSlabs)
             if (slab != null)
                 refund += Estate.CostOfSlab(slab);
@@ -6768,6 +8781,21 @@ public class GridPlacementSystem : MonoBehaviour
     }
 
     // The slab tile directly under the cursor — the delete tool's target.
+    bool TryGetBridgeUnderCursor(Ray ray, out Bridge bridge)
+    {
+        bridge = null;
+        RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (RaycastHit hit in hits)
+        {
+            if (hit.collider.isTrigger)
+                continue;
+            bridge = hit.collider.GetComponent<Bridge>();
+            return bridge != null;
+        }
+        return false;
+    }
+
     bool TryGetSlabUnderCursor(Ray ray, out SlabTile tile)
     {
         tile = null;
@@ -6794,6 +8822,39 @@ public class GridPlacementSystem : MonoBehaviour
                 continue;
             stair = hit.collider.GetComponentInParent<WallStair>();
             return stair != null;
+        }
+        return false;
+    }
+
+    // The pier under the cursor, and only if it is the first thing there —
+    // same precision the section pick keeps.
+    bool TryGetButtressUnderCursor(Ray ray, out WallButtress pier)
+    {
+        pier = null;
+        RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (RaycastHit hit in hits)
+        {
+            if (hit.collider.isTrigger)
+                continue;
+            pier = hit.collider.GetComponent<WallButtress>();
+            return pier != null;
+        }
+        return false;
+    }
+
+    // The battlement under the cursor, first-thing-there like the pier pick.
+    bool TryGetCrenelUnderCursor(Ray ray, out WallCrenel crenel)
+    {
+        crenel = null;
+        RaycastHit[] hits = Physics.RaycastAll(ray, 500f);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (RaycastHit hit in hits)
+        {
+            if (hit.collider.isTrigger)
+                continue;
+            crenel = hit.collider.GetComponent<WallCrenel>();
+            return crenel != null;
         }
         return false;
     }
@@ -6908,29 +8969,30 @@ public class GridPlacementSystem : MonoBehaviour
     // is a square corner, 180 a straight continuation.
     void UpdateAngleGuide()
     {
-        if (!activeAngle.HasValue)
+        for (int a = 0; a < activeAngles.Count; a++)
         {
-            if (angleLine != null)
-                angleLine.gameObject.SetActive(false);
-            return;
-        }
-        if (angleLine == null)
-        {
-            angleLine = CreateGuideLine();
-            angleLine.gameObject.name = "AngleGuide";
-        }
-        angleLine.gameObject.SetActive(true);
+            if (angleLines.Count <= a)
+            {
+                LineRenderer made = CreateGuideLine();
+                made.gameObject.name = "AngleGuide";
+                angleLines.Add(made);
+            }
+            LineRenderer line = angleLines[a];
+            line.gameObject.SetActive(true);
 
-        (Vector3 center, float fromBearing, float toBearing) = activeAngle.Value;
-        float delta = Mathf.DeltaAngle(fromBearing, toBearing);
-        const int ArcSteps = 24;
-        angleLine.positionCount = ArcSteps + 1;
-        for (int i = 0; i <= ArcSteps; i++)
-        {
-            float rad = (fromBearing + delta * i / ArcSteps) * Mathf.Deg2Rad;
-            Vector3 p = center + new Vector3(Mathf.Cos(rad), 0f, Mathf.Sin(rad)) * AngleArcRadius;
-            angleLine.SetPosition(i, new Vector3(p.x, GuideY(p), p.z));
+            (Vector3 center, float fromBearing, float toBearing) = activeAngles[a];
+            float delta = Mathf.DeltaAngle(fromBearing, toBearing);
+            const int ArcSteps = 24;
+            line.positionCount = ArcSteps + 1;
+            for (int i = 0; i <= ArcSteps; i++)
+            {
+                float rad = (fromBearing + delta * i / ArcSteps) * Mathf.Deg2Rad;
+                Vector3 p = center + new Vector3(Mathf.Cos(rad), 0f, Mathf.Sin(rad)) * AngleArcRadius;
+                line.SetPosition(i, new Vector3(p.x, GuideY(p), p.z));
+            }
         }
+        for (int a = activeAngles.Count; a < angleLines.Count; a++)
+            angleLines[a].gameObject.SetActive(false);
     }
 
     // Guides hover just above the terrain so they read against it.
@@ -7103,7 +9165,7 @@ public class GridPlacementSystem : MonoBehaviour
         }
 
         if (activeGuides.Count == 0 && dimGuides.Count == 0
-            && !activeAngle.HasValue && !marqueeStart.HasValue)
+            && activeAngles.Count == 0 && !marqueeStart.HasValue)
             return;
 
         // The delete marquee: a translucent red band in screen space.
@@ -7146,10 +9208,9 @@ public class GridPlacementSystem : MonoBehaviour
             DrawGuideLabel(screen, dim.distance.ToString("0.0") + "m");
         }
 
-        // The corner angle rides just outside its arc's midpoint.
-        if (activeAngle.HasValue)
+        // Each corner angle rides just outside its arc's midpoint.
+        foreach ((Vector3 center, float fromBearing, float toBearing) in activeAngles)
         {
-            (Vector3 center, float fromBearing, float toBearing) = activeAngle.Value;
             float delta = Mathf.DeltaAngle(fromBearing, toBearing);
             float midRad = (fromBearing + delta * 0.5f) * Mathf.Deg2Rad;
             Vector3 world = center + new Vector3(Mathf.Cos(midRad), 0f, Mathf.Sin(midRad)) * (AngleArcRadius + 0.55f);
@@ -7163,7 +9224,8 @@ public class GridPlacementSystem : MonoBehaviour
 
     void DrawGuideLabel(Vector3 screen, string text)
     {
-        Rect rect = new Rect(screen.x - 45f, Screen.height - screen.y - 12f, 90f, 24f);
+        float half = Mathf.Max(45f, text.Length * 5f);
+        Rect rect = new Rect(screen.x - half, Screen.height - screen.y - 12f, half * 2f, 24f);
         GUI.color = Color.black;
         GUI.Label(new Rect(rect.x + 1f, rect.y + 1f, rect.width, rect.height), text, guideLabelStyle);
         GUI.color = guideColor;

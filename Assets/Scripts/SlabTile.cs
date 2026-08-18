@@ -54,11 +54,6 @@ public class SlabTile : MonoBehaviour
     // ground; a deeper dip under the plane refuses placement (live on
     // the ghost — one-test doctrine). Provisional, tuned by feel.
     public const float MaxSkirt = 2f;
-    // Texture-V anchor for the side bands — WallEdge.baseWallHeight's
-    // convention (one tile of stone per this much world height), so a
-    // foundation's skirt shows the same courses as the masonry beside it.
-    public const float CourseHeight = 3.5f;
-
     static Mesh unitCube;
 
     public static SlabTile Create(Transform parent, Material material,
@@ -204,14 +199,35 @@ public class SlabTile : MonoBehaviour
 
     // Strict crossing: shared endpoints and collinear touching (abutting
     // outlines — the whole point of vertex snapping) don't count.
+    // Two segments crossing PROPERLY — by a real distance, not by float
+    // noise. The world sits on the National Grid, so a coordinate near
+    // 14,458m has a float ULP of about a millimetre, and a cross product
+    // of differences of such numbers carries a few tenths of a millimetre
+    // of error once normalized. Comparing the raw products against exact
+    // zero therefore made a segment that merely TOUCHES another read as a
+    // crossing, which is what refused a floor slab drawn flush against
+    // its neighbour: its edge ended exactly on the neighbour's edge and
+    // the sign of a zero landed wherever the last bit fell. Dividing by
+    // the segment length turns each product into the perpendicular
+    // DISTANCE of an endpoint from the other's line, in metres, so the
+    // tolerance below is a real length — an order of magnitude above the
+    // noise floor and far under anything a player could aim at.
+    public const float CrossEpsilon = 0.01f;
+
     public static bool SegmentsCross(Vector3 a, Vector3 b, Vector3 c, Vector3 d)
     {
-        float d1 = Cross2(c, d, a);
-        float d2 = Cross2(c, d, b);
-        float d3 = Cross2(a, b, c);
-        float d4 = Cross2(a, b, d);
-        return ((d1 > 0f && d2 < 0f) || (d1 < 0f && d2 > 0f))
-            && ((d3 > 0f && d4 < 0f) || (d3 < 0f && d4 > 0f));
+        float abLen = Mathf.Sqrt((b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z));
+        float cdLen = Mathf.Sqrt((d.x - c.x) * (d.x - c.x) + (d.z - c.z) * (d.z - c.z));
+        if (abLen < 0.0001f || cdLen < 0.0001f)
+            return false;
+        float d1 = Cross2(c, d, a) / cdLen;
+        float d2 = Cross2(c, d, b) / cdLen;
+        float d3 = Cross2(a, b, c) / abLen;
+        float d4 = Cross2(a, b, d) / abLen;
+        return ((d1 > CrossEpsilon && d2 < -CrossEpsilon)
+                || (d1 < -CrossEpsilon && d2 > CrossEpsilon))
+            && ((d3 > CrossEpsilon && d4 < -CrossEpsilon)
+                || (d3 < -CrossEpsilon && d4 > CrossEpsilon));
     }
 
     static float Cross2(Vector3 o, Vector3 a, Vector3 p)
@@ -415,15 +431,18 @@ public class SlabTile : MonoBehaviour
         // Side bands: the outer rim, then each cut well's shaft. A well
         // is wound CCW like the outline, but its solid is OUTSIDE it —
         // walking it reversed makes the same side formula face the void.
-        // Side UVs follow the wall SIDE convention: U runs along the ring
-        // in metres, V is WORLD height over CourseHeight — courses line up
-        // with adjoining masonry and never stretch with the skirt.
+        // Side UVs follow the wall SIDE convention, and that convention is
+        // now METRES on both axes (2026-08-16): U runs along the ring, V
+        // is world height. Courses line up with adjoining masonry and
+        // never stretch with the skirt, exactly as before — the change is
+        // that a texture states its physical size once, in the material,
+        // instead of every mesh dividing by a height constant of its own.
         void Band(List<Vector3> ring, bool reversed)
         {
             int count = ring.Count;
             float run = 0f;
-            float vB = bottom / CourseHeight;
-            float vT = top / CourseHeight;
+            float vB = bottom;
+            float vT = top;
             for (int i = 0; i < count; i++)
             {
                 Vector3 a = reversed ? ring[(count - i) % count] : ring[i];
@@ -455,6 +474,9 @@ public class SlabTile : MonoBehaviour
         mesh.SetNormals(n);
         mesh.SetUVs(0, uv);
         mesh.SetTriangles(t, 0);
+        // Same stone material, same parallax march — see the note in
+        // WallEdge.BuildSectionMesh.
+        mesh.RecalculateTangents();
     }
 
     static bool Coincident(Vector3 a, Vector3 b)

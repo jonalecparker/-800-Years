@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem.UI;
@@ -36,7 +36,10 @@ public class BuildMenu : MonoBehaviour
     private Image deleteButtonImage;
     private Image roomButtonImage;
     private Image stairButtonImage;
+    private Image bridgeButtonImage;
     private Image doorButtonImage;
+    private Image buttressButtonImage;
+    private Image crenelButtonImage;
     private Image groundButtonImage;
     // Sub-tool buttons shown in the item row while their category is in
     // hand — tinted from the placement system's actual state like every
@@ -55,6 +58,17 @@ public class BuildMenu : MonoBehaviour
     private Text saveNameText;
     private RectTransform savesListParent;
     private string saveName = "";
+    // The panel has two MODES, because one list where a click means load
+    // is a list where saving over a slot is the one thing you cannot do
+    // (the user kept loading the save they meant to overwrite). Save is
+    // the mode the panel opens in — that is what the button is for — and
+    // overwriting an existing slot asks once, since it destroys a save.
+    private bool savesLoadMode;
+    private string overwriteArmed = "";
+    private Image saveTabImage;
+    private Image loadTabImage;
+    private Text savesTitle;
+    private GameObject saveNameRow;
     private Toggle curvedToggle;
     private Toggle offsetToggle;
     private Toggle circleToggle;
@@ -160,7 +174,10 @@ public class BuildMenu : MonoBehaviour
         // options panel instead.
         roomButtonImage = CreateButton(categoryRow, "Room", ToggleRoomMode).GetComponent<Image>();
         stairButtonImage = CreateButton(categoryRow, "Stairs", ToggleStairMode).GetComponent<Image>();
+        bridgeButtonImage = CreateButton(categoryRow, "Bridge", ToggleBridgeMode).GetComponent<Image>();
         doorButtonImage = CreateButton(categoryRow, "Doors", ToggleDoorMode).GetComponent<Image>();
+        buttressButtonImage = CreateButton(categoryRow, "Buttress", ToggleButtressMode).GetComponent<Image>();
+        crenelButtonImage = CreateButton(categoryRow, "Crenels", ToggleCrenelMode).GetComponent<Image>();
         groundButtonImage = CreateButton(categoryRow, "Ground", ToggleGroundMode).GetComponent<Image>();
         surveyButtonImage = CreateButton(categoryRow, "Survey", ToggleSurveyMode).GetComponent<Image>();
         deleteButtonImage = CreateButton(categoryRow, "Delete", ToggleDeleteMode).GetComponent<Image>();
@@ -196,11 +213,11 @@ public class BuildMenu : MonoBehaviour
     }
 
     // The Saves panel: centered, modal, and built from the same cloth as
-    // the rest of the HUD. One name field (always focused — it is the
-    // only text on screen), a Save button, and every slot on disk newest
-    // first with its date; clicking a slot loads it. The date is the
-    // file's write time and the name is the file's name — the panel
-    // stores nothing the Saves folder doesn't already say.
+    // the rest of the HUD. Save/Load tabs, one name field (always focused
+    // — it is the only text on screen), a Save button, and every slot on
+    // disk newest first with its date. The date is the file's write time
+    // and the name is the file's name — the panel stores nothing the
+    // Saves folder doesn't already say.
     void CreateSavesPanel(Transform parent)
     {
         savesPanel = new GameObject("SavesPanel", typeof(RectTransform));
@@ -222,11 +239,26 @@ public class BuildMenu : MonoBehaviour
         ContentSizeFitter fitter = savesPanel.AddComponent<ContentSizeFitter>();
         fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
 
-        Text title = CreateHintLabel(savesPanel.transform, "Title", 18, Color.white);
-        title.text = "Saves — type a name, Enter or Save writes it; click a slot to load";
+        // The mode tabs. Nothing below them changes but the meaning of a
+        // click on a slot row, which is precisely the thing that was
+        // ambiguous.
+        GameObject tabRow = new GameObject("TabRow", typeof(RectTransform));
+        tabRow.transform.SetParent(savesPanel.transform, false);
+        tabRow.AddComponent<LayoutElement>().minHeight = 40f;
+        HorizontalLayoutGroup tabLayout = tabRow.AddComponent<HorizontalLayoutGroup>();
+        tabLayout.spacing = 8f;
+        tabLayout.childForceExpandWidth = true;
+        tabLayout.childForceExpandHeight = true;
+        saveTabImage = CreateButton(tabRow.transform, "Save",
+            () => SetSavesMode(false)).GetComponent<Image>();
+        loadTabImage = CreateButton(tabRow.transform, "Load",
+            () => SetSavesMode(true)).GetComponent<Image>();
+
+        savesTitle = CreateHintLabel(savesPanel.transform, "Title", 18, Color.white);
 
         // The name row: the live field and the Save button side by side.
         GameObject nameRow = new GameObject("NameRow", typeof(RectTransform));
+        saveNameRow = nameRow;
         nameRow.transform.SetParent(savesPanel.transform, false);
         nameRow.AddComponent<LayoutElement>().minHeight = 40f;
         HorizontalLayoutGroup nameLayout = nameRow.AddComponent<HorizontalLayoutGroup>();
@@ -280,8 +312,11 @@ public class BuildMenu : MonoBehaviour
         }
         ModalOpen = true;
         // The field opens holding the current slot's name, so re-saving
-        // the save you're working in is one click.
+        // the save you're working in is one click. Saving is also the mode
+        // it opens in — loading is the deliberate detour.
         saveName = CastleSave.CurrentSlot;
+        savesLoadMode = false;
+        overwriteArmed = "";
         RefreshSavesPanel();
         savesPanel.SetActive(true);
         var keyboard = UnityEngine.InputSystem.Keyboard.current;
@@ -312,7 +347,7 @@ public class BuildMenu : MonoBehaviour
     // so what you see is what the file is called).
     void OnSaveNameChar(char c)
     {
-        if (!ModalOpen)
+        if (!ModalOpen || savesLoadMode)
             return;
         if (!char.IsLetterOrDigit(c) && c != ' ' && c != '-' && c != '_')
             return;
@@ -333,6 +368,7 @@ public class BuildMenu : MonoBehaviour
         if (placementSystem != null)
             placementSystem.SaveSlot(slot);
         saveName = slot;
+        overwriteArmed = "";
         RefreshSavesPanel();
     }
 
@@ -341,21 +377,64 @@ public class BuildMenu : MonoBehaviour
         saveNameText.text = saveName + "▌";
     }
 
+    void SetSavesMode(bool load)
+    {
+        savesLoadMode = load;
+        overwriteArmed = "";
+        RefreshSavesPanel();
+    }
+
+    // A click on a slot row means whatever the mode says, and overwriting
+    // asks first: the row itself becomes the question, so there is no
+    // second window to dismiss and no way to confirm something other than
+    // what was clicked. Arming one row disarms any other.
+    void ClickSlot(string slot)
+    {
+        if (savesLoadMode)
+        {
+            if (placementSystem != null)
+                placementSystem.LoadSlot(slot);
+            CloseSavesPanel();
+            return;
+        }
+        if (overwriteArmed != slot)
+        {
+            overwriteArmed = slot;
+            saveName = slot;
+            RefreshSavesPanel();
+            return;
+        }
+        overwriteArmed = "";
+        saveName = slot;
+        CommitSave();
+    }
+
     void RefreshSavesPanel()
     {
         RefreshSaveNameText();
+        if (savesTitle != null)
+            savesTitle.text = savesLoadMode
+                ? "Load — click a save to open it"
+                : "Save — type a name and press Enter, or click a save to overwrite it";
+        if (saveNameRow != null)
+            saveNameRow.SetActive(!savesLoadMode);
+        if (saveTabImage != null)
+            saveTabImage.color = savesLoadMode ? buttonColor : selectedColor;
+        if (loadTabImage != null)
+            loadTabImage.color = savesLoadMode ? selectedColor : buttonColor;
         foreach (Transform child in savesListParent)
             Destroy(child.gameObject);
         foreach ((string slot, System.DateTime time) in CastleSave.ListSlots())
         {
             string capturedSlot = slot;
+            bool armed = !savesLoadMode && overwriteArmed == slot;
             GameObject row = CreateButton(savesListParent,
-                $"{slot}    —    {time:yyyy-MM-dd HH:mm}", () =>
-                {
-                    if (placementSystem != null)
-                        placementSystem.LoadSlot(capturedSlot);
-                    CloseSavesPanel();
-                });
+                armed
+                    ? $"Overwrite '{slot}'?    —    click again"
+                    : $"{slot}    —    {time:yyyy-MM-dd HH:mm}",
+                () => ClickSlot(capturedSlot));
+            if (armed)
+                row.GetComponent<Image>().color = deleteActiveColor;
             row.GetComponent<LayoutElement>().minHeight = 36f;
             Text label = row.GetComponentInChildren<Text>();
             label.alignment = TextAnchor.MiddleLeft;
@@ -387,6 +466,7 @@ public class BuildMenu : MonoBehaviour
         {
             CastleSave.DeleteSlot(slot);
             BuildLog.Add($"Deleted save '{slot}'.");
+            overwriteArmed = "";
             RefreshSavesPanel();
         });
 
@@ -837,7 +917,10 @@ public class BuildMenu : MonoBehaviour
         if (ModalOpen)
         {
             var kb = UnityEngine.InputSystem.Keyboard.current;
-            if (kb != null)
+            // Only the Save mode has a name to type or an Enter to mean
+            // anything — in Load mode the keyboard would be editing a
+            // field that isn't on screen.
+            if (kb != null && !savesLoadMode)
             {
                 if (kb.backspaceKey.wasPressedThisFrame && saveName.Length > 0)
                 {
@@ -906,9 +989,13 @@ public class BuildMenu : MonoBehaviour
         bool slabTool = placementSystem.Mode == GridPlacementSystem.ToolMode.Foundation
             || placementSystem.Mode == GridPlacementSystem.ToolMode.Floor;
         bool building = !slabTool
+            && placementSystem.Mode != GridPlacementSystem.ToolMode.None
             && placementSystem.Mode != GridPlacementSystem.ToolMode.Delete
             && placementSystem.Mode != GridPlacementSystem.ToolMode.Stair
-            && placementSystem.Mode != GridPlacementSystem.ToolMode.Door;
+            && placementSystem.Mode != GridPlacementSystem.ToolMode.Bridge
+            && placementSystem.Mode != GridPlacementSystem.ToolMode.Door
+            && placementSystem.Mode != GridPlacementSystem.ToolMode.Buttress
+            && placementSystem.Mode != GridPlacementSystem.ToolMode.Crenel;
         heightPanel.SetActive(building || slabTool);
         if (slabTool)
         {
@@ -995,7 +1082,13 @@ public class BuildMenu : MonoBehaviour
             ? selectedColor : buttonColor;
         stairButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Stair
             ? selectedColor : buttonColor;
+        bridgeButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Bridge
+            ? selectedColor : buttonColor;
         doorButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Door
+            ? selectedColor : buttonColor;
+        buttressButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Buttress
+            ? selectedColor : buttonColor;
+        crenelButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Crenel
             ? selectedColor : buttonColor;
         deleteButtonImage.color = placementSystem.Mode == GridPlacementSystem.ToolMode.Delete
             ? deleteActiveColor : buttonColor;
@@ -1106,7 +1199,57 @@ public class BuildMenu : MonoBehaviour
         }
     }
 
+    // Bridge: the two-ends-then-width gesture; no sub-jobs.
+    void ToggleBridgeMode()
+    {
+        if (placementSystem == null)
+            return;
+
+        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Bridge;
+        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Bridge : GridPlacementSystem.ToolMode.Build);
+        if (entering)
+        {
+            itemRow.gameObject.SetActive(false);
+            openCategory = null;
+        }
+    }
+
     // Doors: same shape of tool as stairs — no gesture, no sub-jobs.
+    // Buttresses: the same shape of tool again — point at a wall's face
+    // and click. Its own bar button rather than a Room job, because a
+    // buttress is added to a wall that already stands, like a doorway.
+    void ToggleButtressMode()
+    {
+        if (placementSystem == null)
+            return;
+
+        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Buttress;
+        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Buttress
+            : GridPlacementSystem.ToolMode.Build);
+        if (entering)
+        {
+            itemRow.gameObject.SetActive(false);
+            openCategory = null;
+        }
+    }
+
+    // Crenellations: added to a wall that already stands, exactly like a
+    // doorway or a pier, so its own bar button rather than a Room job.
+    void ToggleCrenelMode()
+    {
+        if (placementSystem == null)
+            return;
+
+        bool entering = placementSystem.Mode != GridPlacementSystem.ToolMode.Crenel;
+        placementSystem.SetMode(entering ? GridPlacementSystem.ToolMode.Crenel
+            : GridPlacementSystem.ToolMode.Build);
+        if (entering)
+        {
+            itemRow.gameObject.SetActive(false);
+            openCategory = null;
+        }
+    }
+
     void ToggleDoorMode()
     {
         if (placementSystem == null)

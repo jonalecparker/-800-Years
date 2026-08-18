@@ -470,7 +470,7 @@ public static class WallGraph
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
                 edge.fixedTopY, edge.baseY, edge.skirt, edge.kind);
-            WallEdge.CarryOpenings(edge, sub, lo, hi);
+            WallEdge.CarryDetails(edge, sub, lo, hi);
             touched.Add(n0);
             touched.Add(n1);
         }
@@ -529,7 +529,7 @@ public static class WallGraph
             WallEdge sub = WallEdge.Create(parent, n0, n1, subC, edge.height, edge.thickness,
                 edge.baseWallHeight, edge.material, edge.targetSectionLength, edge.baseStep,
                 edge.fixedTopY, edge.baseY, edge.skirt, edge.kind);
-            WallEdge.CarryOpenings(edge, sub, t0, t1);
+            WallEdge.CarryDetails(edge, sub, t0, t1);
             orderedSubs.Add(sub);
             touched.Add(n0);
             touched.Add(n1);

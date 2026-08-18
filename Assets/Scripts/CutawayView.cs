@@ -38,7 +38,10 @@ public static class CutawayView
     public static float Level { get; private set; } = float.PositiveInfinity;
     public static bool Active => !float.IsPositiveInfinity(Level);
 
-    const float Step = 0.5f;
+    // The quarter grid every free-built wall top lands on (heights dial
+    // in SlabTile.FloorStep and seat there), so the cut can stop exactly
+    // ON a storey instead of straddling one (2026-08-16).
+    const float Step = 0.25f;
     // Nothing is ever cut below this much above the lowest masonry —
     // slicing the world down to nothing reads as "my castle vanished".
     const float MinSlab = 0.5f;

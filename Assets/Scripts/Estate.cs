@@ -172,6 +172,88 @@ public static class Estate
         return (long)System.Math.Round(Mathf.Max(0f, area) * FloorRatePerArea);
     }
 
+    // A bridge is stone through and through: the deck's graded slab plus
+    // every pier's stamped column — stored facts only, so the delete
+    // refund equals the charge.
+    // A buttress is priced by the stone that STANDS PROUD of the wall —
+    // the half buried in the wall's own thickness was paid for when the
+    // wall was built, and charging for it twice would make the delete
+    // refund overpay. The weathering takes half a wedge off the top, so
+    // the solid is the full pier less half the set-off.
+    // One formula for both kinds; only the width differs, and a clasping
+    // corner block is the wider of the two because it is.
+    static long ButtressCost(float width, float bottom, float top, WallKind kind)
+    {
+        float span = Mathf.Max(0f, top - bottom);
+        float weather = Mathf.Min(WallButtress.Weathering, span * 0.5f);
+        float volume = width * WallButtress.Projection * (span - weather * 0.5f);
+        return (long)System.Math.Round(Mathf.Max(0f, volume) * RateFor(kind));
+    }
+
+    public static long CostOfButtress(WallEdge edge, WallEdge.Buttress b)
+        => edge == null ? 0
+            : ButtressCost(WallButtress.Width,
+                WallButtress.BottomAt(edge, b.t, b.side), b.topY, edge.kind);
+
+    // A clasping corner block, priced from the turn its two walls make —
+    // stored facts throughout, so the refund equals the charge.
+    public static long CostOfCornerButtress(WallNode node, WallNode.Buttress b)
+    {
+        if (node == null || !WallButtress.TryCornerFrame(node, b.bearing, out _,
+                out float halfWidth, out _, out _, out float bottom))
+            return 0;
+        WallKind kind = WallKind.Stone;
+        foreach (WallNode.Member m in node.members)
+            if (m.edge != null) { kind = m.edge.kind; break; }
+        return ButtressCost(halfWidth * 2f, bottom, b.topY, kind);
+    }
+
+    // A battlement is ordinary masonry, priced by the solid stone of its
+    // merlons — the embrasures between them are what a player is really
+    // buying, and they cost nothing because they are absence. Measured from
+    // the stored span through the one layout door, so the charge, the ghost
+    // readout and the refund are the same number.
+    public static long CostOfCrenel(WallEdge edge, WallEdge.Crenel c)
+        => edge == null ? 0
+            : (long)System.Math.Round(WallCrenel.Volume(edge, c) * RateFor(edge.kind));
+
+    // The block standing on a joint, priced from the node's own plan.
+    public static long CostOfNodeCrenel(WallNode node, WallNode.Crenel c)
+    {
+        if (node == null)
+            return 0;
+        WallKind kind = WallKind.Stone;
+        foreach (WallNode.Member m in node.members)
+            if (m.edge != null) { kind = m.edge.kind; break; }
+        return (long)System.Math.Round(WallCrenel.NodeVolume(node, c) * RateFor(kind));
+    }
+
+    // Everything DRESSING a wall, for the demolition refund: the battlements
+    // and face piers that come down with it. A corner block belongs to a
+    // node and outlives any one of its members, so it is not counted here.
+    public static long CostOfDressing(WallEdge edge)
+    {
+        if (edge == null)
+            return 0;
+        long total = 0;
+        foreach (WallEdge.Buttress b in edge.buttresses)
+            total += CostOfButtress(edge, b);
+        foreach (WallEdge.Crenel c in edge.crenels)
+            total += CostOfCrenel(edge, c);
+        return total;
+    }
+
+    public static long CostOfBridge(Bridge bridge)
+    {
+        if (bridge == null)
+            return 0;
+        float volume = bridge.Length * bridge.width * Bridge.DeckThickness;
+        foreach (Bridge.Pier p in bridge.piers)
+            volume += Mathf.Max(0f, bridge.DeckBottomAt(p.pos) - p.bottomY)
+                * bridge.width * Bridge.PierDepth;
+        return (long)System.Math.Round(volume * StoneRate);
+    }
+
     // ------------------------------------------------------------------
     // The two transactions. Both announce in the BuildLog with the new
     // balance, so money is legible without a spreadsheet in sight.

@@ -83,6 +83,64 @@ public class WallEdge : MonoBehaviour
     }
     public List<Opening> openings = new List<Opening>();
 
+    // A buttress standing against one face of this wall. STORED ON THE
+    // EDGE for exactly the reasons an opening is: it is this wall's own
+    // masonry, so it belongs to the data the geometry derives from, and it
+    // travels through every split (CarryButtresses) the way a doorway does.
+    //
+    // `t` is the curve parameter of its CENTRE, which survives subdivision
+    // linearly. `side` is +1 or -1 — which face it stands against, in the
+    // sign SideOf answers with. `topY` is an ABSOLUTE elevation, captured
+    // at the click: a stated fact, so it cannot drift when the ground is
+    // re-shaped or the wall is cut in two. The BOTTOM is not stored — it is
+    // the ground under the pier's own footprint (WallButtress.BottomAt),
+    // the one thing an edge is always allowed to read.
+    //
+    // No strength number is stored, deliberately (user's call, 2026-08-16):
+    // a buttress will make a wall harder to breach when there is a siege to
+    // breach it, and inventing the figure before its consumer exists would
+    // be guessing at a balance nothing can test.
+    [System.Serializable]
+    public struct Buttress
+    {
+        public float t;
+        public float side;
+        public float topY;
+    }
+    public List<Buttress> buttresses = new List<Buttress>();
+
+    // A crenellated STRETCH of this wall's top — two curve parameters and
+    // nothing else. Edge data for the same reason a doorway is: the notches
+    // are cut in this masonry and no other.
+    //
+    // A SPAN rather than a per-edge flag (the design call, made before any
+    // of it was written): a flag can only say "this whole wall", and a
+    // chained run is many edges through no fault of the player's, so what a
+    // flag meant would depend on where the graph put its nodes. A span means
+    // the same stretch whatever the nodes do — and it is what lets a split
+    // CLIP a battlement rather than destroy one.
+    //
+    // `height` and `gap` are the two things the player dials, so they are
+    // stored: a battlement raised low and close-set stays low and close-set.
+    // Zero means "whatever the default is", which is exactly what an old
+    // save's missing field deserializes to — the omitted-field trap turned
+    // into a safe answer.
+    //
+    // The COUNT and the exact spacing are NOT stored. They derive from the
+    // span's own arc length by a rule that begins and ends solid
+    // (WallCrenel.Layout), so a span clipped by a split re-lays out into a
+    // battlement still correct at its new corner. A stored phase would be a
+    // fact that could drift; a derived one cannot.
+    [System.Serializable]
+    public struct Crenel
+    {
+        public float t0;
+        public float t1;
+        public float height;
+        public float gap;
+    }
+    public List<Crenel> crenels = new List<Crenel>();
+
     public Vector3 A => nodeA != null ? nodeA.point : transform.position;
     public Vector3 B => nodeB != null ? nodeB.point : transform.position;
 
@@ -154,12 +212,49 @@ public class WallEdge : MonoBehaviour
     {
         foreach (WallEdgeSection section in GetComponentsInChildren<WallEdgeSection>())
             DestroyImmediate(section.gameObject);
+        foreach (WallButtress pier in GetComponentsInChildren<WallButtress>())
+            DestroyImmediate(pier.gameObject);
+        foreach (WallCrenel crenel in GetComponentsInChildren<WallCrenel>())
+            DestroyImmediate(crenel.gameObject);
 
         List<SectionSpec> specs = BuildSpecs(A, control, B, height, targetSectionLength,
             thickness, baseStep, baseWallHeight, fixedTopY, FloorY, openings);
         foreach (SectionSpec spec in specs)
             CreateSection(spec);
+        for (int i = 0; i < buttresses.Count; i++)
+            CreateButtress(i);
+        // After the sections, always: a merlon reads the wall tops it
+        // stands on, and those are the sections that were just made.
+        for (int i = 0; i < crenels.Count; i++)
+            CreateCrenel(i);
         Physics.SyncTransforms();
+    }
+
+    // The battlement along one stretch of this wall's top, from the same
+    // builder the ghost draws with. Its own object so the cutaway slices it
+    // and the delete tool can pick it off the wall it crowns.
+    void CreateCrenel(int index)
+    {
+        if (!WallCrenel.TryBuild(this, crenels[index], out Mesh mesh))
+            return;
+        WallCrenel crenel = WallCrenel.Spawn(transform, material, mesh);
+        crenel.edge = this;
+        crenel.index = index;
+    }
+
+    // A pier against this wall's face, from the same builder the ghost
+    // draws with. Its own object, so the cutaway slices it like any other
+    // prism and the delete tool can pick it out of the masonry behind it.
+    void CreateButtress(int index)
+    {
+        if (!WallButtress.TryBuild(this, buttresses[index], out Mesh mesh,
+                out Vector3 position, out float yaw, out float bottomY, out float topY))
+            return;
+        WallButtress pier = WallButtress.Spawn(transform, material, mesh, position, yaw,
+            WallButtress.Width * 0.5f, 0f, thickness * 0.5f + WallButtress.Projection,
+            bottomY, topY);
+        pier.edge = this;
+        pier.index = index;
     }
 
     void CreateSection(SectionSpec spec)
@@ -192,10 +287,59 @@ public class WallEdge : MonoBehaviour
     // remapped onto `to`. An opening the split runs THROUGH doesn't
     // survive: half a doorway on each side of a new node is not what
     // anyone drew, and the masonry there is being re-formed anyway.
-    public static void CarryOpenings(WallEdge from, WallEdge to, float t0, float t1)
+    // EVERY mutator that makes sub-edges must call this — both surgery
+    // sites in WallGraph do. It carries BOTH kinds of edge data in one
+    // pass so the sub-edge is rebuilt once, however much of it survived.
+    public static void CarryDetails(WallEdge from, WallEdge to, float t0, float t1)
     {
-        if (from.openings.Count == 0 || t1 - t0 < 0.001f)
+        if (t1 - t0 < 0.001f)
             return;
+        bool any = CarryOpenings(from, to, t0, t1);
+        any |= CarryButtresses(from, to, t0, t1);
+        any |= CarryCrenels(from, to, t0, t1);
+        if (any)
+            to.Rebuild();
+    }
+
+    // A battlement is CLIPPED by a split, not dropped — and that is the
+    // deliberate difference from an opening and a pier. Those are single
+    // objects with a width: half a doorway either side of a new node is not
+    // what anyone drew, so a split through one destroys it. A crenellated
+    // stretch is not one object; it is a length of wall that happens to be
+    // notched, and a wall crossing it halfway leaves both halves just as
+    // notched as they were. So the span is intersected with the surviving
+    // piece and remapped, and only a remnant too short to hold a battlement
+    // at all is let go.
+    static bool CarryCrenels(WallEdge from, WallEdge to, float t0, float t1)
+    {
+        if (from.crenels.Count == 0)
+            return false;
+        float[] table = BuildArcTable(from.A, from.control, from.B);
+        bool any = false;
+        foreach (Crenel c in from.crenels)
+        {
+            float lo = Mathf.Max(t0, Mathf.Min(c.t0, c.t1));
+            float hi = Mathf.Min(t1, Mathf.Max(c.t0, c.t1));
+            if (hi - lo < 0.0001f)
+                continue;
+            if (ArcAt(table, hi) - ArcAt(table, lo) < WallCrenel.MinSpan)
+                continue;
+            to.crenels.Add(new Crenel
+            {
+                t0 = (lo - t0) / (t1 - t0),
+                t1 = (hi - t0) / (t1 - t0),
+                height = c.height,
+                gap = c.gap,
+            });
+            any = true;
+        }
+        return any;
+    }
+
+    static bool CarryOpenings(WallEdge from, WallEdge to, float t0, float t1)
+    {
+        if (from.openings.Count == 0)
+            return false;
         float[] table = BuildArcTable(from.A, from.control, from.B);
         float a0 = ArcAt(table, t0);
         float a1 = ArcAt(table, t1);
@@ -214,8 +358,36 @@ public class WallEdge : MonoBehaviour
             });
             any = true;
         }
-        if (any)
-            to.Rebuild();
+        return any;
+    }
+
+    // Same rule as an opening's: a pier the split runs THROUGH doesn't
+    // survive — half a buttress on each side of a new node is not what
+    // anyone placed. Its topY is absolute, so a split leaves it exactly
+    // where it stood; only the parameter is remapped.
+    static bool CarryButtresses(WallEdge from, WallEdge to, float t0, float t1)
+    {
+        if (from.buttresses.Count == 0)
+            return false;
+        float[] table = BuildArcTable(from.A, from.control, from.B);
+        float a0 = ArcAt(table, t0);
+        float a1 = ArcAt(table, t1);
+        float half = WallButtress.Width * 0.5f;
+        bool any = false;
+        foreach (Buttress b in from.buttresses)
+        {
+            float mid = ArcAt(table, Mathf.Clamp01(b.t));
+            if (mid - half < a0 - 0.05f || mid + half > a1 + 0.05f)
+                continue;
+            to.buttresses.Add(new Buttress
+            {
+                t = (b.t - t0) / (t1 - t0),
+                side = b.side,
+                topY = b.topY,
+            });
+            any = true;
+        }
+        return any;
     }
 
     public List<WallEdgeSection> SectionsInOrder()
@@ -437,8 +609,13 @@ public class WallEdge : MonoBehaviour
     // borrow the sweep: a stair is this same section machinery with tops
     // that step instead of following one height, and it has no business
     // knowing how a wall picks its topY. False = degenerate, skip it.
+    // stringCourses is off for anything that isn't a plain wall face: a
+    // stair's wedge is built from these same specs, and a band running
+    // through a flight of steps is a horizontal line across a diagonal —
+    // the one place the feature reads as a mistake.
     public static bool BuildSpecFrame(ref SectionSpec spec, Vector3 s, Vector3 c, Vector3 e,
-        float thickness, float baseWallHeight, float[] arcTable)
+        float thickness, float baseWallHeight, float[] arcTable,
+        bool stringCourses = true)
     {
         if (spec.topY - spec.bottomY < 0.1f)
             return false;
@@ -451,8 +628,15 @@ public class WallEdge : MonoBehaviour
         Vector3 dir = Tangent(s, c, e, tMid).normalized;
         spec.yaw = Mathf.Atan2(-dir.z, dir.x) * Mathf.Rad2Deg;
         spec.position = new Vector3(mid.x, (spec.bottomY + spec.topY) * 0.5f, mid.z);
+        // Openings are NOT excluded, and excluding them was wrong: a
+        // lintel and a threshold are masonry — the stone over and under
+        // the hole — so a course must cross them like any other wall. The
+        // hole itself needs no rule at all, because no section exists
+        // there to grow one. Suppressing by openingIndex dropped the
+        // course over the WHOLE height above every window, since a lintel
+        // is one section running from the head to the wall top.
         spec.mesh = BuildSectionMesh(s, c, e, spec, arcTable, thickness, baseWallHeight,
-            spec.position, spec.yaw);
+            spec.position, spec.yaw, stringCourses);
         return true;
     }
 
@@ -634,6 +818,63 @@ public class WallEdge : MonoBehaviour
         return 1f;
     }
 
+    // The string course: a band of masonry standing proud of the wall,
+    // marking a level. Kept deliberately shallow — this is here to put a
+    // horizontal shadow line on a tall face so the eye reads storeys
+    // instead of counting stones, and anything bolder starts competing
+    // with the architecture it is meant to serve.
+    // Proud is the number that matters and 60mm was not enough: the band
+    // exists to cast a SHADOW, and at any real viewing distance a 60mm
+    // ledge under a 32° sun casts one about a pixel wide. 120mm out and
+    // 300mm tall is still modest for a real string course and actually
+    // reads from across the bailey.
+    public const float StringCourseSpacing = 4f;
+    public const float StringCourseHeight = 0.3f;
+    public const float StringCourseProud = 0.12f;
+
+    // Which slices of [lo, hi] a string course occupies — clipped to the
+    // masonry it is given, so a band that only half fits comes out half
+    // height instead of vanishing. The margins used to be a full
+    // StringCourseHeight rather than half of one, which quietly refused
+    // any band whose centre sat within 300mm of a section's own bottom or
+    // top: that is why the course disappeared exactly where it crossed a
+    // lintel (whose bottom IS the door head) and why it stopped partway
+    // up a castle of stacked storeys, each new storey's floor cutting the
+    // band above it. Shared with WallNode so a joint carries the course
+    // across itself instead of leaving a post-shaped hole in it.
+    public static List<(float lo, float hi)> StringCourseBands(float lo, float hi)
+    {
+        var bands = new List<(float, float)>();
+        int first = Mathf.FloorToInt(lo / StringCourseSpacing);
+        int last = Mathf.CeilToInt(hi / StringCourseSpacing);
+        for (int band = first; band <= last; band++)
+        {
+            float at = band * StringCourseSpacing;
+            float a = Mathf.Max(lo, at - StringCourseHeight * 0.5f);
+            float b = Mathf.Min(hi, at + StringCourseHeight * 0.5f);
+            if (b - a > 0.02f)
+                bands.Add((a, b));
+        }
+        return bands;
+    }
+
+    // A stable pseudo-random slide along U for one edge, in metres, from
+    // the edge's own stored endpoints — no state, no seeding, same answer
+    // on every rebuild and after every load. Ranges over 4m so it shifts
+    // by more than a whole tile of any sane stone texture.
+    static float UPhase(Vector3 s, Vector3 e)
+    {
+        unchecked
+        {
+            int h = 17;
+            h = h * 31 + Mathf.RoundToInt(s.x * 100f);
+            h = h * 31 + Mathf.RoundToInt(s.z * 100f);
+            h = h * 31 + Mathf.RoundToInt(e.x * 100f);
+            h = h * 31 + Mathf.RoundToInt(e.z * 100f);
+            return ((h & 0xFFFF) / 65535f) * 4f;
+        }
+    }
+
     // Sweeps the wall's rectangular cross-section along one section's
     // slice of the curve. Neighbouring sections evaluate the same curve at
     // the same boundary parameter, so their end faces are identical and
@@ -641,7 +882,7 @@ public class WallEdge : MonoBehaviour
     // into the section's local frame (position + yaw, no scale).
     static Mesh BuildSectionMesh(Vector3 s, Vector3 c, Vector3 e,
         SectionSpec spec, float[] arcTable, float thickness, float baseWallHeight,
-        Vector3 center, float yaw)
+        Vector3 center, float yaw, bool stringCourses)
     {
         Matrix4x4 worldToLocal = Matrix4x4.TRS(center, Quaternion.Euler(0f, yaw, 0f), Vector3.one).inverse;
         float halfWidth = thickness * 0.5f;
@@ -653,32 +894,65 @@ public class WallEdge : MonoBehaviour
         var innerBottom = new Vector3[MeshSegments + 1];
         var innerTop = new Vector3[MeshSegments + 1];
         var arcU = new float[MeshSegments + 1];
+        var tAt = new float[MeshSegments + 1];
+        var centreline = new Vector3[MeshSegments + 1];
+        var sideDir = new Vector3[MeshSegments + 1];
+        // Every edge starts its own U at zero, so the same stretch of
+        // texture begins at every wall in the castle and the eye reads
+        // the repeat instantly. Sliding each edge along U by a fixed
+        // amount of its own breaks that without costing anything: the
+        // phase is derived from the edge's endpoints, so it is identical
+        // for every section of one edge (they all receive the whole
+        // curve here), survives save and load, and never wanders between
+        // rebuilds. Only U moves — V stays world height, because courses
+        // lining up with the masonry next door is the property worth
+        // keeping, and real walls break their vertical joints anyway.
+        float phase = UPhase(s, e);
 
         for (int j = 0; j <= MeshSegments; j++)
         {
             float t = Mathf.Lerp(spec.tStart, spec.tEnd, (float)j / MeshSegments);
             Vector3 p = Evaluate(s, c, e, t);
             Vector3 side = Tangent(s, c, e, t).normalized;
-            side = new Vector3(-side.z, 0f, side.x) * halfWidth;
-            Vector3 outer = new Vector3(p.x + side.x, 0f, p.z + side.z);
-            Vector3 inner = new Vector3(p.x - side.x, 0f, p.z - side.z);
+            side = new Vector3(-side.z, 0f, side.x);
+            tAt[j] = t;
+            centreline[j] = new Vector3(p.x, 0f, p.z);
+            sideDir[j] = side;
+            arcU[j] = ArcAt(arcTable, t) + phase;
+        }
 
-            outerBottom[j] = worldToLocal.MultiplyPoint3x4(new Vector3(outer.x, bottomY, outer.z));
-            outerTop[j] = worldToLocal.MultiplyPoint3x4(new Vector3(outer.x, topY, outer.z));
-            innerBottom[j] = worldToLocal.MultiplyPoint3x4(new Vector3(inner.x, bottomY, inner.z));
-            innerTop[j] = worldToLocal.MultiplyPoint3x4(new Vector3(inner.x, topY, inner.z));
-            arcU[j] = ArcAt(arcTable, t);
+        // The four corner rows for ONE prism swept along this slice at a
+        // given half-width and height range. Filling them per prism is
+        // what lets a string course ride the same curve as the wall it
+        // sits on, exactly concentric, with no second sweep to keep in
+        // step.
+        void Rows(float hw, float yLo, float yHi)
+        {
+            for (int j = 0; j <= MeshSegments; j++)
+            {
+                Vector3 off = sideDir[j] * hw;
+                Vector3 outer = centreline[j] + off;
+                Vector3 inner = centreline[j] - off;
+                outerBottom[j] = worldToLocal.MultiplyPoint3x4(new Vector3(outer.x, yLo, outer.z));
+                outerTop[j] = worldToLocal.MultiplyPoint3x4(new Vector3(outer.x, yHi, outer.z));
+                innerBottom[j] = worldToLocal.MultiplyPoint3x4(new Vector3(inner.x, yLo, inner.z));
+                innerTop[j] = worldToLocal.MultiplyPoint3x4(new Vector3(inner.x, yHi, inner.z));
+            }
         }
 
         var vertices = new List<Vector3>();
         var uvs = new List<Vector2>();
         var triangles = new List<int>();
 
-        // Texture V is anchored to world height so stone courses line up
-        // across sections and across storeys; taller walls show more
-        // courses rather than stretched ones.
-        float vBottom = bottomY / baseWallHeight;
-        float vTop = topY / baseWallHeight;
+        // BOTH UV axes are METRES of real masonry (2026-08-16): U is arc
+        // length, V is world height. V used to divide by baseWallHeight,
+        // which made vertical texel density depend on a height constant —
+        // one stone came out 3.5× taller than it was wide, and the
+        // material's y-scale could only paper over it globally. In metres
+        // a texture states its own physical size ONCE, in the material's
+        // tiling, and every surface agrees. V stays world-anchored either
+        // way, which is what keeps courses lined up across sections and
+        // across storeys.
 
         // Each face gets its own vertices so RecalculateNormals keeps hard
         // edges between faces while smoothing along the sweep.
@@ -711,17 +985,20 @@ public class WallEdge : MonoBehaviour
             }
         }
 
-        void AddCap(int j, bool startCap)
+        // The end cap runs across the wall's THICKNESS, so its U spans
+        // that many metres — not 0→1, which stretched a whole tile of
+        // stone across however thick the wall happened to be.
+        void AddCap(int j, bool startCap, float vLo, float vHi, float across)
         {
             int baseIndex = vertices.Count;
             vertices.Add(outerBottom[j]);
-            uvs.Add(new Vector2(0f, vBottom));
+            uvs.Add(new Vector2(0f, vLo));
             vertices.Add(outerTop[j]);
-            uvs.Add(new Vector2(0f, vTop));
+            uvs.Add(new Vector2(0f, vHi));
             vertices.Add(innerBottom[j]);
-            uvs.Add(new Vector2(1f, vBottom));
+            uvs.Add(new Vector2(across, vLo));
             vertices.Add(innerTop[j]);
-            uvs.Add(new Vector2(1f, vTop));
+            uvs.Add(new Vector2(across, vHi));
             if (startCap)
             {
                 triangles.Add(baseIndex); triangles.Add(baseIndex + 1); triangles.Add(baseIndex + 2);
@@ -734,18 +1011,56 @@ public class WallEdge : MonoBehaviour
             }
         }
 
-        AddStrip(outerBottom, outerTop, false, vBottom, vTop, arcU, arcU);
-        AddStrip(innerBottom, innerTop, true, vBottom, vTop, arcU, arcU);
-        AddStrip(outerTop, innerTop, false, 0f, 1f, arcU, arcU);
-        AddStrip(outerBottom, innerBottom, true, 0f, 1f, arcU, arcU);
-        AddCap(0, true);
-        AddCap(MeshSegments, false);
+        void EmitPrism(float hw, float yLo, float yHi)
+        {
+            Rows(hw, yLo, yHi);
+            AddStrip(outerBottom, outerTop, false, yLo, yHi, arcU, arcU);
+            AddStrip(innerBottom, innerTop, true, yLo, yHi, arcU, arcU);
+            // Top and underside run across the thickness, so their V is
+            // metres for the same reason the cap's U is.
+            AddStrip(outerTop, innerTop, false, 0f, hw * 2f, arcU, arcU);
+            AddStrip(outerBottom, innerBottom, true, 0f, hw * 2f, arcU, arcU);
+            AddCap(0, true, yLo, yHi, hw * 2f);
+            AddCap(MeshSegments, false, yLo, yHi, hw * 2f);
+        }
+
+        EmitPrism(halfWidth, bottomY, topY);
+
+        // The string course: a shallow band proud of the wall on both
+        // faces, at every StringCourseSpacing of ABSOLUTE elevation. World
+        // height is the anchor for the same reason the texture's V is —
+        // two walls built years apart, at different bases, on different
+        // storeys, still band at the same heights, so the castle reads as
+        // one building. The alternative (banding at floor level) is the
+        // historically correct one and the wrong one here: a wall would
+        // have to consult the slabs around it, and then it rebuilds when a
+        // neighbour changes, which is the one thing edge geometry never
+        // does.
+        //
+        // It is a separate concentric prism rather than a bulge in the
+        // wall's own cross-section: the wall's faces simply pass INSIDE
+        // it, hidden, which costs a few buried triangles and saves the
+        // sweep from carrying a profile. Openings need no special case —
+        // a lintel or threshold section is not masonry and is skipped by
+        // the caller.
+        if (stringCourses && topY - bottomY > 0.05f)
+            foreach ((float lo, float hi) in StringCourseBands(bottomY, topY))
+                EmitPrism(halfWidth + StringCourseProud, lo, hi);
 
         Mesh mesh = new Mesh { name = "WallSection" };
         mesh.SetVertices(vertices);
         mesh.SetUVs(0, uvs);
         mesh.SetTriangles(triangles, 0);
         mesh.RecalculateNormals();
+        // The tangent frame the parallax march needs. Runtime meshes carry
+        // NO tangent stream unless one is asked for, and the wall material
+        // does parallax occlusion mapping, which ray-marches in TANGENT
+        // space — with nothing to march along it eats faces at some
+        // viewing angles and not others. It showed up on the stairs first
+        // (they borrow this sweep) but every wall had it. Unity's own
+        // handedness sign rides in tangent.w, so mirrored faces come out
+        // right too. Any new mesh wearing this material owes this line.
+        mesh.RecalculateTangents();
         mesh.RecalculateBounds();
         return mesh;
     }
