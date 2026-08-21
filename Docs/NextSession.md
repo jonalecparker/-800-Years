@@ -6,21 +6,25 @@
 > **real Britain, real castle sites, Europe-ready** (memory +
 > `Docs/MarchesRealism.md`).
 
-**Where we left off:** The 08-16/17 session finished the wall-detailing
-build order. **Buttresses** shipped — face piers as edge data, clasping
-corner blocks as node data, both governed by THE FOUNDING RULE (a pier
-rests on the first solid thing beneath it: a platform under its whole
-footprint, else the earth). **Crenellations** shipped — a battlement is
-a span on the edge plus a merlon on each joint it crosses, drawn by one
-drag that follows the masonry through the graph, with persistent
-Ctrl+scroll height and Alt+scroll spacing dials. Two cross-cutting
-fixes fell out: **every runtime mesh must call `RecalculateTangents()`**
-(the stone material's parallax march eats untangented faces), and
-**`WalkMode.MoveSwept`** caps each frame's travel at 0.15m, which is why
-stairs are climbable again at 10 m/s and 17 fps. CastleSave is v12.
+**Where we left off:** The 08-18/20 session rebuilt the stone material
+as a custom Shader Graph (`Assets/Shaders/StoneTriplanarHex` — CLAUDE.md
+has the doctrine): **world-space triplanar** (courses align across
+separately-built pieces, no mesh UVs read) + **hex stochastic tiling**
+(no visible repeat) + POM re-implemented inside it. The user's first
+close look caught brick edges interleaving into zigzags at hex
+boundaries; fixed with a **height-aware near-hard blend** (the proudest
+stone wins, seams snap into the mortar). `Mat_Wall_Stone` switched in
+place — textures and the palisade tint carried over. CastleSave v12.
 
 ## Top priority: keep building at Grosmont
 
+0. **Walk the new stone** — verified by screenshot only. At eye level
+   check: palisade brown tint, merlons/stairs/slabs up close, any hex
+   boundary still faintly visible (`STONE_HEX_CONTRAST` in the HLSL,
+   12; higher = harder selection), `_TileSize` (2.4m) and
+   `_PomAmplitude` to taste. The detail map (close-up grain) was
+   dropped — say if you miss it. Shader cost untuned; flag any frame
+   drop.
 1. **Hand-test the crenel gesture** — the hover ghost, the pending
    phase and the two dials were each verified by probe but never
    driven by a real mouse. Also worth a look: a battlement on a wall
@@ -35,10 +39,11 @@ stairs are climbable again at 10 m/s and 17 fps. CastleSave is v12.
 
 ## Wall detailing — the order is complete
 
-String course, quoins, buttresses and crenellations all shipped. No
-next detailing item is chosen. Offered and not taken up: plinths, a
-palisade timber material, stochastic/hex tiling in Shader Graph, a
-per-edge string-course opt-out.
+String course, quoins, buttresses, crenellations and the stone
+material rebuild all shipped. No next detailing item is chosen.
+Offered and not taken up: plinths, a palisade timber material (still a
+brown-tinted stone clone — more visible now that the stone got good),
+a per-edge string-course opt-out, restoring the detail map.
 
 ## Second lane: the economy's remaining halves
 
